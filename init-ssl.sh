@@ -1,8 +1,5 @@
 #!/bin/bash
 
-whoami
-ls -ld /var/lib/postgresql/data
-
 SSL_DIR="/var/lib/postgresql/data/certs"
 
 # Use sudo to create the directory as root
