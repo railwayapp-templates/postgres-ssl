@@ -33,8 +33,6 @@ jobs:
 
       - name: Build and Push Docker image
         run: |
-          pwd
-          ls
           version="${{ steps.extract_version.outputs.version }}"
           docker build -f "${{ matrix.dockerfile }}" -t ghcr.io/${{ github.repository }}:${version} .
           docker push ghcr.io/${{ github.repository }}:${version}
