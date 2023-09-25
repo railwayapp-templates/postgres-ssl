@@ -4,11 +4,13 @@ This repository contains the logic to build SSL-enabled Postgres images.
 
 By default, when you deploy Postgres from the offical Postgres template on Railway, the image that is used is built from this repository!
 
+[![Deploy on Railway](https://railway.app/button.svg)](https://railway.app/template/postgres)
+
 ### Why though?
 
 The offical Postgres image in Docker hub does not come with SSL baked in.
 
-Since this could pose a problem for applications or services attempting to connect to Postgres services, we decided to roll our own Postgres image with SSL enabled out of the box.
+Since this could pose a problem for applications or services attempting to connect to Postgres services, we decided to roll our own Postgres image with SSL enabled right out of the box.
 
 ### How does it work?
 
