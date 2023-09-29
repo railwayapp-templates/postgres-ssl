@@ -1,4 +1,4 @@
-name: Docker Image CI/CD
+name: Docker Image CI/CD for number versions
 
 on:
   workflow_dispatch:
@@ -13,7 +13,7 @@ jobs:
 
     strategy:
       matrix:
-        dockerfile: ['Dockerfile.latest', 'Dockerfile.15']
+        dockerfile: ['Dockerfile.13', 'Dockerfile.14','Dockerfile.15']
 
     steps:
       - name: Checkout sources
