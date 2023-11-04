@@ -9,6 +9,9 @@ RUN echo "postgres ALL=(root) NOPASSWD: /usr/bin/mkdir, /bin/chown" > /etc/sudoe
 # Add your init script
 COPY init-ssl.sh /docker-entrypoint-initdb.d/
 
+# Add extensions
+COPY extension.sql /docker-entrypoint-initdb.d/
+
 # Set permissions
 RUN chmod +x /docker-entrypoint-initdb.d/init-ssl.sh
 
