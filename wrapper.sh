@@ -12,5 +12,10 @@ unset PGHOST
 unset PGPORT
 
 # Call the entrypoint script with the
-# approriate PGHOST & PGPORT
-/usr/local/bin/docker-entrypoint.sh "$@"
+# approriate PGHOST & PGPORT and redirect
+# the output to stdout if LOG_TO_STDOUT is true
+if [[ "$LOG_TO_STDOUT" == "true" ]]; then
+    /usr/local/bin/docker-entrypoint.sh "$@" 2>&1
+else
+    /usr/local/bin/docker-entrypoint.sh "$@"
+fi
