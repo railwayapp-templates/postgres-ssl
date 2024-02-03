@@ -1,4 +1,4 @@
-name: Docker Image CI/CD for number versions
+name: Docker Image CI/CD
 
 on:
   workflow_dispatch:
@@ -13,7 +13,7 @@ jobs:
 
     strategy:
       matrix:
-        dockerfile: ['Dockerfile.13', 'Dockerfile.14','Dockerfile.15']
+        version: ['13', '14', '15']
 
     steps:
       - name: Checkout sources
@@ -35,19 +35,21 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract version from Dockerfile name
-        id: extract_version
+      - name: Prepare Dockerfile
+        id: prepare_dockerfile
         run: |
-          version="${{ matrix.dockerfile }}"
-          version="${version#Dockerfile.}" # Remove "Dockerfile." prefix if it exists
-          echo "::set-output name=version::${version}"
+          version=${{ matrix.version }}
+          template_path="${GITHUB_WORKSPACE}/Dockerfile.template"
+          dockerfile_path="${GITHUB_WORKSPACE}/Dockerfile.${version}"
+          echo "::set-output name=dockerfile_path::Dockerfile.${version}"
         shell: bash
-
+        
 
       - name: Build and Publish
         uses: docker/build-push-action@v4
         with:
-          file: ${{ matrix.dockerfile }}
+          context: .
+          file: ${{ steps.prepare_dockerfile.outputs.dockerfile_path }}
           platforms: linux/arm64, linux/amd64
           push: true
-          tags: ghcr.io/${{ github.repository }}:${{ steps.extract_version.outputs.version }}
+          tags: ghcr.io/${{ github.repository }}:${{ matrix.version }}
