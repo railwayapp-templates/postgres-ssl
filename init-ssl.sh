@@ -3,6 +3,7 @@
 # exit as soon as any of these commands fail, this prevents starting a database without certificates
 set -e
 
+# Set up needed variables
 SSL_DIR="/var/lib/postgresql/data/certs"
 
 SSL_SERVER_CRT="$SSL_DIR/server.crt"
@@ -31,6 +32,8 @@ chmod og-rwx "$SSL_ROOT_KEY"
 
 openssl req -new -nodes -text -out "$SSL_SERVER_CSR" -keyout "$SSL_SERVER_KEY" -subj "/CN=localhost"
 
+chown postgres:postgres "$SSL_SERVER_KEY"
+
 chmod og-rwx "$SSL_SERVER_KEY"
 
 cat >| "$SSL_V3_EXT" <<EOF
@@ -43,7 +46,9 @@ EOF
 
 openssl x509 -req -in "$SSL_SERVER_CSR" -extfile "$SSL_V3_EXT" -extensions v3_req -text -days "${SSL_CERT_DAYS:-820}" -CA "$SSL_ROOT_CRT" -CAkey "$SSL_ROOT_KEY" -CAcreateserial -out "$SSL_SERVER_CRT"
 
-# PostgreSQL configuration
+chown postgres:postgres "$SSL_SERVER_CRT"
+
+# PostgreSQL configuration, enable ssl and set paths to certificate files
 cat >> "$POSTGRES_CONF_FILE" <<EOF
 ssl = on
 ssl_cert_file = '$SSL_SERVER_CRT'
