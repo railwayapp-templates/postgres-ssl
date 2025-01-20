@@ -6,6 +6,9 @@ RUN apt-get update && apt-get install -y \
     sudo \
     --no-install-recommends \
     postgresql-contrib \
+    pgbouncer postgresql-common \
+    lz4 libpq-dev libpq5 pg-activity \
+    lsof htop \
     postgresql-15-pgvector \
     postgresql-15-postgis \
     && rm -rf /var/lib/apt/lists/*
