@@ -1,6 +1,17 @@
 # SSL-enabled Postgres DB image
 
-This repository contains the logic to build SSL-enabled Postgres images.
+This repository contains the logic to build SSL-enabled Postgres images that has a postgis and pgvector added ontop.
+
+
+## What you'll need
+
+For a quick setup, you'll need to setup the following environment variables:
+
+- `RAILWAY_DOCKERFILE_PATH : ''` -> Whatever docker file you need to use
+
+- all the service variables from the official Postgres template
+
+
 
 By default, when you deploy Postgres from the official Postgres template on Railway, the image that is used is built from this repository!
 

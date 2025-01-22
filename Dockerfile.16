@@ -1,7 +1,18 @@
 FROM postgres:16
 
 # Install OpenSSL and sudo
-RUN apt-get update && apt-get install -y openssl sudo
+RUN apt-get update && apt-get install -y \
+    openssl \
+    sudo \
+    --no-install-recommends \
+    postgresql-contrib \
+    pgbouncer postgresql-common \
+    lz4 libpq-dev libpq5 pg-activity \
+    lsof htop \
+    postgresql-16-pgvector \
+    postgresql-16-postgis \
+    && rm -rf /var/lib/apt/lists/*
+
 
 # Allow the postgres user to execute certain commands as root without a password
 RUN echo "postgres ALL=(root) NOPASSWD: /usr/bin/mkdir, /bin/chown, /usr/bin/openssl" > /etc/sudoers.d/postgres
