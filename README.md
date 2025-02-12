@@ -30,10 +30,10 @@ For a quick setup, you'll need the following:
         ```
     - You can copy this to the `Variables` -> `Raw Editor` tab and update the POSTGRES_PASSWORD variable to a randomly generated 32 character string.
 
-3. Attach a volume to the service by right clicking on the service and set the mount path to: `/var/lib/postgresql/data`. After this step, you should have 13 Railway Provided Variables.
+3. Attach a volume to the service by right clicking on the service and set the mount path to: `/var/lib/postgresql/data`. After this step, you should have 10 Railway Provided Variables.
 
 4. Deploy to apply the changes.
 
-5. Add a TCP proxy to the service via `Settings` -> `Networking` with the default port 5432.
+5. Configure a TCP Proxy for the service by navigating to `Settings` -> `Networking` and selecting the default port 5432. Ensure that only the TCP Proxy is added. This should bring the total of Railway Provided variables to 13.
 
 6. Redeploy the service.
