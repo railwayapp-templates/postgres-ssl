@@ -1,38 +1,39 @@
 # SSL-enabled Postgres DB image
 
-This repository contains the logic to build SSL-enabled Postgres images that has a postgis and pgvector added ontop.
+This repository contains the logic to build SSL-enabled Postgres images that have postgis and pgvector extensions added.
 
 
 ## What you'll need
 
-For a quick setup, you'll need to setup the following environment variables:
+For a quick setup, you'll need the following:
 
-- `RAILWAY_DOCKERFILE_PATH : ''` -> Whatever docker file you need to use
+1. Create a new service on the Railway project and link it to this repo.
 
-- all the service variables from the official Postgres template
+2. Add the required environment variables:
 
+    - Add a new environment variable: `RAILWAY_DOCKERFILE_PATH`. It's value should be the docker file you need to use e.g. `RAILWAY_DOCKERFILE_PATH="./Dockerfile.17"`
 
+    - Add all the service variables from the official postgres template. When you spin up a new postgres service on railway, it comes with the following 12 service variables:
+        ```
+        DATABASE_PUBLIC_URL="postgresql://${{PGUSER}}:${{POSTGRES_PASSWORD}}@${{RAILWAY_TCP_PROXY_DOMAIN}}:${{RAILWAY_TCP_PROXY_PORT}}/${{PGDATABASE}}"
+        DATABASE_URL="postgresql://${{PGUSER}}:${{POSTGRES_PASSWORD}}@${{RAILWAY_PRIVATE_DOMAIN}}:5432/${{PGDATABASE}}"
+        PGDATA="/var/lib/postgresql/data/pgdata"
+        PGDATABASE="${{POSTGRES_DB}}"
+        PGHOST="${{RAILWAY_PRIVATE_DOMAIN}}"
+        PGPASSWORD="${{POSTGRES_PASSWORD}}"
+        PGPORT="5432"
+        PGUSER="${{POSTGRES_USER}}"
+        POSTGRES_DB="railway"
+        POSTGRES_PASSWORD=""
+        POSTGRES_USER="postgres"
+        SSL_CERT_DAYS="820"
+        ```
+    - You can copy this to the `Variables` -> `Raw Editor` tab and update the POSTGRES_PASSWORD variable to a randomly generated 32 character string.
 
-By default, when you deploy Postgres from the official Postgres template on Railway, the image that is used is built from this repository!
+3. Attach a volume to the service by right clicking on the service and set the mount path to: `/var/lib/postgresql/data`. After this step, you should have 10 Railway Provided Variables.
 
-[![Deploy on Railway](https://railway.app/button.svg)](https://railway.app/template/postgres)
+4. Deploy to apply the changes.
 
-### Why though?
+5. Configure a TCP Proxy for the service by navigating to `Settings` -> `Networking` and selecting the default port 5432. Ensure that only the TCP Proxy is added. This should bring the total of Railway Provided variables to 13.
 
-The official Postgres image in Docker hub does not come with SSL baked in.
-
-Since this could pose a problem for applications or services attempting to connect to Postgres services, we decided to roll our own Postgres image with SSL enabled right out of the box.
-
-### How does it work?
-
-The Dockerfiles contained in this repository start with the official Postgres image as base.  Then the `init-ssl.sh` script is copied into the `docker-entrypoint-initdb.d/` directory to be executed upon initialization.
-
-### Certificate expiry
-By default, the cert expiry is set to 820 days. You can control this by configuring the `SSL_CERT_DAYS` environment variable as needed.
-
-### Certificate renewal
-When a redeploy or restart is done the certificates expiry is checked, if it has expired or will expire in 30 days a new certificate is automatically generated.
-
-### A note about ports
-
-By default, this image is hardcoded to listen on port `5432` regardless of what is set in the `PGPORT` environment variable.  We did this to allow connections to the postgres service over the `RAILWAY_TCP_PROXY_PORT`.  If you need to change this behavior, feel free to build your own image without passing the `--port` parameter to the `CMD` command in the Dockerfile.
+6. Redeploy the service.
