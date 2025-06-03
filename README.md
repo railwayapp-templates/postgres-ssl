@@ -30,10 +30,24 @@ For a quick setup, you'll need the following:
         ```
     - You can copy this to the `Variables` -> `Raw Editor` tab and update the POSTGRES_PASSWORD variable to a randomly generated 32 character string.
 
-3. Attach a volume to the service by right clicking on the service and set the mount path to: `/var/lib/postgresql/data`. After this step, you should have 10 Railway Provided Variables.
+3. Setting POSTGRES_PASSWORD
 
-4. Deploy to apply the changes.
+    - When updating POSTGRES_PASSWORD, be careful with the choice of password to avoid connection errors *(e.g., “password authentication failed for user ‘postgres’”)* when         using DBeaver, psql, or Railway.
 
-5. Configure a TCP Proxy for the service by navigating to `Settings` -> `Networking` and selecting the default port 5432. Ensure that only the TCP Proxy is added. This should bring the total of Railway Provided variables to 13.
+    - You have two options:
 
-6. Redeploy the service.
+        **Option 1:** Use only letters (A–Z, a–z) for your password
+        ```
+        POTGRES_PASSWORD=mysecurepassword
+         ```
+        **Option 2:** If your password must contain numbers or special characters, always wrap it in single quotes
+        ```
+        POSTGRES_PASSWORD='pa$$w0rd123!'
+        ```
+4. Attach a volume to the service by right clicking on the service and set the mount path to: `/var/lib/postgresql/data`. After this step, you should have 10 Railway Provided Variables.
+
+5. Deploy to apply the changes.
+
+6. Configure a TCP Proxy for the service by navigating to `Settings` -> `Networking` and selecting the default port 5432. Ensure that only the TCP Proxy is added. This should bring the total of Railway Provided variables to 13.
+
+7. Redeploy the service.
