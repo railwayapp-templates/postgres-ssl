@@ -1,6 +1,8 @@
 name: Docker Image CI/CD for number versions
 
 on:
+  schedule:
+    - cron: '0 0 * * 1'  # Every Monday at midnight UTC
   workflow_dispatch:
 
 jobs:
