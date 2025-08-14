@@ -1,11 +1,26 @@
 #!/bin/bash
 
-# exit as soon as any of these commands fail, this prevents starting a database without certificates
+# exit as soon as any of these commands fail, this prevents starting a database without certificates or with the wrong volume mount path
 set -e
 
-# Make sure there is a PGDATA variable available
-if [ -z "$PGDATA" ]; then
-  echo "Missing PGDATA variable"
+EXPECTED_VOLUME_MOUNT_PATH="/var/lib/postgresql/data"
+
+# check if the Railway volume is mounted to the correct path
+# we do this by checking the current mount path (RAILWAY_VOLUME_MOUNT_PATH) agiant the expected mount path
+# if the paths are different, we print an error message and exit
+# only perform this check if this image is deployed to Railway by checking for the existence of the RAILWAY_ENVIRONMENT variable
+if [ -n "$RAILWAY_ENVIRONMENT" ] && [ "$RAILWAY_VOLUME_MOUNT_PATH" != "$EXPECTED_VOLUME_MOUNT_PATH" ]; then
+  echo "Railway volume not mounted to the correct path, expected $EXPECTED_VOLUME_MOUNT_PATH but got $RAILWAY_VOLUME_MOUNT_PATH"
+  echo "Please update the volume mount path to the expected path and redeploy the service"
+  exit 1
+fi
+
+# check if PGDATA starts with the expected volume mount path
+# this ensures data files are stored in the correct location
+# if not, print error and exit to prevent data loss or access issues
+if [[ ! "$PGDATA" =~ ^"$EXPECTED_VOLUME_MOUNT_PATH" ]]; then
+  echo "PGDATA variable does not start with the expected volume mount path, expected to start with $EXPECTED_VOLUME_MOUNT_PATH"
+  echo "Please update the PGDATA variable to start with the expected volume mount path and redeploy the service"
   exit 1
 fi
 
