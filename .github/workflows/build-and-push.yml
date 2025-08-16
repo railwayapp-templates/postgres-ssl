@@ -28,14 +28,10 @@ jobs:
         id: get_version
         run: |
           # Get the latest minor version for this major version
-          FULL_VERSION=$(./get-postgres-version.sh ${{ matrix.postgres_major }})
-          echo "full_version=${FULL_VERSION}" >> $GITHUB_OUTPUT
-          
-          # Extract major.minor (e.g., 16.10 -> 16.10)
-          MINOR_VERSION=$(echo $FULL_VERSION | grep -oE '^[0-9]+\.[0-9]+')
+          MINOR_VERSION=$(./get-postgres-version.sh ${{ matrix.postgres_major }})
           echo "minor_version=${MINOR_VERSION}" >> $GITHUB_OUTPUT
           
-          echo "Building PostgreSQL $FULL_VERSION with tags: ${{ matrix.postgres_major }}, ${MINOR_VERSION}, ${FULL_VERSION}"
+          echo "Building PostgreSQL $MINOR_VERSION with tags: ${{ matrix.postgres_major }}, ${MINOR_VERSION}"
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -59,10 +55,9 @@ jobs:
           platforms: linux/arm64,linux/amd64
           push: true
           build-args: |
-            POSTGRES_VERSION=${{ steps.get_version.outputs.full_version }}
+            POSTGRES_VERSION=${{ steps.get_version.outputs.minor_version }}
           tags: |
             ghcr.io/${{ github.repository }}:${{ matrix.postgres_major }}
             ghcr.io/${{ github.repository }}:${{ steps.get_version.outputs.minor_version }}
-            ghcr.io/${{ github.repository }}:${{ steps.get_version.outputs.full_version }}
             ${{ matrix.postgres_major == env.LATEST_POSTGRES_MAJOR && format('ghcr.io/{0}:latest', github.repository) || '' }}
 

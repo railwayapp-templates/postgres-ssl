@@ -1,7 +1,7 @@
 #!/bin/bash
 # get-postgres-version.sh
 # Usage: ./get-postgres-version.sh 16
-# Returns: 16.10 (latest minor.patch for PostgreSQL 16)
+# Returns: 16.10 (latest minor version for PostgreSQL 16)
 
 set -euo pipefail
 
@@ -22,10 +22,10 @@ fi
 echo "Fetching latest PostgreSQL $MAJOR_VERSION version..." >&2
 
 # Query Docker Hub API for the latest version of this major release
-# We look for tags that are just numbers (no alpine, bookworm, etc)
+# We look for tags that are major.minor format (no alpine, bookworm, etc)
 LATEST_VERSION=$(curl -s "https://hub.docker.com/v2/repositories/library/postgres/tags?page_size=100" | \
   jq -r --arg major "$MAJOR_VERSION" '.results[] | 
-    select(.name | test("^" + $major + "\\.\\d+(\\.\\d+)?$")) | 
+    select(.name | test("^" + $major + "\\.\\d+$")) | 
     .name' | \
   sort -V | \
   tail -1)

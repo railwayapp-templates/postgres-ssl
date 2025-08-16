@@ -38,24 +38,19 @@ Images are automatically built weekly and tagged with multiple version levels
 for flexibility:
 
 - **Major version tags** (e.g., `:17`, `:16`, `:15`): Always points to the
-  latest minor/patch version for that major release
-- **Minor version tags** (e.g., `:17.6`, `:16.10`): Points to the latest patch
-  version for that minor release
-- **Patch version tags** (e.g., `:17.6.0`, `:16.10.0`): Exact version pinning
-  for maximum stability
+  latest minor version for that major release
+- **Minor version tags** (e.g., `:17.6`, `:16.10`): Pins to specific minor
+  version for stability
 - **Latest tag** (`:latest`): Currently points to PostgreSQL 16
 
 Example usage:
 
 ```bash
-# Auto-update to latest minor/patch versions (recommended for development)
+# Auto-update to latest minor versions (recommended for development)
 docker run ghcr.io/railwayapp-templates/postgres-ssl:17
 
 # Pin to specific minor version (recommended for production)
 docker run ghcr.io/railwayapp-templates/postgres-ssl:17.6
-
-# Pin to exact patch version (maximum stability)
-docker run ghcr.io/railwayapp-templates/postgres-ssl:17.6.0
 ```
 
 ### A note about ports
