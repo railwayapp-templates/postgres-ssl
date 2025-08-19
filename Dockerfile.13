@@ -1,4 +1,5 @@
-FROM postgres:13
+ARG POSTGRES_VERSION=13
+FROM postgres:${POSTGRES_VERSION}
 
 # Install OpenSSL and sudo
 RUN apt-get update && apt-get install -y openssl sudo
