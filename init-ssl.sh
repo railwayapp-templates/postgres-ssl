@@ -4,7 +4,7 @@
 set -e
 
 # Set up needed variables
-SSL_DIR="/var/lib/postgresql/data/certs"
+SSL_DIR="$PGDATA/certs"
 
 SSL_SERVER_CRT="$SSL_DIR/server.crt"
 SSL_SERVER_KEY="$SSL_DIR/server.key"
