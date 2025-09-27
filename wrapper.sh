@@ -3,7 +3,7 @@
 # exit as soon as any of these commands fail, this prevents starting a database without certificates or with the wrong volume mount path
 set -e
 
-EXPECTED_VOLUME_MOUNT_PATH="/var/lib/postgresql/data"
+EXPECTED_VOLUME_MOUNT_PATH="/var/lib/postgresql"
 
 # check if the Railway volume is mounted to the correct path
 # we do this by checking the current mount path (RAILWAY_VOLUME_MOUNT_PATH) agiant the expected mount path
@@ -25,7 +25,7 @@ if [[ ! "$PGDATA" =~ ^"$EXPECTED_VOLUME_MOUNT_PATH" ]]; then
 fi
 
 # Set up needed variables
-SSL_DIR="/var/lib/postgresql/data/certs"
+SSL_DIR="/var/lib/postgresql/certs"
 INIT_SSL_SCRIPT="/docker-entrypoint-initdb.d/init-ssl.sh"
 POSTGRES_CONF_FILE="$PGDATA/postgresql.conf"
 
