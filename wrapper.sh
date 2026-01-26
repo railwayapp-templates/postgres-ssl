@@ -49,6 +49,13 @@ if [ -f "$POSTGRES_CONF_FILE" ] && [ ! -f "$SSL_DIR/server.crt" ]; then
   bash "$INIT_SSL_SCRIPT"
 fi
 
+# Ensure pg_stat_statements is in shared_preload_libraries for existing databases
+# This handles databases created before this setting was added
+if [ -f "$POSTGRES_CONF_FILE" ] && ! grep -q "shared_preload_libraries.*pg_stat_statements" "$POSTGRES_CONF_FILE"; then
+  echo "Adding pg_stat_statements to shared_preload_libraries..."
+  echo "shared_preload_libraries = 'pg_stat_statements'" >> "$POSTGRES_CONF_FILE"
+fi
+
 # unset PGHOST to force psql to use Unix socket path
 # this is specific to Railway and allows
 # us to use PGHOST after the init
