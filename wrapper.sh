@@ -49,11 +49,31 @@ if [ -f "$POSTGRES_CONF_FILE" ] && [ ! -f "$SSL_DIR/server.crt" ]; then
   bash "$INIT_SSL_SCRIPT"
 fi
 
+# Adds pg_stat_statements to shared_preload_libraries in a config file
+# Usage: add_pg_stat_statements <config_file>
+add_pg_stat_statements() {
+  local config_file="$1"
+  local current_libs
+  # Extract value - handles quoted ('val', "val") and unquoted (val) formats
+  current_libs=$(grep -E "^[[:space:]]*shared_preload_libraries" "$config_file" 2>/dev/null | tail -1 | sed "s/.*=[[:space:]]*//; s/^['\"]//; s/['\"].*$//; s/[[:space:]]*$//")
+  if [ -n "$current_libs" ]; then
+    echo "shared_preload_libraries = '${current_libs},pg_stat_statements'" >> "$config_file"
+  else
+    echo "shared_preload_libraries = 'pg_stat_statements'" >> "$config_file"
+  fi
+}
+
 # Ensure pg_stat_statements is in shared_preload_libraries for existing databases
 # This handles databases created before this setting was added
-if [ -f "$POSTGRES_CONF_FILE" ] && ! grep -q "shared_preload_libraries.*pg_stat_statements" "$POSTGRES_CONF_FILE"; then
+AUTO_CONF_FILE="$PGDATA/postgresql.auto.conf"
+if [ -f "$POSTGRES_CONF_FILE" ] && ! grep -q "pg_stat_statements" "$POSTGRES_CONF_FILE"; then
   echo "Adding pg_stat_statements to shared_preload_libraries..."
-  echo "shared_preload_libraries = 'pg_stat_statements'" >> "$POSTGRES_CONF_FILE"
+  add_pg_stat_statements "$POSTGRES_CONF_FILE"
+  # Only update auto.conf if it has shared_preload_libraries set (which would override postgresql.conf)
+  # and doesn't already have pg_stat_statements
+  if grep -q "^[[:space:]]*shared_preload_libraries" "$AUTO_CONF_FILE" 2>/dev/null && ! grep -q "pg_stat_statements" "$AUTO_CONF_FILE" 2>/dev/null; then
+    add_pg_stat_statements "$AUTO_CONF_FILE"
+  fi
 fi
 
 # unset PGHOST to force psql to use Unix socket path
