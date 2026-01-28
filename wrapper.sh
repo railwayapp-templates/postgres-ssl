@@ -87,11 +87,21 @@ unset PGHOST
 ## it ends up being empty
 unset PGPORT
 
-# Call the entrypoint script with the
-# appropriate PGHOST & PGPORT and redirect
-# the output to stdout if LOG_TO_STDOUT is true
-if [[ "$LOG_TO_STDOUT" == "true" ]]; then
-    /usr/local/bin/docker-entrypoint.sh "$@" 2>&1
+# Control whether we want to initialize the database. If false, this will
+# start the container in sleep mode.
+if [[ "$INITDB" == "false" ]]; then
+    echo "Database initialization disabled, starting in sleep mode..."
+    echo "To initialize and run the database, set the INITDB environment variable to true"
+    trap "echo Shutting down; exit 0" SIGTERM SIGINT SIGKILL
+    sleep infinity & wait
 else
-    /usr/local/bin/docker-entrypoint.sh "$@"
+    # Call the entrypoint script with the
+    # appropriate PGHOST & PGPORT and redirect
+    # the output to stdout if LOG_TO_STDOUT is true
+    if [[ "$LOG_TO_STDOUT" == "true" ]]; then
+        /usr/local/bin/docker-entrypoint.sh "$@" 2>&1
+    else
+        /usr/local/bin/docker-entrypoint.sh "$@"
+    fi
 fi
+
