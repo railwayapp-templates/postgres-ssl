@@ -49,13 +49,50 @@ if [ -f "$POSTGRES_CONF_FILE" ] && [ ! -f "$SSL_DIR/server.crt" ]; then
   bash "$INIT_SSL_SCRIPT"
 fi
 
+# Parses shared_preload_libraries value from a PostgreSQL config file
+# Handles: 'value', "value", and unquoted value formats
+# Only strips the OUTER quotes, preserving any inner quotes
+parse_shared_preload_libraries() {
+  local config_file="$1"
+  local line value
+
+  # Get the last shared_preload_libraries line (PostgreSQL uses last value)
+  line=$(grep -E "^[[:space:]]*shared_preload_libraries" "$config_file" 2>/dev/null | tail -1)
+  [ -z "$line" ] && return
+
+  # Extract everything after the = sign
+  value="${line#*=}"
+  # Trim leading whitespace
+  value="${value#"${value%%[![:space:]]*}"}"
+  # Trim trailing whitespace
+  value="${value%"${value##*[![:space:]]}"}"
+
+  # Handle quoted values - only strip matching outer quotes
+  if [[ "$value" == \'* ]]; then
+    # Single-quoted: strip leading ', then everything from the closing ' onwards
+    value="${value#\'}"
+    value="${value%%\'*}"
+  elif [[ "$value" == \"* ]]; then
+    # Double-quoted: strip leading ", then everything from the closing " onwards
+    value="${value#\"}"
+    value="${value%%\"*}"
+  else
+    # Unquoted: strip from # comment to end if present
+    value="${value%%#*}"
+    # Trim trailing whitespace again
+    value="${value%"${value##*[![:space:]]}"}"
+  fi
+
+  printf '%s' "$value"
+}
+
 # Adds pg_stat_statements to shared_preload_libraries in a config file
 # Usage: add_pg_stat_statements <config_file>
 add_pg_stat_statements() {
   local config_file="$1"
   local current_libs
-  # Extract value - handles quoted ('val', "val") and unquoted (val) formats
-  current_libs=$(grep -E "^[[:space:]]*shared_preload_libraries" "$config_file" 2>/dev/null | tail -1 | sed "s/.*=[[:space:]]*//; s/^['\"]//; s/['\"].*$//; s/[[:space:]]*$//")
+
+  current_libs=$(parse_shared_preload_libraries "$config_file")
   if [ -n "$current_libs" ]; then
     echo "shared_preload_libraries = '${current_libs},pg_stat_statements'" >> "$config_file"
   else
