@@ -8,9 +8,7 @@ RUN apt-get update && apt-get install -y openssl sudo pgbackrest postgresql-14-p
 # Allow the postgres user to execute certain commands as root without a password
 RUN echo "postgres ALL=(root) NOPASSWD: /usr/bin/mkdir, /bin/chown, /usr/bin/openssl" > /etc/sudoers.d/postgres
 
-# pgBackRest spool dir for async archive-push. Dormant unless
-# PGBACKREST_REPO1_S3_BUCKET is set at runtime; see wrapper.sh.
-RUN install -d -m 0750 -o postgres -g postgres /var/lib/postgresql/pgbackrest-spool /etc/pgbackrest
+RUN install -d -m 0750 -o postgres -g postgres /etc/pgbackrest
 
 # Add init scripts while setting permissions
 COPY --chmod=755 init-ssl.sh /docker-entrypoint-initdb.d/init-ssl.sh

@@ -102,20 +102,30 @@ render_pgbackrest_conf() {
   [ -z "$PGBACKREST_REPO1_S3_BUCKET" ] && return 0
 
   mkdir -p /etc/pgbackrest
+  # Spool lives under PGDATA so it survives container restarts on the same
+  # volume — segments staged in spool but not yet pushed to S3 would
+  # otherwise be silently dropped on restart (Postgres has already advanced
+  # restart_lsn after archive_command returned 0). Only create it once the
+  # data dir is initialized; before initdb, $PGDATA must be empty or
+  # docker-entrypoint refuses to run initdb. pgbackrest-init.sh handles the
+  # fresh-init case after initdb completes.
+  if [ -f "$POSTGRES_CONF_FILE" ]; then
+    install -d -m 0750 -o postgres -g postgres "$PGDATA/pgbackrest-spool"
+  fi
+  # repo1-retention-* is intentionally omitted: this image never runs
+  # `pgbackrest backup`/`expire` so the knobs would be no-ops anyway. WAL
+  # retention is enforced server-side by the bucket's lifecycle policy.
+  local process_max="${PGBACKREST_PROCESS_MAX:-2}"
   cat > "$PGBACKREST_CONF_FILE" <<EOF
 [global]
 repo1-type=s3
-repo1-retention-full=2
-repo1-retention-diff=4
-repo1-retention-archive=14
-repo1-retention-archive-type=incr
 log-level-console=info
 log-level-file=off
 archive-async=y
 archive-push-queue-max=5GiB
 archive-get-queue-max=1GiB
-spool-path=/var/lib/postgresql/pgbackrest-spool
-process-max=4
+spool-path=${PGDATA}/pgbackrest-spool
+process-max=${process_max}
 compress-type=zst
 compress-level=3
 start-fast=y
@@ -128,6 +138,27 @@ EOF
   echo "pgbackrest: rendered $PGBACKREST_CONF_FILE"
 }
 
+# Path of the sentinel that records the repo1-path this volume's WAL has been
+# pushed to. Recovery refuses to stage if PGBACKREST_REPO1_PATH still matches
+# this — the operator must change it so post-promote archive-push lands in a
+# different prefix and can't corrupt the source's ongoing WAL chain.
+SOURCE_PATH_SENTINEL_FILE="$PGDATA/.pgbackrest_source_path"
+
+# Refresh the sentinel to track the currently-configured repo1-path. Runs on
+# every boot when archiving is enabled so the recorded value reflects the
+# path Postgres is actually pushing to right now.
+stamp_source_repo_path() {
+  [ -z "$PGBACKREST_REPO1_S3_BUCKET" ] && return 0
+  [ ! -d "$PGDATA" ] && return 0
+  local current_path="${PGBACKREST_REPO1_PATH:-}"
+  if [ -f "$SOURCE_PATH_SENTINEL_FILE" ] \
+     && [ "$(cat "$SOURCE_PATH_SENTINEL_FILE")" = "$current_path" ]; then
+    return 0
+  fi
+  printf '%s' "$current_path" > "$SOURCE_PATH_SENTINEL_FILE"
+  echo "pgbackrest: stamped source repo path '${current_path}' to ${SOURCE_PATH_SENTINEL_FILE}"
+}
+
 # Append archive config to postgresql.auto.conf when PGBACKREST_REPO1_S3_BUCKET
 # is set and the DB is already initialized. Marker-guarded so it writes once.
 configure_pgbackrest_archiving() {
@@ -138,11 +169,12 @@ configure_pgbackrest_archiving() {
     return 0
   fi
 
-  cat >> "$AUTO_CONF_FILE" <<'EOF'
+  local archive_timeout="${POSTGRES_ARCHIVE_TIMEOUT:-60}"
+  cat >> "$AUTO_CONF_FILE" <<EOF
 # pgbackrest-config-begin (managed by wrapper.sh)
 archive_mode = 'on'
 archive_command = '/usr/local/bin/pgbackrest-archive-push-wrapper.sh %p'
-archive_timeout = '60'
+archive_timeout = '${archive_timeout}'
 restore_command = 'pgbackrest --stanza=main archive-get %f %p'
 # pgbackrest-config-end
 EOF
@@ -166,6 +198,7 @@ clear_pgbackrest_archiving_if_disabled() {
   sed '/# pgbackrest-config-begin/,/# pgbackrest-config-end/d' "$AUTO_CONF_FILE" > "$AUTO_CONF_FILE.tmp" \
     && mv "$AUTO_CONF_FILE.tmp" "$AUTO_CONF_FILE"
   rm -f "$PGBACKREST_CONF_FILE"
+  rm -f "$SOURCE_PATH_SENTINEL_FILE"
   echo "pgbackrest: archive config removed from postgresql.auto.conf (PGBACKREST_REPO1_S3_BUCKET unset)"
 }
 
@@ -201,30 +234,84 @@ bootstrap_pgbackrest_stanza() {
 }
 
 # Stage PITR replay when POSTGRES_RECOVERY_TARGET_TIME is set. Creates
-# recovery.signal + recovery settings in postgresql.auto.conf. A sentinel file
-# (.pitr_configured) ensures this runs exactly once per volume: Postgres
-# removes recovery.signal on successful promote, and a subsequent container
-# restart must not re-trigger replay on the same data.
+# recovery.signal + recovery settings in postgresql.auto.conf.
+#
+# Two filesystem stamps coordinate "exactly once per successful promote":
+#   - .pitr_staging: written when we hand recovery off to Postgres. Means a
+#     replay attempt is in flight or last attempt didn't promote yet.
+#   - .pitr_configured: written on the boot AFTER Postgres consumes
+#     recovery.signal (which Postgres removes only on successful promote).
+#     Means PITR is done and must not run again on this volume.
+# So a failed replay (bad target time, missing WAL, bad creds) leaves
+# .pitr_staging behind WITHOUT .pitr_configured — the operator can fix env
+# vars and restart, and the next boot will re-stage cleanly. auto.conf is
+# last-wins for duplicate keys, so re-staging is safe even with leftover
+# lines from earlier attempts.
+#
+# Repo-path divergence is enforced two ways:
+#   1. Read path: PGBACKREST_RECOVERY_REPO1_PATH names where archive-get pulls
+#      WAL from during replay (the source's path). Baked into restore_command
+#      via --repo1-path=... so pgbackrest reads from there regardless of the
+#      env value pgbackrest itself sees.
+#   2. Write path: PGBACKREST_REPO1_PATH must NOT equal the stamped source
+#      path. After promote, archive_command pushes to PGBACKREST_REPO1_PATH;
+#      if that's still the source's path, the new timeline corrupts the
+#      source's ongoing WAL chain. Refusing here surfaces the misconfig
+#      before Postgres starts.
 configure_pgbackrest_recovery() {
+  [ -z "$PGBACKREST_REPO1_S3_BUCKET" ] && return 0
   [ -z "$POSTGRES_RECOVERY_TARGET_TIME" ] && return 0
   [ ! -f "$POSTGRES_CONF_FILE" ] && return 0
 
   local marker="$PGDATA/.pitr_configured"
+  local staging="$PGDATA/.pitr_staging"
   if [ -f "$marker" ]; then
     return 0
+  fi
+
+  # Promote-success detection: a previous boot staged recovery (.pitr_staging
+  # present) and Postgres has since removed recovery.signal, which it only
+  # does on successful promote. Stamp the marker, drop the staging file, and
+  # skip re-staging.
+  if [ -f "$staging" ] && [ ! -f "$PGDATA/recovery.signal" ]; then
+    rm -f "$staging"
+    touch "$marker"
+    echo "pgbackrest: previous PITR replay completed; marker written"
+    return 0
+  fi
+
+  if [ -f "$SOURCE_PATH_SENTINEL_FILE" ]; then
+    local stamped_path
+    stamped_path=$(cat "$SOURCE_PATH_SENTINEL_FILE")
+    local current_write_path="${PGBACKREST_REPO1_PATH:-}"
+    if [ "$stamped_path" = "$current_write_path" ]; then
+      echo "pgbackrest: REFUSING to stage PITR — PGBACKREST_REPO1_PATH ('${current_write_path}') matches the source's stamped repo path." >&2
+      echo "pgbackrest: After promote, archive_command would push the recovered timeline back into the source's repo and corrupt its WAL chain." >&2
+      echo "pgbackrest: Set PGBACKREST_REPO1_PATH to a NEW prefix for the recovered cluster's writes, and PGBACKREST_RECOVERY_REPO1_PATH='${stamped_path}' so archive-get can still read source WAL during replay." >&2
+      exit 1
+    fi
+  fi
+
+  local recovery_read_path="${PGBACKREST_RECOVERY_REPO1_PATH:-}"
+  local restore_cmd="pgbackrest --stanza=main archive-get %f %p"
+  if [ -n "$recovery_read_path" ]; then
+    restore_cmd="pgbackrest --stanza=main --repo1-path=${recovery_read_path} archive-get %f %p"
+  else
+    echo "pgbackrest: WARNING — PGBACKREST_RECOVERY_REPO1_PATH unset; archive-get will use PGBACKREST_REPO1_PATH ('${PGBACKREST_REPO1_PATH:-}'). Set the recovery-read path explicitly to avoid coupling read and write paths." >&2
   fi
 
   # Escape single quotes per postgresql.conf rules (' -> '') so a value with
   # an embedded apostrophe can't break the conf file or smuggle a setting.
   local escaped_target="${POSTGRES_RECOVERY_TARGET_TIME//\'/\'\'}"
+  local escaped_restore="${restore_cmd//\'/\'\'}"
   cat >> "$AUTO_CONF_FILE" <<EOF
 # managed by pgbackrest-recovery (wrapper.sh)
-restore_command = 'pgbackrest --stanza=main archive-get %f %p'
+restore_command = '${escaped_restore}'
 recovery_target_time = '${escaped_target}'
 recovery_target_action = 'promote'
 EOF
   touch "$PGDATA/recovery.signal"
-  touch "$marker"
+  touch "$staging"
   echo "pgbackrest: PITR replay staged (target=${POSTGRES_RECOVERY_TARGET_TIME})"
 }
 
@@ -232,6 +319,7 @@ render_pgbackrest_conf
 clear_pgbackrest_archiving_if_disabled
 configure_pgbackrest_archiving
 configure_pgbackrest_recovery
+stamp_source_repo_path
 bootstrap_pgbackrest_stanza
 
 # unset PGHOST to force psql to use Unix socket path
