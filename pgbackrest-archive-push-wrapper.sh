@@ -4,12 +4,16 @@
 # Wraps `pgbackrest archive-push` so that any kind of archive failure (hard
 # repo error, stuck async worker, anything else) cannot fill pg_wal/ and halt
 # Postgres. When pgbackrest fails AND pg_wal/ has grown past a threshold
-# (default 10 GiB, override via PGBACKREST_DROP_THRESHOLD_GIB), the wrapper
+# (default 5 GiB, override via PGBACKREST_DROP_THRESHOLD_GIB), the wrapper
 # returns success to Postgres anyway. Postgres recycles the WAL segment as
 # if archiving were disabled. The PITR window gets a coverage gap from this
 # segment forward; the dashboard reads pg_stat_archiver to surface "PITR
 # broken — fix archiving config" so the underlying issue (bad creds, deleted
 # bucket, expired keys, …) gets fixed.
+#
+# 5 GiB matches pgBackRest's own archive-push-queue-max in the spool path:
+# both failure regimes (queueable S3 stalls; unqueueable hard errors) get
+# the same WAL-budget ceiling before we trade coverage for availability.
 #
 # Below the threshold the wrapper surfaces pgbackrest's failure to Postgres
 # normally, so transient S3 issues retry on the next archive_timeout instead
@@ -24,7 +28,7 @@ if [ -z "$WAL_FILE" ]; then
 fi
 
 PGDATA="${PGDATA:-/var/lib/postgresql/data}"
-PGWAL_THRESHOLD_GIB="${PGBACKREST_DROP_THRESHOLD_GIB:-10}"
+PGWAL_THRESHOLD_GIB="${PGBACKREST_DROP_THRESHOLD_GIB:-5}"
 PGWAL_THRESHOLD_BYTES=$(( PGWAL_THRESHOLD_GIB * 1024 * 1024 * 1024 ))
 
 pgbackrest --stanza=main archive-push "$WAL_FILE"

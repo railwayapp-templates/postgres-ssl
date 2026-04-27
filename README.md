@@ -69,7 +69,8 @@ volume.
 `archive_command` points at `/usr/local/bin/pgbackrest-archive-push-wrapper.sh`
 rather than calling `pgbackrest archive-push` directly. The wrapper tries the
 real push; on failure it measures `pg_wal/`, and when it exceeds the
-threshold (default 10 GiB, override via `PGBACKREST_DROP_THRESHOLD_GIB`) it
+threshold (default 5 GiB, matching pgBackRest's `archive-push-queue-max`;
+override via `PGBACKREST_DROP_THRESHOLD_GIB`) it
 returns success to Postgres anyway, dropping the segment. This is the
 never-halt safety net for failure modes that bypass pgBackRest's own
 queue-max — bad credentials, deleted bucket, expired keys,
