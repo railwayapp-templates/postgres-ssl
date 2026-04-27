@@ -53,6 +53,53 @@ docker run ghcr.io/railwayapp-templates/postgres-ssl:17
 docker run ghcr.io/railwayapp-templates/postgres-ssl:17.6
 ```
 
+### Point-in-time recovery (opt-in)
+
+The image ships with [pgBackRest](https://pgbackrest.org/) installed but
+dormant. When `PGBACKREST_REPO1_S3_BUCKET` is unset, the image behaves
+identically to a vanilla SSL Postgres image — no archiving, no extra
+processes, no config changes. When set, Postgres archives WAL segments
+continuously to S3-compatible storage in **async mode** with
+`archive-push-queue-max=5GiB`. If S3 stalls, WAL queues in the local spool
+without blocking Postgres; if the queue fills, pgBackRest drops WAL and
+keeps Postgres running rather than letting `pg_wal` fill the data volume.
+
+| Env var | Purpose |
+|---|---|
+| `PGBACKREST_REPO1_S3_BUCKET` | bucket name — gates archiving |
+| `PGBACKREST_REPO1_S3_ENDPOINT` | S3-compatible endpoint (e.g. `fly.storage.tigris.dev`) |
+| `PGBACKREST_REPO1_S3_REGION` | bucket region |
+| `PGBACKREST_REPO1_S3_KEY` / `PGBACKREST_REPO1_S3_KEY_SECRET` | bucket credentials |
+| `PGBACKREST_REPO1_PATH` | path prefix in bucket (e.g. `/pgbackrest`) |
+| `POSTGRES_RECOVERY_TARGET_TIME` | ISO 8601 timestamp; stages archive-recovery replay on next start |
+
+The first time archiving is enabled, run `pgbackrest --stanza=main stanza-create`
+inside the container (one-time stanza initialization). Subsequent restarts
+require no extra steps.
+
+When `POSTGRES_RECOVERY_TARGET_TIME` is set, the container writes a
+`recovery.signal` file and the matching `recovery_target_time` /
+`restore_command` / `recovery_target_action=promote` into
+`postgresql.auto.conf`. Postgres enters archive recovery, replays WAL from
+the bucket to the target timestamp, and promotes. A sentinel file
+(`$PGDATA/.pitr_configured`) prevents re-triggering on later restarts —
+PITR is expected to run against a fresh volume restored from a base
+snapshot.
+
+### Disabling PITR
+
+When `PGBACKREST_REPO1_S3_BUCKET` is removed (the gating env var), the
+container on next start strips the previously-written pgbackrest block
+from `postgresql.auto.conf` and removes `/etc/pgbackrest/pgbackrest.conf`
+so `archive_mode` and `archive_command` go away cleanly. Without this
+cleanup, Postgres would still try to fire the configured `archive_command`
+on every WAL switch — pgbackrest would fail with no creds, and Postgres
+would refuse to recycle WAL until the disk filled. The cleanup is bounded
+to a single sentinel-bracketed block (`# pgbackrest-config-begin` /
+`# pgbackrest-config-end`) written by either `pgbackrest-init.sh` or
+`wrapper.sh`, so user-managed `postgresql.auto.conf` entries are never
+touched.
+
 ### A note about ports
 
 By default, this image is hardcoded to listen on port `5432` regardless of what
