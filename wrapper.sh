@@ -128,19 +128,10 @@ render_pgbackrest_conf() {
   if [ -f "$POSTGRES_CONF_FILE" ]; then
     install -d -m 0750 -o postgres -g postgres "$PGDATA/pgbackrest-spool"
   fi
-  # repo1-retention-* is kept as a defensive fallback: this image never runs
-  # `pgbackrest backup`/`expire` itself, but if anything ever does (e.g. an
-  # out-of-band Railway-side cron against the same bucket) we want sane
-  # bounds rather than unbounded growth. WAL retention in the steady-state
-  # is still the bucket lifecycle's job.
   local process_max="${PGBACKREST_PROCESS_MAX:-2}"
   cat > "$PGBACKREST_CONF_FILE" <<EOF
 [global]
 repo1-type=s3
-repo1-retention-full=2
-repo1-retention-diff=4
-repo1-retention-archive=14
-repo1-retention-archive-type=incr
 log-level-console=info
 log-level-file=off
 archive-async=y

@@ -158,11 +158,10 @@ checkpoint LSN to anywhere useful. Pick a bucket TTL (or lifecycle rule)
 that covers your oldest restorable snapshot plus the longest replay
 window you care about.
 
-This image does not enforce the coupling. The image keeps
-`repo1-retention-*` defaults inside `/etc/pgbackrest/pgbackrest.conf` as
-a defensive fallback for any out-of-band `pgbackrest backup`/`expire`
-that runs against the same bucket; the bucket lifecycle is still the
-source of truth for steady-state WAL retention.
+This image does not enforce the coupling. The bucket lifecycle is the
+sole source of truth for WAL retention — the image never runs
+`pgbackrest backup`/`expire`, so no `repo1-retention-*` settings are
+written to `/etc/pgbackrest/pgbackrest.conf`.
 
 ### Disabling PITR
 
