@@ -82,15 +82,13 @@ fi
 # All helpers are no-ops unless PGBACKREST_REPO1_S3_BUCKET is set, so the
 # image behaves identically to pre-pgBackRest releases when unused.
 #
-# Three storage tiers absorb backup backpressure so Postgres never halts:
-#   1. Local spool dir (/var/lib/postgresql/pgbackrest-spool, ~few GiB)
-#   2. (future) dedicated backup service WAL volume — not in this image
-#   3. S3 (the configured repo)
-#
-# pgBackRest is run in async mode: archive_command writes WAL into the spool
-# dir and returns in milliseconds; a background worker pushes to S3. When
-# archive-push-queue-max trips, pgBackRest drops WAL and tells Postgres the
-# push succeeded, keeping Postgres running. PITR window truncates; DB stays up.
+# pgBackRest pushes WAL direct to S3 (no intermediary service). It runs in
+# async mode: archive_command writes WAL into the local spool dir and
+# returns in milliseconds; a background worker pushes from there to S3.
+# When archive-push-queue-max=5GiB trips during a sustained S3 outage,
+# pgBackRest drops WAL and reports success to Postgres rather than letting
+# pg_wal fill the data volume and halting the database. PITR window
+# truncates; DB stays up.
 # -----------------------------------------------------------------------------
 
 PGBACKREST_CONF_FILE="/etc/pgbackrest/pgbackrest.conf"
@@ -143,7 +141,7 @@ configure_pgbackrest_archiving() {
   cat >> "$AUTO_CONF_FILE" <<'EOF'
 # pgbackrest-config-begin (managed by wrapper.sh)
 archive_mode = 'on'
-archive_command = 'pgbackrest --stanza=main archive-push %p'
+archive_command = '/usr/local/bin/pgbackrest-archive-push-wrapper.sh %p'
 archive_timeout = '60'
 restore_command = 'pgbackrest --stanza=main archive-get %f %p'
 # pgbackrest-config-end
@@ -169,6 +167,37 @@ clear_pgbackrest_archiving_if_disabled() {
     && mv "$AUTO_CONF_FILE.tmp" "$AUTO_CONF_FILE"
   rm -f "$PGBACKREST_CONF_FILE"
   echo "pgbackrest: archive config removed from postgresql.auto.conf (PGBACKREST_REPO1_S3_BUCKET unset)"
+}
+
+# Run `pgbackrest stanza-create` automatically once Postgres is reachable.
+# Forks a background poller so wrapper.sh can stay on its existing exec
+# path. stanza-create is idempotent: a matching stanza already in the repo
+# is a no-op; a mismatch errors loudly (e.g. PGBACKREST_REPO1_PATH points
+# at another cluster's repo), which is the safety we want. Runs on every
+# boot — the S3 round-trip is cheap and there's no marker to bookkeep.
+#
+# Without this, the first WAL switch after enable would fail archive-push
+# with "stanza is missing data in the repo" until a human exec'd in and
+# ran the command — wrong default for a managed product.
+bootstrap_pgbackrest_stanza() {
+  [ -z "$PGBACKREST_REPO1_S3_BUCKET" ] && return 0
+
+  (
+    local deadline=$(( $(date +%s) + 300 ))
+    until pg_isready -U postgres -q 2>/dev/null; do
+      if [ "$(date +%s)" -ge "$deadline" ]; then
+        echo "pgbackrest: timed out waiting for Postgres before stanza-create" >&2
+        exit 1
+      fi
+      sleep 2
+    done
+
+    if gosu postgres pgbackrest --stanza=main stanza-create; then
+      echo "pgbackrest: stanza-create completed"
+    else
+      echo "pgbackrest: stanza-create failed (will retry on next boot)" >&2
+    fi
+  ) &
 }
 
 # Stage PITR replay when POSTGRES_RECOVERY_TARGET_TIME is set. Creates
@@ -203,6 +232,7 @@ render_pgbackrest_conf
 clear_pgbackrest_archiving_if_disabled
 configure_pgbackrest_archiving
 configure_pgbackrest_recovery
+bootstrap_pgbackrest_stanza
 
 # unset PGHOST to force psql to use Unix socket path
 # this is specific to Railway and allows

@@ -18,7 +18,7 @@ fi
 cat >> "$PGDATA/postgresql.auto.conf" <<'EOF'
 # pgbackrest-config-begin (managed by pgbackrest-init.sh)
 archive_mode = 'on'
-archive_command = 'pgbackrest --stanza=main archive-push %p'
+archive_command = '/usr/local/bin/pgbackrest-archive-push-wrapper.sh %p'
 archive_timeout = '60'
 restore_command = 'pgbackrest --stanza=main archive-get %f %p'
 # pgbackrest-config-end

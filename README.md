@@ -64,6 +64,20 @@ continuously to S3-compatible storage in **async mode** with
 without blocking Postgres; if the queue fills, pgBackRest drops WAL and
 keeps Postgres running rather than letting `pg_wal` fill the data volume.
 
+`archive_command` points at `/usr/local/bin/pgbackrest-archive-push-wrapper.sh`
+rather than calling `pgbackrest archive-push` directly. The wrapper tries the
+real push; on failure it measures `pg_wal/`, and when it exceeds the
+threshold (default 10 GiB, override via `PGBACKREST_DROP_THRESHOLD_GIB`) it
+returns success to Postgres anyway, dropping the segment. This is the
+never-halt safety net for failure modes that bypass pgBackRest's own
+queue-max — bad credentials, deleted bucket, expired keys,
+[pgbackrest#1848](https://github.com/pgbackrest/pgbackrest/issues/1848),
+[#1726](https://github.com/pgbackrest/pgbackrest/issues/1726). When the
+wrapper drops a segment the PITR window gets a coverage gap from that
+segment to the next post-recovery base snapshot; below the threshold the
+wrapper surfaces failures normally so transient errors retry on the next
+`archive_timeout`.
+
 | Env var | Purpose |
 |---|---|
 | `PGBACKREST_REPO1_S3_BUCKET` | bucket name — gates archiving |
@@ -73,9 +87,13 @@ keeps Postgres running rather than letting `pg_wal` fill the data volume.
 | `PGBACKREST_REPO1_PATH` | path prefix in bucket (e.g. `/pgbackrest`) |
 | `POSTGRES_RECOVERY_TARGET_TIME` | ISO 8601 timestamp; stages archive-recovery replay on next start |
 
-The first time archiving is enabled, run `pgbackrest --stanza=main stanza-create`
-inside the container (one-time stanza initialization). Subsequent restarts
-require no extra steps.
+Stanza initialization (`pgbackrest stanza-create`) runs automatically the
+first time the container boots with `PGBACKREST_REPO1_S3_BUCKET` set: a
+background task waits for Postgres to accept connections, then writes the
+stanza metadata into the bucket. The command is idempotent and runs on
+every subsequent boot — already-correct repo metadata is a no-op; a
+mismatch (e.g. `PGBACKREST_REPO1_PATH` pointing at another cluster's
+repo) errors loudly, which is the safety we want.
 
 When `POSTGRES_RECOVERY_TARGET_TIME` is set, the container writes a
 `recovery.signal` file and the matching `recovery_target_time` /
