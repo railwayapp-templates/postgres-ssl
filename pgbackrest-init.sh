@@ -2,9 +2,14 @@
 # pgbackrest-init.sh — runs once during initdb from /docker-entrypoint-initdb.d/.
 #
 # When PGBACKREST_REPO1_S3_BUCKET is set, writes archive config to
-# postgresql.auto.conf so a freshly initialized DB starts with pgBackRest
-# archiving on. The pgbackrest.conf file is rendered by wrapper.sh and is
-# already in place by the time this script runs.
+# $PGDATA/conf.d/pgbackrest.conf and adds `include_dir = 'conf.d'` to
+# postgresql.conf so a freshly initialized DB starts with pgBackRest
+# archiving on. We never write to postgresql.auto.conf — ALTER SYSTEM
+# rewrites it and would strip any sentinel comments we used to scope a
+# managed block, breaking clean disable.
+#
+# The pgbackrest.conf file at /etc/pgbackrest/ is rendered by wrapper.sh
+# and is already in place by the time this script runs.
 #
 # This handles the fresh-DB path. wrapper.sh handles the existing-DB path
 # (idempotent reapply), the disable path, and the recovery-target path.
@@ -23,19 +28,27 @@ fi
 mkdir -p "$PGDATA/pgbackrest-spool"
 chmod 0750 "$PGDATA/pgbackrest-spool"
 
+# Add the include directive once. postgresql.conf is not rewritten by
+# Postgres at runtime (only auto.conf is, by ALTER SYSTEM), so this single
+# line is durable.
+if ! grep -qE "^[[:space:]]*include_dir[[:space:]]*=[[:space:]]*'conf\.d'" "$PGDATA/postgresql.conf"; then
+  echo "include_dir = 'conf.d'" >> "$PGDATA/postgresql.conf"
+fi
+
+mkdir -p "$PGDATA/conf.d"
+chmod 0750 "$PGDATA/conf.d"
+
 archive_timeout="${POSTGRES_ARCHIVE_TIMEOUT:-60}"
-cat >> "$PGDATA/postgresql.auto.conf" <<EOF
-# pgbackrest-config-begin (managed by pgbackrest-init.sh)
+cat > "$PGDATA/conf.d/pgbackrest.conf" <<EOF
 archive_mode = 'on'
 archive_command = '/usr/local/bin/pgbackrest-archive-push-wrapper.sh %p'
 archive_timeout = '${archive_timeout}'
-restore_command = 'pgbackrest --stanza=main archive-get %f %p'
-# pgbackrest-config-end
 EOF
+chmod 0640 "$PGDATA/conf.d/pgbackrest.conf"
 
 # Stamp the source repo path so a future PITR-restored volume can detect
 # whether the operator pivoted PGBACKREST_REPO1_PATH before staging recovery
 # (see configure_pgbackrest_recovery in wrapper.sh).
 printf '%s' "${PGBACKREST_REPO1_PATH:-}" > "$PGDATA/.pgbackrest_source_path"
 
-echo "pgbackrest: archive config written to postgresql.auto.conf during initdb"
+echo "pgbackrest: archive config written to ${PGDATA}/conf.d/pgbackrest.conf during initdb"

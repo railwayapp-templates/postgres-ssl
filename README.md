@@ -100,17 +100,27 @@ every subsequent boot — already-correct repo metadata is a no-op; a
 mismatch (e.g. `PGBACKREST_REPO1_PATH` pointing at another cluster's
 repo) errors loudly, which is the safety we want.
 
-When `POSTGRES_RECOVERY_TARGET_TIME` is set, the container writes a
-`recovery.signal` file and the matching `recovery_target_time` /
-`restore_command` / `recovery_target_action=promote` into
-`postgresql.auto.conf`. Postgres enters archive recovery, replays WAL from
-the bucket to the target timestamp, and promotes. The "PITR done" sentinel
+All Postgres-side config the image manages (archive settings, recovery
+settings) is written to `$PGDATA/conf.d/*.conf`, with a one-time
+`include_dir = 'conf.d'` directive added to `postgresql.conf`. The image
+does not touch `postgresql.auto.conf` — Postgres rewrites that file on
+every `ALTER SYSTEM` call and strips comments, which would break any
+sentinel-based cleanup. With the include-directory approach, file
+existence *is* the sentinel: enable = write, disable = remove.
+
+When `POSTGRES_RECOVERY_TARGET_TIME` is set, the container writes
+`recovery_target_time`, `restore_command`, and
+`recovery_target_action='promote'` into
+`$PGDATA/conf.d/pgbackrest-recovery.conf` and creates `recovery.signal`.
+Postgres enters archive recovery, replays WAL from the bucket to the
+target timestamp, and promotes. The "PITR done" sentinel
 (`$PGDATA/.pitr_configured`) is written on the boot **after** Postgres
-removes `recovery.signal` (which it only does on successful promote), so
-a failed replay leaves the volume re-stageable — fix env vars and
-restart, no manual file cleanup needed. Once the sentinel is written,
-later restarts skip recovery entirely; PITR is expected to run against a
-fresh volume restored from a base snapshot.
+removes `recovery.signal` (which it only does on successful promote), at
+which point the recovery conf file is also removed. A failed replay
+leaves the volume re-stageable — fix env vars and restart, no manual
+file cleanup needed. Once the sentinel is written, later restarts skip
+recovery entirely; PITR is expected to run against a fresh volume
+restored from a base snapshot.
 
 ##### Repo-path divergence (mandatory on PITR restore)
 
@@ -147,23 +157,23 @@ checkpoint LSN to anywhere useful. Pick a bucket TTL (or lifecycle rule)
 that covers your oldest restorable snapshot plus the longest replay
 window you care about.
 
-This image does not enforce the coupling — pgBackRest's own
-`repo1-retention-*` knobs are intentionally left at defaults and not
-exposed, since the bucket lifecycle is the source of truth.
+This image does not enforce the coupling. The image keeps
+`repo1-retention-*` defaults inside `/etc/pgbackrest/pgbackrest.conf` as
+a defensive fallback for any out-of-band `pgbackrest backup`/`expire`
+that runs against the same bucket; the bucket lifecycle is still the
+source of truth for steady-state WAL retention.
 
 ### Disabling PITR
 
 When `PGBACKREST_REPO1_S3_BUCKET` is removed (the gating env var), the
-container on next start strips the previously-written pgbackrest block
-from `postgresql.auto.conf` and removes `/etc/pgbackrest/pgbackrest.conf`
-so `archive_mode` and `archive_command` go away cleanly. Without this
-cleanup, Postgres would still try to fire the configured `archive_command`
-on every WAL switch — pgbackrest would fail with no creds, and Postgres
-would refuse to recycle WAL until the disk filled. The cleanup is bounded
-to a single sentinel-bracketed block (`# pgbackrest-config-begin` /
-`# pgbackrest-config-end`) written by either `pgbackrest-init.sh` or
-`wrapper.sh`, so user-managed `postgresql.auto.conf` entries are never
-touched.
+container on next start removes `$PGDATA/conf.d/pgbackrest.conf`,
+`$PGDATA/conf.d/pgbackrest-recovery.conf` (if present), and
+`/etc/pgbackrest/pgbackrest.conf`. With the conf-file-as-sentinel model,
+removal IS the disable — `archive_mode`, `archive_command`, and any
+recovery settings vanish on next start. The `include_dir = 'conf.d'`
+line in `postgresql.conf` is left in place; it's a no-op when the
+directory is empty of pgbackrest files and any user-added include files
+in `conf.d/` continue to work.
 
 ### A note about ports
 
