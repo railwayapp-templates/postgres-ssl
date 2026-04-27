@@ -86,6 +86,25 @@ the bucket to the target timestamp, and promotes. A sentinel file
 PITR is expected to run against a fresh volume restored from a base
 snapshot.
 
+#### Retention coupling
+
+This image ships WAL archiving only — there is no `pgbackrest backup`
+running in-container. The "base" for any restore is a block-level
+snapshot of the data volume (e.g. a Railway volume snapshot); pgBackRest
+supplies the WAL needed to replay forward from that snapshot's
+checkpoint LSN to the target time.
+
+Because of that, **bucket WAL retention must be ≥ snapshot retention**.
+If snapshots live 30 days but the bucket TTL is 14 days, a 16-day-old
+snapshot is unrecoverable: there is no archived WAL to bridge from its
+checkpoint LSN to anywhere useful. Pick a bucket TTL (or lifecycle rule)
+that covers your oldest restorable snapshot plus the longest replay
+window you care about.
+
+This image does not enforce the coupling — pgBackRest's own
+`repo1-retention-*` knobs are intentionally left at defaults and not
+exposed, since the bucket lifecycle is the source of truth.
+
 ### Disabling PITR
 
 When `PGBACKREST_REPO1_S3_BUCKET` is removed (the gating env var), the

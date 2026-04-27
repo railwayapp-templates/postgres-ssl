@@ -146,7 +146,6 @@ archive_mode = 'on'
 archive_command = 'pgbackrest --stanza=main archive-push %p'
 archive_timeout = '60'
 restore_command = 'pgbackrest --stanza=main archive-get %f %p'
-wal_level = replica
 # pgbackrest-config-end
 EOF
   echo "pgbackrest: archive config appended to postgresql.auto.conf"
