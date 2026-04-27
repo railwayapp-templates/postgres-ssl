@@ -27,10 +27,11 @@ PGDATA="${PGDATA:-/var/lib/postgresql/data}"
 PGWAL_THRESHOLD_GIB="${PGBACKREST_DROP_THRESHOLD_GIB:-10}"
 PGWAL_THRESHOLD_BYTES=$(( PGWAL_THRESHOLD_GIB * 1024 * 1024 * 1024 ))
 
-if pgbackrest --stanza=main archive-push "$WAL_FILE"; then
+pgbackrest --stanza=main archive-push "$WAL_FILE"
+PGB_RC=$?
+if [ "$PGB_RC" -eq 0 ]; then
   exit 0
 fi
-PGB_RC=$?
 
 PGWAL_BYTES=$(du -sb "$PGDATA/pg_wal" 2>/dev/null | awk '{print $1}')
 if [ -z "${PGWAL_BYTES:-}" ]; then
