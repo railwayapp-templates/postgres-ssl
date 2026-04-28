@@ -8,10 +8,12 @@
 # SYSTEM rewrites it and would clobber any sentinel-bracketed block we used
 # to scope a managed section, breaking clean disable.
 #
-# Restored services have only WAL_RECOVER_FROM_* (no archive bucket of their
-# own); they skip this path entirely so a wiped volume's fresh initdb
-# doesn't accidentally start writing archive_command into the source's
-# bucket via the wrapper's translation of WAL_RECOVER_FROM_* to REPO1.
+# Gated on WAL_ARCHIVE_BUCKET — "does this service archive outgoing WAL?".
+# Skips when unset (vanilla services, restored services that haven't re-
+# enabled PITR). When a restored service has re-enabled PITR (both
+# WAL_RECOVER_FROM_* and WAL_ARCHIVE_* set) this path runs; archive_command
+# points at the push wrapper, which targets --repo=2 so post-promote WAL
+# lands in the new archive bucket, not the source's.
 #
 # /etc/pgbackrest/pgbackrest.conf is rendered by wrapper.sh and is already
 # in place by the time this script runs.
