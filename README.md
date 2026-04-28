@@ -56,15 +56,29 @@ docker run ghcr.io/railwayapp-templates/postgres-ssl:17.6
 ### Point-in-time recovery (opt-in)
 
 The image ships with [pgBackRest](https://pgbackrest.org/) installed but
-dormant. When `PGBACKREST_REPO1_S3_BUCKET` is unset, the image behaves
-identically to a vanilla SSL Postgres image — no archiving, no extra
-processes, no config changes. When set, Postgres archives WAL segments
-continuously to S3-compatible storage in **async mode** with
+dormant. When `WAL_ARCHIVE_BUCKET` is unset (and the service isn't a
+PITR-restored one — see below), the image behaves identically to a
+vanilla SSL Postgres image — no archiving, no extra processes, no
+config changes. When set, Postgres archives WAL segments continuously
+to S3-compatible storage in **async mode** with
 `archive-push-queue-max=5GiB`. If S3 stalls, WAL queues in the local spool
 (`$PGDATA/pgbackrest-spool`, on the data volume so it survives container
 restarts) without blocking Postgres; if the queue fills, pgBackRest drops
 WAL and keeps Postgres running rather than letting `pg_wal` fill the data
 volume.
+
+The image reads a tool-agnostic `WAL_ARCHIVE_*` / `WAL_RECOVER_FROM_*`
+env contract and translates internally to pgBackRest's native
+`PGBACKREST_REPO{1,2}_S3_*`, so swapping pgBackRest for another archiver
+in the future is a wrapper change rather than a cross-repo rewrite.
+Three modes:
+
+- `WAL_ARCHIVE_*` only → standalone archiving service. `repo1` = archive bucket.
+- `WAL_RECOVER_FROM_*` only → PITR-restored service, no ongoing archiving.
+  `repo1` = source's bucket (read-only during recovery).
+- `WAL_ARCHIVE_*` + `WAL_RECOVER_FROM_*` → restored service that has been
+  re-enabled for archiving. `repo1` = source (read), `repo2` = own
+  archive bucket (write).
 
 `archive_command` points at `/usr/local/bin/pgbackrest-archive-push-wrapper.sh`
 rather than calling `pgbackrest archive-push` directly. The wrapper tries the
@@ -91,20 +105,28 @@ The two thresholds gate orthogonal failure regimes:
   zero chance of success. Smaller cap so we don't hold 5 GiB of pg_wal
   hostage waiting for a config fix.
 
+Operator-facing env contract:
+
 | Env var | Purpose |
 |---|---|
-| `PGBACKREST_REPO1_S3_BUCKET` | bucket name — gates archiving |
-| `PGBACKREST_REPO1_S3_ENDPOINT` | S3-compatible endpoint (e.g. `fly.storage.tigris.dev`) |
-| `PGBACKREST_REPO1_S3_REGION` | bucket region |
-| `PGBACKREST_REPO1_S3_KEY` / `PGBACKREST_REPO1_S3_KEY_SECRET` | bucket credentials |
-| `PGBACKREST_REPO1_PATH` | path prefix where archive-push writes (e.g. `/pgbackrest`) |
-| `PGBACKREST_RECOVERY_REPO1_PATH` | path prefix archive-get reads from during PITR replay; baked into `restore_command`. Set to the source's `PGBACKREST_REPO1_PATH` so the recovered cluster can read source WAL while writing to a new prefix |
+| `WAL_ARCHIVE_BUCKET` | bucket name — gates archiving on this service |
+| `WAL_ARCHIVE_ENDPOINT` | S3-compatible endpoint (e.g. `fly.storage.tigris.dev`) |
+| `WAL_ARCHIVE_REGION` | bucket region |
+| `WAL_ARCHIVE_KEY` / `WAL_ARCHIVE_SECRET` | bucket credentials |
+| `WAL_ARCHIVE_PATH` | path prefix where archive-push writes (default `/pgbackrest`) |
+| `WAL_RECOVER_FROM_BUCKET` / `_ENDPOINT` / `_REGION` / `_KEY` / `_SECRET` / `_PATH` | source-bucket coordinates on a PITR-restored service; `archive-get` reads source WAL from here during replay. Set by backboard on restore; not normally a manual knob. |
+| `POSTGRES_RECOVERY_TARGET_TIME` | ISO 8601 timestamp; stages archive-recovery replay on next start |
+| `POSTGRES_ARCHIVE_TIMEOUT` | seconds Postgres waits before forcing a WAL switch (default `60`) |
+
+Image-level tuning knobs (pgBackRest-native, internal):
+
+| Env var | Purpose |
+|---|---|
+| `PGBACKREST_DROP_THRESHOLD_MB` | `pg_wal/` size at which the archive-push wrapper drops failing segments to keep Postgres running (default `500`) |
 | `PGBACKREST_ARCHIVE_PUSH_PROCESS_MAX` | parallel workers for `archive-push`. Default auto-sized as `clamp(cpus/8, 2, 8)`. |
 | `PGBACKREST_ARCHIVE_GET_PROCESS_MAX` | parallel workers for `archive-get`. Default `1` (WAL replay is serial). |
 | `PGBACKREST_BACKUP_PROCESS_MAX` | parallel workers for `backup`. Default auto-sized as `clamp(cpus/4, 1, 16)` (≤25% of CPUs to leave room for live DB). |
 | `PGBACKREST_RESTORE_PROCESS_MAX` | parallel workers for `restore`. Default auto-sized as `clamp(cpus, 1, 32)` (DB is down, but pgBackRest plateaus past ~32 workers). |
-| `POSTGRES_ARCHIVE_TIMEOUT` | seconds Postgres waits before forcing a WAL switch (default `60`) |
-| `POSTGRES_RECOVERY_TARGET_TIME` | ISO 8601 timestamp; stages archive-recovery replay on next start |
 
 Per-command worker counts (`process-max`) are auto-sized at container
 start from the cgroup-reported vCPU allocation (`cpu.max` on cgroup v2,
@@ -118,12 +140,14 @@ escape hatches for workloads that disprove the heuristic. On vertical
 autoscale, the new values take effect on the next container restart.
 
 Stanza initialization (`pgbackrest stanza-create`) runs automatically the
-first time the container boots with `PGBACKREST_REPO1_S3_BUCKET` set: a
+first time the container boots with `WAL_ARCHIVE_BUCKET` set: a
 background task waits for Postgres to accept connections, then writes the
 stanza metadata into the bucket. The command is idempotent and runs on
 every subsequent boot — already-correct repo metadata is a no-op; a
-mismatch (e.g. `PGBACKREST_REPO1_PATH` pointing at another cluster's
-repo) errors loudly, which is the safety we want.
+mismatch (e.g. `WAL_ARCHIVE_PATH` pointing at another cluster's repo)
+errors loudly, which is the safety we want. Stanza-create only runs
+against the service's own archive bucket, never against a
+`WAL_RECOVER_FROM_*` source repo (which is read-only during recovery).
 
 All Postgres-side config the image manages (archive settings, recovery
 settings) is written to `$PGDATA/conf.d/*.conf`, with a one-time
@@ -153,29 +177,24 @@ target, restore from a fresh volume snapshot (or, advanced: remove
 PITR runs only against an existing data directory. If
 `POSTGRES_RECOVERY_TARGET_TIME` is set on a brand-new container with no
 `$PGDATA`, the wrapper refuses to start and points at the fix (restore
-from a base snapshot first, or unset the recovery target). Without this
-check, initdb would silently produce a fresh database and the next
-restart would deadlock on the divergence check.
+from a base snapshot first, or unset the recovery target).
 
-##### Repo-path divergence (mandatory on PITR restore)
+##### Restored services have a separate bucket
 
-A restored volume carries the source's `$PGDATA` contents, including a
-`.pgbackrest_source_path` sentinel that records the bucket prefix the
-source has been pushing WAL to. On a PITR restore, the operator MUST set
-two distinct repo paths:
+PITR restore creates a brand-new Postgres service in the project; the
+source service stays online and untouched. The restored service's
+volume is populated from the source's snapshot, then booted with
+`WAL_RECOVER_FROM_*` pointing at the source's bucket and
+`POSTGRES_RECOVERY_TARGET_TIME` set — `archive-get` reads source WAL
+during replay. After promote, the restored service has no archive
+bucket of its own and runs as a plain non-archiving Postgres until the
+operator opts in via the standard PITR-enable flow (which provisions a
+fresh bucket on the restored service).
 
-- `PGBACKREST_REPO1_PATH` → a **new** prefix where the recovered
-  cluster's post-promote `archive_command` will land. If left equal to
-  the source's path, the recovered timeline overwrites the source's
-  ongoing WAL chain and corrupts both.
-- `PGBACKREST_RECOVERY_REPO1_PATH` → the **source's** path, so
-  `archive-get` during replay can read source WAL. This is baked into
-  `restore_command` via `--repo1-path=...`.
-
-The container refuses to stage recovery (exits non-zero before Postgres
-starts) when `PGBACKREST_REPO1_PATH` matches the stamped source path —
-catching the case where the operator set the recovery-read path
-correctly but forgot to pivot the post-promote write path.
+Source and restored services therefore never share a write path: there
+is no risk of the recovered timeline overwriting the source's ongoing
+WAL chain. The previous "mandatory repo-path divergence" guard and the
+`.pgbackrest_source_path` sentinel are gone.
 
 #### Retention coupling
 
@@ -199,21 +218,21 @@ written to `/etc/pgbackrest/pgbackrest.conf`.
 
 ### Disabling PITR
 
-When `PGBACKREST_REPO1_S3_BUCKET` is removed (the gating env var), the
-container on next start wipes all pgBackRest state from the volume so a
-later re-enable starts from a clean slate:
+When `WAL_ARCHIVE_BUCKET` is removed (the gating env var), the
+container on next start wipes the archive-side state so a later
+re-enable starts from a clean slate:
 
 - `$PGDATA/conf.d/pgbackrest.conf` (archive settings)
-- `$PGDATA/conf.d/pgbackrest-recovery.conf` (recovery settings, if present)
-- `/etc/pgbackrest/pgbackrest.conf` (image-level operator policy)
-- `$PGDATA/.pgbackrest_source_path` (source-path sentinel used by
-  the divergence check on PITR restore)
-- `$PGDATA/.pitr_staging`, `$PGDATA/.pitr_configured` (PITR markers —
-  removing them lets a fresh re-enable run PITR again later without
-  manual cleanup)
+- `/etc/pgbackrest/pgbackrest.conf` (image-level operator policy — only
+  removed when both `WAL_ARCHIVE_BUCKET` and `WAL_RECOVER_FROM_BUCKET`
+  are unset, since recovery-only services still need it)
 - `$PGDATA/pgbackrest-spool` (staged segments are useless without a
   repo to push to; any in-flight WAL was already covered by the
   archive-push wrapper's drop-on-failure path)
+- `$PGDATA/conf.d/pgbackrest-recovery.conf` and the
+  `$PGDATA/.pitr_staging` / `$PGDATA/.pitr_configured` markers are
+  scoped to `WAL_RECOVER_FROM_BUCKET` and only cleared when *that*
+  variable goes away.
 
 With the conf-file-as-sentinel model, removal IS the disable —
 `archive_mode`, `archive_command`, and any recovery settings vanish on
