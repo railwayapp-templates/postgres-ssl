@@ -87,7 +87,10 @@ fi
 # strips comments, so any sentinel-bracketed approach there is fragile.
 # postgresql.conf is not rewritten by Postgres at runtime, so adding a
 # one-time `include_dir = 'conf.d'` directive is durable; from then on,
-# enable/disable is just write/remove of conf.d/pgbackrest.conf.
+# enable/disable is just write/remove of conf.d/pgbackrest.conf. conf.d
+# loads before auto.conf so a determined operator's `ALTER SYSTEM SET
+# archive_mode = 'off'` still wins; the dashboard surfaces the divergence
+# from the image's intended state by reading pg_settings.
 #
 # pgBackRest pushes WAL direct to S3 (no intermediary service). It runs in
 # async mode: archive_command writes WAL into the local spool dir and
@@ -96,18 +99,82 @@ fi
 # pgBackRest drops WAL and reports success to Postgres rather than letting
 # pg_wal fill the data volume and halting the database. PITR window
 # truncates; DB stays up.
+#
+# Path constants and the helpers shared with pgbackrest-init.sh
+# (ensure_pgbackrest_spool_dir, ensure_pg_includes_confd,
+# write_pgbackrest_archive_conf, stamp_source_repo_path) live in
+# pgbackrest-helpers.sh; the wrapper here adds the boot-time-only paths
+# (rendering /etc/pgbackrest/pgbackrest.conf, disable cleanup, stanza
+# bootstrap, recovery staging).
 # -----------------------------------------------------------------------------
 
-PGBACKREST_CONF_FILE="/etc/pgbackrest/pgbackrest.conf"
-PGBACKREST_CONFD_DIR="$PGDATA/conf.d"
-PGBACKREST_ARCHIVE_CONF="$PGBACKREST_CONFD_DIR/pgbackrest.conf"
-PGBACKREST_RECOVERY_CONF="$PGBACKREST_CONFD_DIR/pgbackrest-recovery.conf"
+. /usr/local/bin/pgbackrest-helpers.sh
 
-# Path of the sentinel that records the repo1-path this volume's WAL has been
-# pushed to. Recovery refuses to stage if PGBACKREST_REPO1_PATH still matches
-# this — the operator must change it so post-promote archive-push lands in a
-# different prefix and can't corrupt the source's ongoing WAL chain.
-SOURCE_PATH_SENTINEL_FILE="$PGDATA/.pgbackrest_source_path"
+# Fresh init + POSTGRES_RECOVERY_TARGET_TIME is a footgun: archive recovery
+# only runs on existing data, so a fresh container would silently ignore
+# the target on this boot. On the next boot pgbackrest-init.sh has stamped
+# .pgbackrest_source_path to the current write path, and configure_pgbackrest_recovery
+# would refuse to start (stamp == current write path). Catch it here before
+# initdb runs, with a message that points at the actual fix.
+validate_no_pitr_on_fresh_db() {
+  [ -z "$PGBACKREST_REPO1_S3_BUCKET" ] && return 0
+  [ -z "$POSTGRES_RECOVERY_TARGET_TIME" ] && return 0
+  [ -f "$POSTGRES_CONF_FILE" ] && return 0
+  echo "pgbackrest: REFUSING to start: POSTGRES_RECOVERY_TARGET_TIME is set, but \$PGDATA is uninitialized." >&2
+  echo "pgbackrest: PITR replays WAL onto a base snapshot. Restore the volume from a base snapshot first," >&2
+  echo "pgbackrest: or unset POSTGRES_RECOVERY_TARGET_TIME to initialize a fresh database." >&2
+  exit 1
+}
+
+# Detect the container's effective CPU allocation. Reads cgroup v2 cpu.max
+# first (Railway, modern Docker, Kubernetes ≥ 1.25), then falls back to
+# cgroup v1 cpu.cfs_quota_us, then to nproc. Returns the integer ceiling
+# of fractional quotas (0.5 vCPU → 1) so process-max sizing is sane on the
+# smallest tier. "max"/"-1" quotas mean unlimited and use the host count.
+detect_cpus() {
+  local quota period
+
+  if [ -r /sys/fs/cgroup/cpu.max ]; then
+    read -r quota period < /sys/fs/cgroup/cpu.max
+    if [ "$quota" != "max" ] && [ -n "$quota" ] && [ -n "$period" ] && [ "$period" -gt 0 ]; then
+      echo $(( (quota + period - 1) / period ))
+      return
+    fi
+  fi
+
+  if [ -r /sys/fs/cgroup/cpu/cpu.cfs_quota_us ] && [ -r /sys/fs/cgroup/cpu/cpu.cfs_period_us ]; then
+    quota=$(cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us)
+    period=$(cat /sys/fs/cgroup/cpu/cpu.cfs_period_us)
+    if [ "$quota" -gt 0 ] && [ "$period" -gt 0 ]; then
+      echo $(( (quota + period - 1) / period ))
+      return
+    fi
+  fi
+
+  nproc 2>/dev/null || echo 1
+}
+
+# Compute per-command process-max with a clamp(value, min, max) shape.
+# Sized off detected CPUs because:
+#   archive-push: serial 16 MiB segment arrival + per-PUT S3 overhead.
+#     cpus/8 grows gently; floor 2 gives every tier some burst headroom;
+#     ceiling 16 because past that the bottleneck flips to WAL arrival
+#     and S3 per-prefix request rate, not worker count.
+#   archive-get: WAL replay is serial inside Postgres, so prefetching with
+#     >1 worker yields diminishing returns. Pinned to 1.
+#   backup: Steele's "≤25% of CPUs" rule (don't starve live DB traffic).
+#     Floor 1, ceiling 32 to bound per-worker zstd buffer memory and stay
+#     well under S3 per-prefix request limits on huge boxes.
+#   restore: DB is down, no other workload to protect, so use everything
+#     up to detected CPUs. No ceiling.
+# Per-command env overrides win when set (custom Enterprise sustaining
+# extreme WAL, or operator pinning for testing).
+clamp() {
+  local v=$1 lo=$2 hi=$3
+  [ "$v" -lt "$lo" ] && v=$lo
+  [ -n "$hi" ] && [ "$v" -gt "$hi" ] && v=$hi
+  echo "$v"
+}
 
 # Render /etc/pgbackrest/pgbackrest.conf with operator-policy defaults +
 # stanza definition (pg1-path, pg1-port). User-supplied options (S3 bucket,
@@ -118,17 +185,25 @@ render_pgbackrest_conf() {
   [ -z "$PGBACKREST_REPO1_S3_BUCKET" ] && return 0
 
   mkdir -p /etc/pgbackrest
-  # Spool lives under PGDATA so it survives container restarts on the same
-  # volume — segments staged in spool but not yet pushed to S3 would
-  # otherwise be silently dropped on restart (Postgres has already advanced
-  # restart_lsn after archive_command returned 0). Only create it once the
-  # data dir is initialized; before initdb, $PGDATA must be empty or
-  # docker-entrypoint refuses to run initdb. pgbackrest-init.sh handles the
-  # fresh-init case after initdb completes.
+  # Only create the spool dir once $PGDATA is initialized; before initdb,
+  # $PGDATA must be empty or docker-entrypoint refuses to run initdb.
+  # pgbackrest-init.sh creates the spool on the fresh-init path.
   if [ -f "$POSTGRES_CONF_FILE" ]; then
-    install -d -m 0750 -o postgres -g postgres "$PGDATA/pgbackrest-spool"
+    ensure_pgbackrest_spool_dir
   fi
-  local process_max="${PGBACKREST_PROCESS_MAX:-2}"
+
+  local cpus
+  cpus=$(detect_cpus)
+  [ "$cpus" -lt 1 ] && cpus=1
+
+  local push_max get_max backup_max restore_max
+  push_max=${PGBACKREST_ARCHIVE_PUSH_PROCESS_MAX:-$(clamp $((cpus / 8)) 2 16)}
+  get_max=${PGBACKREST_ARCHIVE_GET_PROCESS_MAX:-1}
+  backup_max=${PGBACKREST_BACKUP_PROCESS_MAX:-$(clamp $((cpus / 4)) 1 32)}
+  restore_max=${PGBACKREST_RESTORE_PROCESS_MAX:-$cpus}
+
+  echo "pgbackrest: detected ${cpus} vCPU; process-max push=${push_max} get=${get_max} backup=${backup_max} restore=${restore_max}"
+
   cat > "$PGBACKREST_CONF_FILE" <<EOF
 [global]
 repo1-type=s3
@@ -137,11 +212,22 @@ log-level-file=off
 archive-async=y
 archive-push-queue-max=5GiB
 archive-get-queue-max=1GiB
-spool-path=${PGDATA}/pgbackrest-spool
-process-max=${process_max}
+spool-path=${PGBACKREST_SPOOL_DIR}
 compress-type=zst
 compress-level=3
 start-fast=y
+
+[global:archive-push]
+process-max=${push_max}
+
+[global:archive-get]
+process-max=${get_max}
+
+[global:backup]
+process-max=${backup_max}
+
+[global:restore]
+process-max=${restore_max}
 
 [main]
 pg1-path=${PGDATA}
@@ -152,77 +238,64 @@ EOF
   echo "pgbackrest: rendered $PGBACKREST_CONF_FILE"
 }
 
-# Refresh the sentinel to track the currently-configured repo1-path. Runs on
-# every boot when archiving is enabled so the recorded value reflects the
-# path Postgres is actually pushing to right now.
-#
-# Skipped while a PITR replay is in flight (.pitr_staging present): on a
-# restored volume the stamp must keep showing the SOURCE's path until promote
-# succeeds, otherwise a retry of a failed replay would trip the divergence
-# check in configure_pgbackrest_recovery (stamp == current write path).
-stamp_source_repo_path() {
+# Refresh the source-path sentinel to track the currently-configured
+# repo1-path. Skipped while a PITR replay is in flight (.pitr_staging
+# present): on a restored volume the stamp must keep showing the SOURCE's
+# path until promote succeeds, otherwise a retry of a failed replay would
+# trip the divergence check (stamp == current write path).
+refresh_source_path_stamp() {
   [ -z "$PGBACKREST_REPO1_S3_BUCKET" ] && return 0
   [ ! -d "$PGDATA" ] && return 0
-  [ -f "$PGDATA/.pitr_staging" ] && return 0
+  [ -f "$PITR_STAGING_FILE" ] && return 0
   local current_path="${PGBACKREST_REPO1_PATH:-}"
   if [ -f "$SOURCE_PATH_SENTINEL_FILE" ] \
      && [ "$(cat "$SOURCE_PATH_SENTINEL_FILE")" = "$current_path" ]; then
     return 0
   fi
-  printf '%s' "$current_path" > "$SOURCE_PATH_SENTINEL_FILE"
+  stamp_source_repo_path
   echo "pgbackrest: stamped source repo path '${current_path}' to ${SOURCE_PATH_SENTINEL_FILE}"
 }
 
-# Add `include_dir = 'conf.d'` to postgresql.conf if not already present.
-# postgresql.conf is not rewritten by Postgres (only auto.conf is, by ALTER
-# SYSTEM), so this single edit is one-shot and durable. Files in conf.d/ are
-# loaded after postgresql.conf and before postgresql.auto.conf — last write
-# wins, so user `ALTER SYSTEM SET archive_mode = 'off'` would still take
-# precedence over our conf.d entry, which is the right semantics.
-ensure_pg_includes_confd() {
-  [ ! -f "$POSTGRES_CONF_FILE" ] && return 0
-  if grep -qE "^[[:space:]]*include_dir[[:space:]]*=[[:space:]]*'conf\.d'" "$POSTGRES_CONF_FILE"; then
-    return 0
-  fi
-  echo "include_dir = 'conf.d'" >> "$POSTGRES_CONF_FILE"
-  echo "pgbackrest: enabled include_dir 'conf.d' in postgresql.conf"
-}
-
-# Write archive config to $PGDATA/conf.d/pgbackrest.conf when
-# PGBACKREST_REPO1_S3_BUCKET is set and the DB is already initialized.
-# Idempotent: rewritten on every boot when the gate var is set.
-write_pgbackrest_archive_conf() {
+# Apply the shared archive-conf write on existing-DB boots. Fresh-init
+# is handled by pgbackrest-init.sh inside docker-entrypoint-initdb.d/.
+# The helpers chown to postgres when invoked as root, so no extra chown
+# is needed here.
+apply_pgbackrest_archive_conf() {
   [ -z "$PGBACKREST_REPO1_S3_BUCKET" ] && return 0
   [ ! -f "$POSTGRES_CONF_FILE" ] && return 0
-
   ensure_pg_includes_confd
-  install -d -m 0750 -o postgres -g postgres "$PGBACKREST_CONFD_DIR"
-
-  local archive_timeout="${POSTGRES_ARCHIVE_TIMEOUT:-60}"
-  cat > "$PGBACKREST_ARCHIVE_CONF" <<EOF
-archive_mode = 'on'
-archive_command = '/usr/local/bin/pgbackrest-archive-push-wrapper.sh %p'
-archive_timeout = '${archive_timeout}'
-EOF
-  chown postgres:postgres "$PGBACKREST_ARCHIVE_CONF"
-  chmod 0640 "$PGBACKREST_ARCHIVE_CONF"
-  echo "pgbackrest: wrote ${PGBACKREST_ARCHIVE_CONF}"
+  write_pgbackrest_archive_conf
 }
 
-# Inverse of write_pgbackrest_archive_conf: when the gate var is unset and
-# the conf still exists from a previous boot (user just disabled PITR),
-# remove it so archive_mode reverts to the default off and archive_command
-# vanishes. Without this, pgbackrest would fire on every WAL switch with no
-# creds and Postgres would refuse to recycle WAL until the disk filled.
-clear_pgbackrest_conf_if_disabled() {
+# Inverse of apply_pgbackrest_archive_conf: when the gate var is unset and
+# config exists from a previous boot (user just disabled PITR), wipe
+# everything pgBackRest-related from the volume. Without this, pgbackrest
+# would fire on every WAL switch with no creds and Postgres would refuse to
+# recycle WAL until the disk filled.
+#
+# Cleared on disable:
+#   - $PGDATA/conf.d/pgbackrest.conf, pgbackrest-recovery.conf
+#   - /etc/pgbackrest/pgbackrest.conf
+#   - $PGDATA/.pgbackrest_source_path (source-path sentinel)
+#   - $PGDATA/.pitr_staging, $PGDATA/.pitr_configured (PITR markers — fresh
+#     enable later should be able to PITR again without manual cleanup)
+#   - $PGDATA/pgbackrest-spool (staged segments are useless without the
+#     repo to push to; any in-flight WAL was already covered by the
+#     wrapper's drop-on-failure path)
+# The `include_dir = 'conf.d'` line in postgresql.conf is left in place
+# (no-op when the directory has no pgbackrest files).
+clear_pgbackrest_state_if_disabled() {
   [ -n "$PGBACKREST_REPO1_S3_BUCKET" ] && return 0
   local removed=0
   [ -f "$PGBACKREST_ARCHIVE_CONF" ] && rm -f "$PGBACKREST_ARCHIVE_CONF" && removed=1
   [ -f "$PGBACKREST_RECOVERY_CONF" ] && rm -f "$PGBACKREST_RECOVERY_CONF" && removed=1
   [ -f "$PGBACKREST_CONF_FILE" ] && rm -f "$PGBACKREST_CONF_FILE" && removed=1
   [ -f "$SOURCE_PATH_SENTINEL_FILE" ] && rm -f "$SOURCE_PATH_SENTINEL_FILE" && removed=1
+  [ -f "$PITR_STAGING_FILE" ] && rm -f "$PITR_STAGING_FILE" && removed=1
+  [ -f "$PITR_DONE_MARKER" ] && rm -f "$PITR_DONE_MARKER" && removed=1
+  [ -d "$PGBACKREST_SPOOL_DIR" ] && rm -rf "$PGBACKREST_SPOOL_DIR" && removed=1
   if [ "$removed" = "1" ]; then
-    echo "pgbackrest: cleared archive/recovery config (PGBACKREST_REPO1_S3_BUCKET unset)"
+    echo "pgbackrest: cleared archive/recovery config and PITR state (PGBACKREST_REPO1_S3_BUCKET unset)"
   fi
 }
 
@@ -243,13 +316,18 @@ clear_pgbackrest_conf_if_disabled() {
 # Without this, the first WAL switch after enable would fail archive-push
 # with "stanza is missing data in the repo" until a human exec'd in and
 # ran the command — wrong default for a managed product.
+#
+# 600s deadline accommodates slow first boots: a freshly initdb'd cluster
+# plus user-supplied init SQL can easily run a few minutes before the
+# real postmaster binds TCP. If we time out, first WAL push fails until
+# the next boot retries — recoverable, but louder than necessary.
 bootstrap_pgbackrest_stanza() {
   [ -z "$PGBACKREST_REPO1_S3_BUCKET" ] && return 0
 
   (
     # No `local` here: subshells are their own scope so it's redundant, and
     # the construct misleads if the body is ever lifted out of a function.
-    deadline=$(( $(date +%s) + 300 ))
+    deadline=$(( $(date +%s) + 600 ))
     until pg_isready -h 127.0.0.1 -p 5432 -U postgres -q 2>/dev/null; do
       if [ "$(date +%s)" -ge "$deadline" ]; then
         echo "pgbackrest: timed out waiting for Postgres before stanza-create" >&2
@@ -275,7 +353,10 @@ bootstrap_pgbackrest_stanza() {
 #     replay attempt is in flight or last attempt didn't promote yet.
 #   - .pitr_configured: written on the boot AFTER Postgres consumes
 #     recovery.signal (which Postgres removes only on successful promote).
-#     Means PITR is done and must not run again on this volume.
+#     Means PITR is done and must not run again on this volume; once set,
+#     subsequent boots skip recovery even if POSTGRES_RECOVERY_TARGET_TIME
+#     is changed. To re-run PITR with a different target the operator
+#     must restore from a fresh snapshot (or, advanced: rm the marker).
 # So a failed replay (bad target time, missing WAL, bad creds) leaves
 # .pitr_staging behind WITHOUT .pitr_configured — the operator can fix env
 # vars and restart, and the next boot will re-stage cleanly. The recovery
@@ -297,9 +378,7 @@ configure_pgbackrest_recovery() {
   [ -z "$POSTGRES_RECOVERY_TARGET_TIME" ] && return 0
   [ ! -f "$POSTGRES_CONF_FILE" ] && return 0
 
-  local marker="$PGDATA/.pitr_configured"
-  local staging="$PGDATA/.pitr_staging"
-  if [ -f "$marker" ]; then
+  if [ -f "$PITR_DONE_MARKER" ]; then
     return 0
   fi
 
@@ -307,10 +386,10 @@ configure_pgbackrest_recovery() {
   # present) and Postgres has since removed recovery.signal, which it only
   # does on successful promote. Stamp the marker, drop the staging file, and
   # remove the recovery conf so subsequent boots are vanilla archive-only.
-  if [ -f "$staging" ] && [ ! -f "$PGDATA/recovery.signal" ]; then
-    rm -f "$staging"
+  if [ -f "$PITR_STAGING_FILE" ] && [ ! -f "$PGDATA/recovery.signal" ]; then
+    rm -f "$PITR_STAGING_FILE"
     rm -f "$PGBACKREST_RECOVERY_CONF"
-    touch "$marker"
+    touch "$PITR_DONE_MARKER"
     echo "pgbackrest: previous PITR replay completed; marker written"
     return 0
   fi
@@ -328,12 +407,18 @@ configure_pgbackrest_recovery() {
   fi
 
   ensure_pg_includes_confd
-  install -d -m 0750 -o postgres -g postgres "$PGBACKREST_CONFD_DIR"
+  ensure_pgbackrest_confd_dir
 
   local recovery_read_path="${PGBACKREST_RECOVERY_REPO1_PATH:-}"
   local restore_cmd="pgbackrest --stanza=main archive-get %f %p"
   if [ -n "$recovery_read_path" ]; then
-    restore_cmd="pgbackrest --stanza=main --repo1-path=${recovery_read_path} archive-get %f %p"
+    # printf %q produces a shell-safe quoted form, so a recovery_read_path
+    # with spaces, dollar signs, etc. survives the eventual sh -c that
+    # Postgres uses to run restore_command. Without this, "/foo bar" would
+    # split into two args and the restore_command would silently malform.
+    local quoted_read_path
+    printf -v quoted_read_path '%q' "$recovery_read_path"
+    restore_cmd="pgbackrest --stanza=main --repo1-path=${quoted_read_path} archive-get %f %p"
   else
     echo "pgbackrest: WARNING — PGBACKREST_RECOVERY_REPO1_PATH unset; archive-get will use PGBACKREST_REPO1_PATH ('${PGBACKREST_REPO1_PATH:-}'). Set the recovery-read path explicitly to avoid coupling read and write paths." >&2
   fi
@@ -347,18 +432,19 @@ restore_command = '${escaped_restore}'
 recovery_target_time = '${escaped_target}'
 recovery_target_action = 'promote'
 EOF
-  chown postgres:postgres "$PGBACKREST_RECOVERY_CONF"
   chmod 0640 "$PGBACKREST_RECOVERY_CONF"
+  chown_postgres_if_root "$PGBACKREST_RECOVERY_CONF"
   touch "$PGDATA/recovery.signal"
-  touch "$staging"
+  touch "$PITR_STAGING_FILE"
   echo "pgbackrest: PITR replay staged (target=${POSTGRES_RECOVERY_TARGET_TIME})"
 }
 
+validate_no_pitr_on_fresh_db
 render_pgbackrest_conf
-clear_pgbackrest_conf_if_disabled
-write_pgbackrest_archive_conf
+clear_pgbackrest_state_if_disabled
+apply_pgbackrest_archive_conf
 configure_pgbackrest_recovery
-stamp_source_repo_path
+refresh_source_path_stamp
 bootstrap_pgbackrest_stanza
 
 # unset PGHOST to force psql to use Unix socket path

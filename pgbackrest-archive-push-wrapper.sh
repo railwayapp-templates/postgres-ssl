@@ -18,6 +18,15 @@
 # Below the threshold the wrapper surfaces pgbackrest's failure to Postgres
 # normally, so transient S3 issues retry on the next archive_timeout instead
 # of being silently dropped.
+#
+# Cost of `du -sb $PGDATA/pg_wal` here: only fires when archive-push fails.
+# Under normal operation pgbackrest succeeds in async mode (segment written
+# to spool, returns in milliseconds) and the wrapper exits before du runs.
+# When pgbackrest IS failing, archive_command retries on every WAL switch
+# (default archive_timeout=60s) — and pg_wal has by definition stopped
+# being recycled, so it's a few hundred segments at most. A directory
+# traversal of a few hundred small files every minute is the cheapest
+# thing happening on this host while S3 is unreachable. Not worth caching.
 
 set -u
 

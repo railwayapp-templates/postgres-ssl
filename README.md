@@ -89,9 +89,23 @@ wrapper surfaces failures normally so transient errors retry on the next
 | `PGBACKREST_REPO1_S3_KEY` / `PGBACKREST_REPO1_S3_KEY_SECRET` | bucket credentials |
 | `PGBACKREST_REPO1_PATH` | path prefix where archive-push writes (e.g. `/pgbackrest`) |
 | `PGBACKREST_RECOVERY_REPO1_PATH` | path prefix archive-get reads from during PITR replay; baked into `restore_command`. Set to the source's `PGBACKREST_REPO1_PATH` so the recovered cluster can read source WAL while writing to a new prefix |
-| `PGBACKREST_PROCESS_MAX` | parallel S3 workers for archive-push/get (default `2`) |
+| `PGBACKREST_ARCHIVE_PUSH_PROCESS_MAX` | parallel workers for `archive-push`. Default auto-sized from detected vCPU as `clamp(cpus/8, 2, 16)`. |
+| `PGBACKREST_ARCHIVE_GET_PROCESS_MAX` | parallel workers for `archive-get`. Default `1` (WAL replay is serial). |
+| `PGBACKREST_BACKUP_PROCESS_MAX` | parallel workers for `backup`. Default auto-sized as `clamp(cpus/4, 1, 32)` (≤25% of CPUs to leave room for live DB). |
+| `PGBACKREST_RESTORE_PROCESS_MAX` | parallel workers for `restore`. Default = detected vCPU (DB is down). |
 | `POSTGRES_ARCHIVE_TIMEOUT` | seconds Postgres waits before forcing a WAL switch (default `60`) |
 | `POSTGRES_RECOVERY_TARGET_TIME` | ISO 8601 timestamp; stages archive-recovery replay on next start |
+
+Per-command worker counts (`process-max`) are auto-sized at container
+start from the cgroup-reported vCPU allocation (`cpu.max` on cgroup v2,
+`cpu.cfs_quota_us` on v1, `nproc` as a fallback). The four commands have
+different bottleneck shapes — `archive-push` is gated by serial WAL
+arrival and S3 PUT overhead, `archive-get` by serial replay inside
+Postgres, `backup` by the need to leave CPU for live DB traffic,
+`restore` by nothing (DB is down) — so each gets its own derived
+default. The `PGBACKREST_*_PROCESS_MAX` env vars (table above) are
+escape hatches for workloads that disprove the heuristic. On vertical
+autoscale, the new values take effect on the next container restart.
 
 Stanza initialization (`pgbackrest stanza-create`) runs automatically the
 first time the container boots with `PGBACKREST_REPO1_S3_BUCKET` set: a
@@ -120,8 +134,18 @@ removes `recovery.signal` (which it only does on successful promote), at
 which point the recovery conf file is also removed. A failed replay
 leaves the volume re-stageable — fix env vars and restart, no manual
 file cleanup needed. Once the sentinel is written, later restarts skip
-recovery entirely; PITR is expected to run against a fresh volume
-restored from a base snapshot.
+recovery entirely **even if `POSTGRES_RECOVERY_TARGET_TIME` is changed
+to a different value** — the cluster has already promoted to a new
+timeline and replaying again would corrupt it. To probe a different
+target, restore from a fresh volume snapshot (or, advanced: remove
+`$PGDATA/.pitr_configured` before the next start).
+
+PITR runs only against an existing data directory. If
+`POSTGRES_RECOVERY_TARGET_TIME` is set on a brand-new container with no
+`$PGDATA`, the wrapper refuses to start and points at the fix (restore
+from a base snapshot first, or unset the recovery target). Without this
+check, initdb would silently produce a fresh database and the next
+restart would deadlock on the divergence check.
 
 ##### Repo-path divergence (mandatory on PITR restore)
 
@@ -166,14 +190,26 @@ written to `/etc/pgbackrest/pgbackrest.conf`.
 ### Disabling PITR
 
 When `PGBACKREST_REPO1_S3_BUCKET` is removed (the gating env var), the
-container on next start removes `$PGDATA/conf.d/pgbackrest.conf`,
-`$PGDATA/conf.d/pgbackrest-recovery.conf` (if present), and
-`/etc/pgbackrest/pgbackrest.conf`. With the conf-file-as-sentinel model,
-removal IS the disable — `archive_mode`, `archive_command`, and any
-recovery settings vanish on next start. The `include_dir = 'conf.d'`
-line in `postgresql.conf` is left in place; it's a no-op when the
-directory is empty of pgbackrest files and any user-added include files
-in `conf.d/` continue to work.
+container on next start wipes all pgBackRest state from the volume so a
+later re-enable starts from a clean slate:
+
+- `$PGDATA/conf.d/pgbackrest.conf` (archive settings)
+- `$PGDATA/conf.d/pgbackrest-recovery.conf` (recovery settings, if present)
+- `/etc/pgbackrest/pgbackrest.conf` (image-level operator policy)
+- `$PGDATA/.pgbackrest_source_path` (source-path sentinel used by
+  the divergence check on PITR restore)
+- `$PGDATA/.pitr_staging`, `$PGDATA/.pitr_configured` (PITR markers —
+  removing them lets a fresh re-enable run PITR again later without
+  manual cleanup)
+- `$PGDATA/pgbackrest-spool` (staged segments are useless without a
+  repo to push to; any in-flight WAL was already covered by the
+  archive-push wrapper's drop-on-failure path)
+
+With the conf-file-as-sentinel model, removal IS the disable —
+`archive_mode`, `archive_command`, and any recovery settings vanish on
+next start. The `include_dir = 'conf.d'` line in `postgresql.conf` is
+left in place; it's a no-op when the directory has no pgbackrest files,
+and any user-added include files in `conf.d/` continue to work.
 
 ### A note about ports
 
