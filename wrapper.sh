@@ -79,32 +79,37 @@ fi
 # -----------------------------------------------------------------------------
 # WAL archiving + PITR (tool-agnostic env contract)
 #
-# Backboard / frontend / template speak `WAL_ARCHIVE_*` and (on restored
-# services) `WAL_RECOVER_FROM_*`. The translation below maps that contract
-# onto pgBackRest's native `PGBACKREST_REPO{1,2}_S3_*` env vars so the rest
-# of this script can stay pgBackRest-shaped. Swapping pgBackRest↔wal-g is a
-# wrapper change, not a fan-out rewrite.
+# Backboard / frontend / template speak `WAL_ARCHIVE_*` (this service's own
+# archive bucket) and `WAL_RECOVER_FROM_*` (only on restored services, points
+# at source's bucket for read-during-recovery). The translation below maps
+# that contract onto pgBackRest's native `PGBACKREST_REPO{1,2}_S3_*` so the
+# rest of this script can stay pgBackRest-shaped.
 #
-# Two scenarios:
-#   - `WAL_ARCHIVE_*` only → standard archiving service. REPO1 = archive
-#     bucket (used for both push and any get).
-#   - `WAL_ARCHIVE_*` + `WAL_RECOVER_FROM_*` → restored service. REPO1 =
-#     recover-from (read source's WAL during archive recovery), REPO2 =
-#     archive (push the new timeline post-promote). `archive-push-repo=2`
-#     in pgbackrest.conf pins archive_command to repo2.
-if [ -n "${WAL_ARCHIVE_BUCKET:-}" ] && [ -n "${WAL_RECOVER_FROM_BUCKET:-}" ]; then
+# Three modes:
+#   - WAL_ARCHIVE_* only → standalone archiving service. REPO1 = archive.
+#   - WAL_RECOVER_FROM_* only → restored service, no ongoing archiving. REPO1
+#     = source bucket (read for archive-get during recovery). After promote
+#     no archive_command runs; user enables PITR via the standard flow if
+#     they want continued archiving (which provisions a fresh bucket then).
+#   - WAL_ARCHIVE_* + WAL_RECOVER_FROM_* → restored service that already has
+#     PITR re-enabled. REPO1 = recover-from, REPO2 = archive; the archive-
+#     push wrapper adds --repo=2 so post-promote WAL never sprays into the
+#     source bucket.
+if [ -n "${WAL_RECOVER_FROM_BUCKET:-}" ]; then
   export PGBACKREST_REPO1_S3_BUCKET="$WAL_RECOVER_FROM_BUCKET"
   export PGBACKREST_REPO1_S3_KEY="$WAL_RECOVER_FROM_KEY"
   export PGBACKREST_REPO1_S3_KEY_SECRET="$WAL_RECOVER_FROM_SECRET"
   export PGBACKREST_REPO1_S3_REGION="$WAL_RECOVER_FROM_REGION"
   export PGBACKREST_REPO1_S3_ENDPOINT="$WAL_RECOVER_FROM_ENDPOINT"
   export PGBACKREST_REPO1_PATH="${WAL_RECOVER_FROM_PATH:-/pgbackrest}"
-  export PGBACKREST_REPO2_S3_BUCKET="$WAL_ARCHIVE_BUCKET"
-  export PGBACKREST_REPO2_S3_KEY="$WAL_ARCHIVE_KEY"
-  export PGBACKREST_REPO2_S3_KEY_SECRET="$WAL_ARCHIVE_SECRET"
-  export PGBACKREST_REPO2_S3_REGION="$WAL_ARCHIVE_REGION"
-  export PGBACKREST_REPO2_S3_ENDPOINT="$WAL_ARCHIVE_ENDPOINT"
-  export PGBACKREST_REPO2_PATH="${WAL_ARCHIVE_PATH:-/pgbackrest}"
+  if [ -n "${WAL_ARCHIVE_BUCKET:-}" ]; then
+    export PGBACKREST_REPO2_S3_BUCKET="$WAL_ARCHIVE_BUCKET"
+    export PGBACKREST_REPO2_S3_KEY="$WAL_ARCHIVE_KEY"
+    export PGBACKREST_REPO2_S3_KEY_SECRET="$WAL_ARCHIVE_SECRET"
+    export PGBACKREST_REPO2_S3_REGION="$WAL_ARCHIVE_REGION"
+    export PGBACKREST_REPO2_S3_ENDPOINT="$WAL_ARCHIVE_ENDPOINT"
+    export PGBACKREST_REPO2_PATH="${WAL_ARCHIVE_PATH:-/pgbackrest}"
+  fi
 elif [ -n "${WAL_ARCHIVE_BUCKET:-}" ]; then
   export PGBACKREST_REPO1_S3_BUCKET="$WAL_ARCHIVE_BUCKET"
   export PGBACKREST_REPO1_S3_KEY="$WAL_ARCHIVE_KEY"
@@ -114,9 +119,12 @@ elif [ -n "${WAL_ARCHIVE_BUCKET:-}" ]; then
   export PGBACKREST_REPO1_PATH="${WAL_ARCHIVE_PATH:-/pgbackrest}"
 fi
 
-# All helpers are no-ops unless PGBACKREST_REPO1_S3_BUCKET is set (i.e., the
-# WAL_ARCHIVE contract above translated to a non-empty repo1 bucket), so the
-# image behaves identically to pre-pgBackRest releases when unused.
+# Helpers gate on whichever role is active. PGBACKREST_REPO1_S3_BUCKET acts
+# as the "any pgBackRest at all" gate (rendering pgbackrest.conf, running
+# stanza-create); WAL_ARCHIVE_BUCKET specifically gates writing
+# archive_mode=on / archive_command (this service archives outgoing WAL);
+# WAL_RECOVER_FROM_BUCKET + POSTGRES_RECOVERY_TARGET_TIME together gate
+# arming archive recovery on first boot.
 #
 # Postgres config is delivered via a managed include directory (conf.d/)
 # rather than postgresql.auto.conf. ALTER SYSTEM rewrites auto.conf and
@@ -305,11 +313,14 @@ EOF
   echo "pgbackrest: rendered $PGBACKREST_CONF_FILE"
 }
 
-# Write archive config to $PGDATA/conf.d/pgbackrest.conf when the gate var
-# is set and the DB is already initialized. Idempotent: rewritten on every
-# boot. Fresh-init is handled by pgbackrest-init.sh from initdb.
+# Write archive config to $PGDATA/conf.d/pgbackrest.conf when the service has
+# its own archive bucket and the DB is already initialized. Idempotent:
+# rewritten on every boot. Fresh-init is handled by pgbackrest-init.sh from
+# initdb. Restored services without WAL_ARCHIVE_BUCKET skip this — they read
+# from repo1 during recovery via configure_pgbackrest_recovery and run as
+# plain non-archiving Postgres after promote.
 apply_pgbackrest_archive_conf() {
-  [ -z "$PGBACKREST_REPO1_S3_BUCKET" ] && return 0
+  [ -z "${WAL_ARCHIVE_BUCKET:-}" ] && return 0
   [ ! -f "$POSTGRES_CONF_FILE" ] && return 0
   ensure_pg_includes_confd
   install -d -m 0750 -o postgres -g postgres "$PGBACKREST_CONFD_DIR"
@@ -325,33 +336,32 @@ EOF
   echo "pgbackrest: wrote ${PGBACKREST_ARCHIVE_CONF}"
 }
 
-# Inverse of apply_pgbackrest_archive_conf: when the gate var is unset and
-# config exists from a previous boot (user just disabled PITR), wipe
-# everything pgBackRest-related from the volume. Without this, pgbackrest
-# would fire on every WAL switch with no creds and Postgres would refuse to
-# recycle WAL until the disk filled.
-#
-# Cleared on disable:
-#   - $PGDATA/conf.d/pgbackrest.conf, pgbackrest-recovery.conf
-#   - /etc/pgbackrest/pgbackrest.conf
-#   - $PGDATA/.pitr_staging, $PGDATA/.pitr_configured (PITR markers — fresh
-#     enable later should be able to PITR again without manual cleanup)
-#   - $PGDATA/pgbackrest-spool (staged segments are useless without the
-#     repo to push to; any in-flight WAL was already covered by the
-#     wrapper's drop-on-failure path)
+# Granular cleanup driven by the WAL_* contract. Each role has its own gate:
+#   - WAL_ARCHIVE_BUCKET unset → drop archive config (archive_mode=on /
+#     archive_command). Without this, archive_command would fire with no
+#     creds and Postgres would refuse to recycle WAL until disk filled.
+#   - WAL_RECOVER_FROM_BUCKET unset → drop recovery config + PITR markers so
+#     a future restore-from-this-service starts cleanly.
+#   - Both unset → also wipe /etc/pgbackrest/pgbackrest.conf and the spool;
+#     pgBackRest is not in use at all.
 # The `include_dir = 'conf.d'` line in postgresql.conf is left in place
-# (no-op when the directory has no pgbackrest files).
+# (no-op when conf.d has no pgbackrest files).
 clear_pgbackrest_state_if_disabled() {
-  [ -n "$PGBACKREST_REPO1_S3_BUCKET" ] && return 0
   local removed=0
-  [ -f "$PGBACKREST_ARCHIVE_CONF" ] && rm -f "$PGBACKREST_ARCHIVE_CONF" && removed=1
-  [ -f "$PGBACKREST_RECOVERY_CONF" ] && rm -f "$PGBACKREST_RECOVERY_CONF" && removed=1
-  [ -f "$PGBACKREST_CONF_FILE" ] && rm -f "$PGBACKREST_CONF_FILE" && removed=1
-  [ -f "$PITR_STAGING_FILE" ] && rm -f "$PITR_STAGING_FILE" && removed=1
-  [ -f "$PITR_DONE_MARKER" ] && rm -f "$PITR_DONE_MARKER" && removed=1
-  [ -d "$PGBACKREST_SPOOL_DIR" ] && rm -rf "$PGBACKREST_SPOOL_DIR" && removed=1
+  if [ -z "${WAL_ARCHIVE_BUCKET:-}" ]; then
+    [ -f "$PGBACKREST_ARCHIVE_CONF" ] && rm -f "$PGBACKREST_ARCHIVE_CONF" && removed=1
+  fi
+  if [ -z "${WAL_RECOVER_FROM_BUCKET:-}" ]; then
+    [ -f "$PGBACKREST_RECOVERY_CONF" ] && rm -f "$PGBACKREST_RECOVERY_CONF" && removed=1
+    [ -f "$PITR_STAGING_FILE" ] && rm -f "$PITR_STAGING_FILE" && removed=1
+    [ -f "$PITR_DONE_MARKER" ] && rm -f "$PITR_DONE_MARKER" && removed=1
+  fi
+  if [ -z "${WAL_ARCHIVE_BUCKET:-}" ] && [ -z "${WAL_RECOVER_FROM_BUCKET:-}" ]; then
+    [ -f "$PGBACKREST_CONF_FILE" ] && rm -f "$PGBACKREST_CONF_FILE" && removed=1
+    [ -d "$PGBACKREST_SPOOL_DIR" ] && rm -rf "$PGBACKREST_SPOOL_DIR" && removed=1
+  fi
   if [ "$removed" = "1" ]; then
-    echo "pgbackrest: cleared archive/recovery config and PITR state (WAL_ARCHIVE_BUCKET unset)"
+    echo "pgbackrest: cleared stale archive/recovery state for the disabled role(s)"
   fi
 }
 
@@ -423,7 +433,7 @@ bootstrap_pgbackrest_stanza() {
 # (the restored service's own bucket) — see archive-push-repo in the
 # rendered pgbackrest.conf.
 configure_pgbackrest_recovery() {
-  [ -z "$PGBACKREST_REPO1_S3_BUCKET" ] && return 0
+  [ -z "${WAL_RECOVER_FROM_BUCKET:-}" ] && return 0
   [ -z "$POSTGRES_RECOVERY_TARGET_TIME" ] && return 0
   [ ! -f "$POSTGRES_CONF_FILE" ] && return 0
 

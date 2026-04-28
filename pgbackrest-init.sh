@@ -1,13 +1,17 @@
 #!/bin/bash
 # pgbackrest-init.sh — runs once during initdb from /docker-entrypoint-initdb.d/.
 #
-# When PGBACKREST_REPO1_S3_BUCKET is set (translated by wrapper.sh from the
-# generic `WAL_ARCHIVE_*` contract), writes archive config to
-# $PGDATA/conf.d/pgbackrest.conf and adds `include_dir = 'conf.d'` to
-# postgresql.conf so a freshly initialized DB starts with archiving on. We
-# never write to postgresql.auto.conf — ALTER SYSTEM rewrites it and would
-# clobber any sentinel-bracketed block we used to scope a managed section,
-# breaking clean disable.
+# When the service has its own archive bucket (`WAL_ARCHIVE_BUCKET` set),
+# writes archive config to $PGDATA/conf.d/pgbackrest.conf and adds
+# `include_dir = 'conf.d'` to postgresql.conf so a freshly initialized DB
+# starts with archiving on. Never write to postgresql.auto.conf — ALTER
+# SYSTEM rewrites it and would clobber any sentinel-bracketed block we used
+# to scope a managed section, breaking clean disable.
+#
+# Restored services have only WAL_RECOVER_FROM_* (no archive bucket of their
+# own); they skip this path entirely so a wiped volume's fresh initdb
+# doesn't accidentally start writing archive_command into the source's
+# bucket via the wrapper's translation of WAL_RECOVER_FROM_* to REPO1.
 #
 # /etc/pgbackrest/pgbackrest.conf is rendered by wrapper.sh and is already
 # in place by the time this script runs.
@@ -19,7 +23,7 @@
 
 set -e
 
-if [ -z "$PGBACKREST_REPO1_S3_BUCKET" ]; then
+if [ -z "${WAL_ARCHIVE_BUCKET:-}" ]; then
   exit 0
 fi
 
