@@ -437,6 +437,17 @@ configure_pgbackrest_recovery() {
   [ -z "$POSTGRES_RECOVERY_TARGET_TIME" ] && return 0
   [ ! -f "$POSTGRES_CONF_FILE" ] && return 0
 
+  # Wiped volume on a restored service: pgbackrest-init.sh's `.fresh_initdb`
+  # marker is present, the env vars still say "recover to T," but the cluster
+  # was just initdb'd and has no relationship to source's WAL stream. Skip
+  # arming recovery silently — Postgres starts as a normal fresh DB instead
+  # of refusing to start on a system_identifier mismatch later.
+  if [ -f "$PGDATA/.fresh_initdb" ]; then
+    echo "pgbackrest: ignoring POSTGRES_RECOVERY_TARGET_TIME — volume was freshly initdb'd, no source WAL relationship to recover from"
+    return 0
+  fi
+
+
   if [ -f "$PITR_DONE_MARKER" ]; then
     return 0
   fi
@@ -475,6 +486,10 @@ clear_pgbackrest_state_if_disabled
 apply_pgbackrest_archive_conf
 configure_pgbackrest_recovery
 bootstrap_pgbackrest_stanza
+
+# Marker only meaningful on the first boot after initdb; clear it now that
+# the wrapper has had its chance to act on it.
+[ -f "$PGDATA/.fresh_initdb" ] && rm -f "$PGDATA/.fresh_initdb"
 
 # unset PGHOST to force psql to use Unix socket path
 # this is specific to Railway and allows
