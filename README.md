@@ -69,8 +69,7 @@ volume.
 `archive_command` points at `/usr/local/bin/pgbackrest-archive-push-wrapper.sh`
 rather than calling `pgbackrest archive-push` directly. The wrapper tries the
 real push; on failure it measures `pg_wal/`, and when it exceeds the
-threshold (default 5 GiB, matching pgBackRest's `archive-push-queue-max`;
-override via `PGBACKREST_DROP_THRESHOLD_GIB`) it
+threshold (default 500 MiB, override via `PGBACKREST_DROP_THRESHOLD_MB`) it
 returns success to Postgres anyway, dropping the segment. This is the
 never-halt safety net for failure modes that bypass pgBackRest's own
 queue-max — bad credentials, deleted bucket, expired keys,
@@ -80,6 +79,17 @@ wrapper drops a segment the PITR window gets a coverage gap from that
 segment to the next post-recovery base snapshot; below the threshold the
 wrapper surfaces failures normally so transient errors retry on the next
 `archive_timeout`.
+
+The two thresholds gate orthogonal failure regimes:
+- `archive-push-queue-max=5GiB` (image-baked) governs the **spool**.
+  Trips on transient S3 stalls — async worker keeps retrying and most
+  segments eventually land. Generous buffer to absorb multi-hour outages
+  cleanly.
+- `PGBACKREST_DROP_THRESHOLD_MB=500` (default) governs **`pg_wal/`** when
+  pgbackrest's foreground returns non-zero. Trips on hard failures (bad
+  creds, deleted bucket) where retrying without operator intervention has
+  zero chance of success. Smaller cap so we don't hold 5 GiB of pg_wal
+  hostage waiting for a config fix.
 
 | Env var | Purpose |
 |---|---|

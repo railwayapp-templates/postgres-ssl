@@ -41,8 +41,9 @@ chmod 0750 "$PGDATA/pgbackrest-spool"
 
 # Add the include directive once. postgresql.conf is not rewritten by
 # Postgres at runtime (only auto.conf is, by ALTER SYSTEM), so this single
-# line is durable.
-if ! grep -qE "^[[:space:]]*include_dir[[:space:]]*=[[:space:]]*'conf\.d'" "$PGDATA/postgresql.conf"; then
+# line is durable. Regex tolerates single-quoted, double-quoted, and
+# unquoted forms — postgresql.conf treats them as equivalent.
+if ! grep -qE "^[[:space:]]*include_dir[[:space:]]*=[[:space:]]*['\"]?conf\.d['\"]?[[:space:]]*$" "$PGDATA/postgresql.conf"; then
   echo "include_dir = 'conf.d'" >> "$PGDATA/postgresql.conf"
 fi
 

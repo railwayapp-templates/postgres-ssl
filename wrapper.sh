@@ -95,10 +95,18 @@ fi
 # pgBackRest pushes WAL direct to S3 (no intermediary service). It runs in
 # async mode: archive_command writes WAL into the local spool dir and
 # returns in milliseconds; a background worker pushes from there to S3.
-# When archive-push-queue-max=5GiB trips during a sustained S3 outage,
-# pgBackRest drops WAL and reports success to Postgres rather than letting
-# pg_wal fill the data volume and halting the database. PITR window
-# truncates; DB stays up.
+# Two orthogonal thresholds gate the "WAL is accumulating, do something":
+#   - archive-push-queue-max=5GiB (set in /etc/pgbackrest/pgbackrest.conf
+#     below) governs the SPOOL. Trips on transient S3 stalls; pgBackRest
+#     drops segments from spool and reports success to archive_command.
+#     Generous buffer to absorb multi-hour outages cleanly.
+#   - pgbackrest-archive-push-wrapper.sh's PGBACKREST_DROP_THRESHOLD_MB
+#     (default 500 MiB) governs pg_wal/. Trips on HARD failures (bad creds,
+#     deleted bucket, expired keys) where pgbackrest's foreground returns
+#     non-zero and retrying without operator intervention has zero chance
+#     of success. Smaller cap because we shouldn't hold 5 GiB of pg_wal
+#     hostage waiting for a config fix.
+# Either way, PITR window truncates; DB stays up.
 # -----------------------------------------------------------------------------
 
 PGBACKREST_CONF_FILE="/etc/pgbackrest/pgbackrest.conf"
@@ -119,9 +127,16 @@ PITR_DONE_MARKER="$PGDATA/.pitr_configured"
 # postgresql.conf is not rewritten by Postgres at runtime (only auto.conf is,
 # by ALTER SYSTEM), so this single line is durable. Called from both the
 # archive-conf write path and the recovery-staging path.
+#
+# The detection regex accepts single-quoted, double-quoted, and unquoted
+# forms because postgresql.conf treats all three as equivalent. Without the
+# tolerance, a hand-tuned image (or a future PG release that changes the
+# default quoting) would silently get a duplicate include_dir line on every
+# boot — Postgres tolerates duplicates (last wins, both point at the same
+# dir) but the noise is avoidable.
 ensure_pg_includes_confd() {
   [ ! -f "$POSTGRES_CONF_FILE" ] && return 0
-  if grep -qE "^[[:space:]]*include_dir[[:space:]]*=[[:space:]]*'conf\.d'" "$POSTGRES_CONF_FILE"; then
+  if grep -qE "^[[:space:]]*include_dir[[:space:]]*=[[:space:]]*['\"]?conf\.d['\"]?[[:space:]]*$" "$POSTGRES_CONF_FILE"; then
     return 0
   fi
   echo "include_dir = 'conf.d'" >> "$POSTGRES_CONF_FILE"
