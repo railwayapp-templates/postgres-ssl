@@ -389,7 +389,19 @@ clear_pgbackrest_state_if_disabled() {
 # real postmaster binds TCP. If we time out, first WAL push fails until
 # the next boot retries — recoverable, but louder than necessary.
 bootstrap_pgbackrest_stanza() {
-  [ -z "$PGBACKREST_REPO1_S3_BUCKET" ] && return 0
+  # stanza-create only runs when this service archives to its own bucket
+  # AND there is no in-flight recovery from another bucket. pgBackRest's
+  # stanza-create operates against all configured repos and doesn't accept
+  # --repo, so in dual-repo mode (WAL_RECOVER_FROM_* + WAL_ARCHIVE_*) it
+  # would target source's repo1 too — wrong. The standard PITR-enable flow
+  # on a restored service should clear WAL_RECOVER_FROM_* before adding
+  # WAL_ARCHIVE_* (post-promote env-var cleanup); until that lands, the
+  # operator runs stanza-create manually after the recover-from vars come off.
+  [ -z "${WAL_ARCHIVE_BUCKET:-}" ] && return 0
+  if [ -n "${WAL_RECOVER_FROM_BUCKET:-}" ]; then
+    echo "pgbackrest: skipping stanza-create — both WAL_RECOVER_FROM_* and WAL_ARCHIVE_* are set; clear the recover-from vars then restart" >&2
+    return 0
+  fi
 
   (
     # No `local` here: subshells are their own scope so it's redundant, and
