@@ -179,23 +179,6 @@ PITR runs only against an existing data directory. If
 `$PGDATA`, the wrapper refuses to start and points at the fix (restore
 from a base snapshot first, or unset the recovery target).
 
-##### Restored services have a separate bucket
-
-PITR restore creates a brand-new Postgres service in the project; the
-source service stays online and untouched. The restored service's
-volume is populated from the source's snapshot, then booted with
-`WAL_RECOVER_FROM_*` pointing at the source's bucket and
-`POSTGRES_RECOVERY_TARGET_TIME` set — `archive-get` reads source WAL
-during replay. After promote, the restored service has no archive
-bucket of its own and runs as a plain non-archiving Postgres until the
-operator opts in via the standard PITR-enable flow (which provisions a
-fresh bucket on the restored service).
-
-Source and restored services therefore never share a write path: there
-is no risk of the recovered timeline overwriting the source's ongoing
-WAL chain. The previous "mandatory repo-path divergence" guard and the
-`.pgbackrest_source_path` sentinel are gone.
-
 #### Retention coupling
 
 This image ships WAL archiving only — there is no `pgbackrest backup`
