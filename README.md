@@ -83,7 +83,7 @@ Three modes:
 `archive_command` points at `/usr/local/bin/pgbackrest-archive-push-wrapper.sh`
 rather than calling `pgbackrest archive-push` directly. The wrapper tries the
 real push; on failure it measures `pg_wal/`, and when it exceeds the
-threshold (default 500 MiB, override via `PGBACKREST_DROP_THRESHOLD_MB`) it
+threshold (default 500 MiB, override via `WAL_DROP_THRESHOLD_MB`) it
 returns success to Postgres anyway, dropping the segment. This is the
 never-halt safety net for failure modes that bypass pgBackRest's own
 queue-max — bad credentials, deleted bucket, expired keys,
@@ -99,7 +99,7 @@ The two thresholds gate orthogonal failure regimes:
   Trips on transient S3 stalls — async worker keeps retrying and most
   segments eventually land. Generous buffer to absorb multi-hour outages
   cleanly.
-- `PGBACKREST_DROP_THRESHOLD_MB=500` (default) governs **`pg_wal/`** when
+- `WAL_DROP_THRESHOLD_MB=500` (default) governs **`pg_wal/`** when
   pgbackrest's foreground returns non-zero. Trips on hard failures (bad
   creds, deleted bucket) where retrying without operator intervention has
   zero chance of success. Smaller cap so we don't hold 5 GiB of pg_wal
@@ -122,7 +122,7 @@ Image-level tuning knobs (pgBackRest-native, internal):
 
 | Env var | Purpose |
 |---|---|
-| `PGBACKREST_DROP_THRESHOLD_MB` | `pg_wal/` size at which the archive-push wrapper drops failing segments to keep Postgres running (default `500`) |
+| `WAL_DROP_THRESHOLD_MB` | `pg_wal/` size at which the archive-push wrapper drops failing segments to keep Postgres running (default `500`). Outside the `PGBACKREST_*` namespace on purpose — pgBackRest treats unknown `PGBACKREST_*` vars as config options and warns about them on every push. |
 | `PGBACKREST_ARCHIVE_PUSH_PROCESS_MAX` | parallel workers for `archive-push`. Default auto-sized as `clamp(cpus/8, 2, 8)`. |
 | `PGBACKREST_ARCHIVE_GET_PROCESS_MAX` | parallel workers for `archive-get`. Default `1` (WAL replay is serial). |
 | `PGBACKREST_BACKUP_PROCESS_MAX` | parallel workers for `backup`. Default auto-sized as `clamp(cpus/4, 1, 16)` (≤25% of CPUs to leave room for live DB). |

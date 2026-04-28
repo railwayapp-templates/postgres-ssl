@@ -145,7 +145,7 @@ fi
 #     below) governs the SPOOL. Trips on transient S3 stalls; pgBackRest
 #     drops segments from spool and reports success to archive_command.
 #     Generous buffer to absorb multi-hour outages cleanly.
-#   - pgbackrest-archive-push-wrapper.sh's PGBACKREST_DROP_THRESHOLD_MB
+#   - pgbackrest-archive-push-wrapper.sh's WAL_DROP_THRESHOLD_MB
 #     (default 500 MiB) governs pg_wal/. Trips on HARD failures (bad creds,
 #     deleted bucket, expired keys) where pgbackrest's foreground returns
 #     non-zero and retrying without operator intervention has zero chance
