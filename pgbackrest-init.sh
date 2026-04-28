@@ -23,16 +23,6 @@
 
 set -e
 
-# Stamp a marker the wrapper uses to detect "this volume was just initdb'd
-# fresh, not restored from a snapshot." Without it, a wiped volume on a
-# restored service still has WAL_RECOVER_FROM_* + POSTGRES_RECOVERY_TARGET_TIME
-# set, the wrapper would arm archive recovery, restore_command would fetch
-# source WAL whose system_identifier doesn't match the freshly-init'd cluster,
-# and Postgres would refuse to start. With this marker, the wrapper sees fresh
-# init and silently skips arming recovery, letting Postgres start as a normal
-# fresh DB — graceful behavior on accidental wipe.
-touch "$PGDATA/.fresh_initdb"
-
 if [ -z "${WAL_ARCHIVE_BUCKET:-}" ]; then
   exit 0
 fi
