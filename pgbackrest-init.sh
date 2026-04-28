@@ -13,9 +13,10 @@
 #
 # This handles the fresh-DB path. wrapper.sh handles the existing-DB path
 # (idempotent reapply), the disable path, and the recovery-target path.
+# Runs as the postgres user inside docker-entrypoint's gosu context — no
+# chown is needed because every file we create is postgres-owned by default.
 
 set -e
-. /usr/local/bin/pgbackrest-helpers.sh
 
 if [ -z "$PGBACKREST_REPO1_S3_BUCKET" ]; then
   exit 0
@@ -33,9 +34,32 @@ if [ -n "$POSTGRES_RECOVERY_TARGET_TIME" ]; then
   exit 1
 fi
 
-ensure_pgbackrest_spool_dir
-ensure_pg_includes_confd
-write_pgbackrest_archive_conf
-stamp_source_repo_path
+# Spool lives on the volume so segments staged but not yet pushed to S3
+# survive container restarts.
+mkdir -p "$PGDATA/pgbackrest-spool"
+chmod 0750 "$PGDATA/pgbackrest-spool"
 
-echo "pgbackrest: archive config written to ${PGBACKREST_ARCHIVE_CONF} during initdb"
+# Add the include directive once. postgresql.conf is not rewritten by
+# Postgres at runtime (only auto.conf is, by ALTER SYSTEM), so this single
+# line is durable.
+if ! grep -qE "^[[:space:]]*include_dir[[:space:]]*=[[:space:]]*'conf\.d'" "$PGDATA/postgresql.conf"; then
+  echo "include_dir = 'conf.d'" >> "$PGDATA/postgresql.conf"
+fi
+
+mkdir -p "$PGDATA/conf.d"
+chmod 0750 "$PGDATA/conf.d"
+
+archive_timeout="${POSTGRES_ARCHIVE_TIMEOUT:-60}"
+cat > "$PGDATA/conf.d/pgbackrest.conf" <<EOF
+archive_mode = 'on'
+archive_command = '/usr/local/bin/pgbackrest-archive-push-wrapper.sh %p'
+archive_timeout = '${archive_timeout}'
+EOF
+chmod 0640 "$PGDATA/conf.d/pgbackrest.conf"
+
+# Stamp the source repo path so a future PITR-restored volume can detect
+# whether the operator pivoted PGBACKREST_REPO1_PATH before staging recovery
+# (see configure_pgbackrest_recovery in wrapper.sh).
+printf '%s' "${PGBACKREST_REPO1_PATH:-}" > "$PGDATA/.pgbackrest_source_path"
+
+echo "pgbackrest: archive config written to ${PGDATA}/conf.d/pgbackrest.conf during initdb"
