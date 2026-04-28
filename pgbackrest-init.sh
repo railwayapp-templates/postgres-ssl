@@ -10,10 +10,7 @@
 #
 # Gated on WAL_ARCHIVE_BUCKET — "does this service archive outgoing WAL?".
 # Skips when unset (vanilla services, restored services that haven't re-
-# enabled PITR). When a restored service has re-enabled PITR (both
-# WAL_RECOVER_FROM_* and WAL_ARCHIVE_* set) this path runs; archive_command
-# points at the push wrapper, which targets --repo=2 so post-promote WAL
-# lands in the new archive bucket, not the source's.
+# enabled PITR).
 #
 # /etc/pgbackrest/pgbackrest.conf is rendered by wrapper.sh and is already
 # in place by the time this script runs.
