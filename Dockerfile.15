@@ -1,8 +1,10 @@
 ARG POSTGRES_VERSION=15
 FROM postgres:${POSTGRES_VERSION}
 
-# Install OpenSSL, sudo, pgvector, and pgbackrest
-RUN apt-get update && apt-get install -y openssl sudo pgbackrest postgresql-15-pgvector \
+# Install OpenSSL, sudo, pgvector, pgbackrest, and ca-certificates (needed
+# so pgbackrest can verify the TLS cert of the S3 endpoint — postgres base
+# image disables apt Recommends, so ca-certificates isn't pulled implicitly)
+RUN apt-get update && apt-get install -y openssl sudo ca-certificates pgbackrest postgresql-15-pgvector \
     && rm -rf /var/lib/apt/lists/*
 
 # Allow the postgres user to execute certain commands as root without a password
