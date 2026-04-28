@@ -158,15 +158,16 @@ detect_cpus() {
 # Sized off detected CPUs because:
 #   archive-push: serial 16 MiB segment arrival + per-PUT S3 overhead.
 #     cpus/8 grows gently; floor 2 gives every tier some burst headroom;
-#     ceiling 16 because past that the bottleneck flips to WAL arrival
-#     and S3 per-prefix request rate, not worker count.
+#     ceiling 8 because at ~190 MB/s/worker that already drains ~1.5 GB/s
+#     of sustained WAL — well past realistic generation rates, and beyond
+#     that the bottleneck is WAL arrival itself, not worker count.
 #   archive-get: WAL replay is serial inside Postgres, so prefetching with
 #     >1 worker yields diminishing returns. Pinned to 1.
 #   backup: Steele's "≤25% of CPUs" rule (don't starve live DB traffic).
-#     Floor 1, ceiling 32 to bound per-worker zstd buffer memory and stay
-#     well under S3 per-prefix request limits on huge boxes.
-#   restore: DB is down, no other workload to protect, so use everything
-#     up to detected CPUs. No ceiling.
+#     Floor 1, ceiling 16 to bound per-worker zstd buffer memory.
+#   restore: DB is down, no other workload to protect — but ceiling at 32
+#     because pgBackRest's restore throughput plateaus around there
+#     (S3 GET-per-prefix and per-worker memory dominate past that).
 # Per-command env overrides win when set (custom Enterprise sustaining
 # extreme WAL, or operator pinning for testing).
 clamp() {
@@ -197,10 +198,10 @@ render_pgbackrest_conf() {
   [ "$cpus" -lt 1 ] && cpus=1
 
   local push_max get_max backup_max restore_max
-  push_max=${PGBACKREST_ARCHIVE_PUSH_PROCESS_MAX:-$(clamp $((cpus / 8)) 2 16)}
+  push_max=${PGBACKREST_ARCHIVE_PUSH_PROCESS_MAX:-$(clamp $((cpus / 8)) 2 8)}
   get_max=${PGBACKREST_ARCHIVE_GET_PROCESS_MAX:-1}
-  backup_max=${PGBACKREST_BACKUP_PROCESS_MAX:-$(clamp $((cpus / 4)) 1 32)}
-  restore_max=${PGBACKREST_RESTORE_PROCESS_MAX:-$cpus}
+  backup_max=${PGBACKREST_BACKUP_PROCESS_MAX:-$(clamp $((cpus / 4)) 1 16)}
+  restore_max=${PGBACKREST_RESTORE_PROCESS_MAX:-$(clamp "$cpus" 1 32)}
 
   echo "pgbackrest: detected ${cpus} vCPU; process-max push=${push_max} get=${get_max} backup=${backup_max} restore=${restore_max}"
 
