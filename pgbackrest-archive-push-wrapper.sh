@@ -48,7 +48,16 @@ PGDATA="${PGDATA:-/var/lib/postgresql/data}"
 PGWAL_THRESHOLD_MB="${PGBACKREST_DROP_THRESHOLD_MB:-500}"
 PGWAL_THRESHOLD_BYTES=$(( PGWAL_THRESHOLD_MB * 1024 * 1024 ))
 
-pgbackrest --stanza=main archive-push "$WAL_FILE"
+# When two repos are configured (restored service: repo1=recover-from,
+# repo2=archive), pin archive-push to repo2 so post-promote WAL doesn't
+# spray into the source bucket. Standalone services have only repo1 set
+# and skip the flag entirely.
+REPO_FLAG=""
+if [ -n "${PGBACKREST_REPO2_S3_BUCKET:-}" ]; then
+  REPO_FLAG="--repo=2"
+fi
+
+pgbackrest --stanza=main $REPO_FLAG archive-push "$WAL_FILE"
 PGB_RC=$?
 if [ "$PGB_RC" -eq 0 ]; then
   exit 0
