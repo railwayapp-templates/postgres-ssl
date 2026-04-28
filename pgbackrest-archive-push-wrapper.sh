@@ -4,12 +4,18 @@
 # Wraps `pgbackrest archive-push` so that any kind of archive failure (hard
 # repo error, stuck async worker, anything else) cannot fill pg_wal/ and halt
 # Postgres. When pgbackrest fails AND pg_wal/ has grown past a threshold
-# (default 500 MiB, override via PGBACKREST_DROP_THRESHOLD_MB), the wrapper
-# returns success to Postgres anyway. Postgres recycles the WAL segment as
-# if archiving were disabled. The PITR window gets a coverage gap from this
-# segment forward; the dashboard reads pg_stat_archiver to surface "PITR
-# broken — fix archiving config" so the underlying issue (bad creds, deleted
-# bucket, expired keys, …) gets fixed.
+# (default 500 MiB, override via WAL_DROP_THRESHOLD_MB), the wrapper returns
+# success to Postgres anyway. Postgres recycles the WAL segment as if
+# archiving were disabled. The PITR window gets a coverage gap from this
+# segment forward; below the threshold pg_stat_archiver.failed_count climbs
+# normally and the dashboard surfaces "PITR broken — fix archiving config",
+# so the underlying issue (bad creds, deleted bucket, expired keys, …) gets
+# fixed before the threshold trips and the failure signal disappears.
+#
+# The env var name avoids the PGBACKREST_* prefix on purpose: pgBackRest
+# treats every PGBACKREST_* variable as a config option and warns about
+# unknown names on every invocation. WAL_DROP_THRESHOLD_MB sits outside
+# that namespace so it doesn't pollute logs.
 #
 # Why 500 MiB here, vs pgBackRest's archive-push-queue-max=5GiB:
 # the two thresholds gate orthogonal failure regimes. archive-push-queue-max
@@ -45,7 +51,7 @@ if [ -z "$WAL_FILE" ]; then
 fi
 
 PGDATA="${PGDATA:-/var/lib/postgresql/data}"
-PGWAL_THRESHOLD_MB="${PGBACKREST_DROP_THRESHOLD_MB:-500}"
+PGWAL_THRESHOLD_MB="${WAL_DROP_THRESHOLD_MB:-500}"
 PGWAL_THRESHOLD_BYTES=$(( PGWAL_THRESHOLD_MB * 1024 * 1024 ))
 
 # When two repos are configured (restored service: repo1=recover-from,
