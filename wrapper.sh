@@ -170,6 +170,12 @@ PGBACKREST_SPOOL_DIR="$PGDATA/pgbackrest-spool"
 PITR_STAGING_FILE="$PGDATA/.pitr_staging"
 PITR_DONE_MARKER="$PGDATA/.pitr_configured"
 
+# Written by restore_from_pgbackrest_if_empty_volume after a successful
+# `pgbackrest restore` populates an empty volume. Tells configure_pgbackrest_recovery
+# to bail — pgbackrest restore already wrote recovery.signal + recovery params,
+# our conf.d/pgbackrest-recovery.conf path would duplicate them.
+PGBACKREST_RESTORED_MARKER="$PGDATA/.pgbackrest_restored"
+
 # Add `include_dir = 'conf.d'` to postgresql.conf if not already present.
 # postgresql.conf is not rewritten by Postgres at runtime (only auto.conf is,
 # by ALTER SYSTEM), so this single line is durable. Called from both the
@@ -280,6 +286,23 @@ render_pgbackrest_conf() {
     repo2_block="repo2-type=s3"$'\n'
   fi
 
+  # Retention knobs are written for whichever repo this service archives to.
+  # In standalone (REPO1 = archive bucket) → write under repo1.
+  # In dual-repo recovery mode (REPO1 = source / read, REPO2 = own archive)
+  # → write under repo2; repo1's source bucket has its own retention owned
+  # by the source service. pgbackrest expire runs after every backup and
+  # uses these to remove stale fulls/diffs and the WAL they pinned.
+  # repo*-retention-archive is left to pgBackRest's default (= retention-full),
+  # which keeps WAL needed for the most recent N fulls.
+  local retention_full="${WAL_BACKUP_RETENTION_FULL:-4}"
+  local retention_diff="${WAL_BACKUP_RETENTION_DIFF:-14}"
+  local retention_block=""
+  if [ -n "${PGBACKREST_REPO2_S3_BUCKET:-}" ]; then
+    retention_block="repo2-retention-full=${retention_full}"$'\n'"repo2-retention-diff=${retention_diff}"$'\n'
+  elif [ -n "${WAL_ARCHIVE_BUCKET:-}" ]; then
+    retention_block="repo1-retention-full=${retention_full}"$'\n'"repo1-retention-diff=${retention_diff}"$'\n'
+  fi
+
   cat > "$PGBACKREST_CONF_FILE" <<EOF
 [global]
 repo1-type=s3
@@ -292,7 +315,7 @@ spool-path=${PGBACKREST_SPOOL_DIR}
 compress-type=zst
 compress-level=3
 start-fast=y
-
+${retention_block}
 [global:archive-push]
 process-max=${push_max}
 
@@ -351,11 +374,17 @@ clear_pgbackrest_state_if_disabled() {
   local removed=0
   if [ -z "${WAL_ARCHIVE_BUCKET:-}" ]; then
     [ -f "$PGBACKREST_ARCHIVE_CONF" ] && rm -f "$PGBACKREST_ARCHIVE_CONF" && removed=1
+    # Backup-watcher state is scoped to a particular archive bucket — when
+    # the bucket goes away, drop the state so a future re-enable starts
+    # from NEEDS_INITIAL_BACKUP rather than a stale "last full was X" cache.
+    [ -f "$PGDATA/.pgbackrest_backup_state" ] && rm -f "$PGDATA/.pgbackrest_backup_state" && removed=1
+    [ -f "$PGDATA/.pgbackrest_gap_pending" ] && rm -f "$PGDATA/.pgbackrest_gap_pending" && removed=1
   fi
   if [ -z "${WAL_RECOVER_FROM_BUCKET:-}" ]; then
     [ -f "$PGBACKREST_RECOVERY_CONF" ] && rm -f "$PGBACKREST_RECOVERY_CONF" && removed=1
     [ -f "$PITR_STAGING_FILE" ] && rm -f "$PITR_STAGING_FILE" && removed=1
     [ -f "$PITR_DONE_MARKER" ] && rm -f "$PITR_DONE_MARKER" && removed=1
+    [ -f "$PGBACKREST_RESTORED_MARKER" ] && rm -f "$PGBACKREST_RESTORED_MARKER" && removed=1
   fi
   if [ -z "${WAL_ARCHIVE_BUCKET:-}" ] && [ -z "${WAL_RECOVER_FROM_BUCKET:-}" ]; then
     [ -f "$PGBACKREST_CONF_FILE" ] && rm -f "$PGBACKREST_CONF_FILE" && removed=1
@@ -450,6 +479,13 @@ configure_pgbackrest_recovery() {
   [ -z "$POSTGRES_RECOVERY_TARGET_TIME" ] && return 0
   [ ! -f "$POSTGRES_CONF_FILE" ] && return 0
 
+  # The pgbackrest-restore path (empty-volume restore) handles recovery
+  # staging itself — recovery.signal + recovery params come out of
+  # `pgbackrest restore`, not our conf.d include. Skip the include-write
+  # path so we don't end up with duplicate recovery_target_time settings.
+  if [ -f "$PGBACKREST_RESTORED_MARKER" ]; then
+    return 0
+  fi
 
   if [ -f "$PITR_DONE_MARKER" ]; then
     return 0
@@ -484,11 +520,58 @@ EOF
   echo "pgbackrest: PITR replay staged (target=${POSTGRES_RECOVERY_TARGET_TIME})"
 }
 
+# When a restored service is created with an empty volume + WAL_RECOVER_FROM_*
+# + POSTGRES_RECOVERY_TARGET_TIME, restore the data dir directly from the
+# source bucket via pgbackrest. Replaces v1's "snapshot replicate, then
+# archive-get during recovery" two-step. The restore command pulls the most
+# recent base backup ≤ T, applies WAL forward to T, writes recovery.signal +
+# recovery params; postmaster boots straight into recovery and promotes.
+#
+# The .pgbackrest_restored marker tells configure_pgbackrest_recovery to
+# stay out of the way (its conf.d include would duplicate what pgbackrest
+# restore already wrote).
+#
+# Container restart on an already-restored volume: $PGDATA is populated, so
+# the empty-PGDATA gate fails and we skip — Postgres starts normally.
+restore_from_pgbackrest_if_empty_volume() {
+  [ -z "${WAL_RECOVER_FROM_BUCKET:-}" ] && return 0
+  [ -z "${POSTGRES_RECOVERY_TARGET_TIME:-}" ] && return 0
+  [ -f "$PGDATA/PG_VERSION" ] && return 0
+  [ -f "$PGBACKREST_RESTORED_MARKER" ] && return 0
+
+  echo "pgbackrest: empty PGDATA + recovery target — restoring from source bucket (target=${POSTGRES_RECOVERY_TARGET_TIME})"
+
+  install -d -m 0700 -o postgres -g postgres "$PGDATA"
+
+  if ! gosu postgres pgbackrest --stanza=main --repo=1 restore \
+       --type=time --target="$POSTGRES_RECOVERY_TARGET_TIME" \
+       --target-action=promote; then
+    echo "pgbackrest: restore from source bucket failed; fix env vars (WAL_RECOVER_FROM_*, POSTGRES_RECOVERY_TARGET_TIME) and redeploy" >&2
+    exit 1
+  fi
+
+  touch "$PGBACKREST_RESTORED_MARKER"
+  chown postgres:postgres "$PGBACKREST_RESTORED_MARKER" 2>/dev/null || true
+  echo "pgbackrest: restore complete; postgres will replay forward to ${POSTGRES_RECOVERY_TARGET_TIME} and promote on first start"
+}
+
+# Fork the backup watcher. Subshell pattern matches bootstrap_pgbackrest_stanza
+# — gosu drops to postgres so the watcher's psql calls use peer auth via the
+# Unix socket and `pgbackrest backup` runs as the right uid. The watcher gates
+# itself on WAL_ARCHIVE_BUCKET / WAL_RECOVER_FROM_BUCKET internally, so the
+# fork is unconditional and cheap when archiving isn't on.
+fork_pgbackrest_backup_watcher() {
+  [ -z "${WAL_ARCHIVE_BUCKET:-}" ] && return 0
+  gosu postgres /usr/local/bin/pgbackrest-backup-watcher.sh &
+}
+
 render_pgbackrest_conf
+restore_from_pgbackrest_if_empty_volume
 clear_pgbackrest_state_if_disabled
 apply_pgbackrest_archive_conf
 configure_pgbackrest_recovery
 bootstrap_pgbackrest_stanza
+fork_pgbackrest_backup_watcher
 
 # unset PGHOST to force psql to use Unix socket path
 # this is specific to Railway and allows

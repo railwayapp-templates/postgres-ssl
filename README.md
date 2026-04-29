@@ -117,6 +117,10 @@ Operator-facing env contract:
 | `WAL_RECOVER_FROM_BUCKET` / `_ENDPOINT` / `_REGION` / `_KEY` / `_SECRET` / `_PATH` | source-bucket coordinates on a PITR-restored service; `archive-get` reads source WAL from here during replay. Set by backboard on restore; not normally a manual knob. |
 | `POSTGRES_RECOVERY_TARGET_TIME` | ISO 8601 timestamp; stages archive-recovery replay on next start |
 | `POSTGRES_ARCHIVE_TIMEOUT` | seconds Postgres waits before forcing a WAL switch (default `60`) |
+| `WAL_BACKUP_FULL_INTERVAL_HOURS` | image-owned full base-backup cadence (default `168` = weekly; `0` disables periodic fulls). Initial / gap-recovery fulls fire regardless. |
+| `WAL_BACKUP_DIFF_INTERVAL_HOURS` | image-owned differential base-backup cadence (default `24`; `0` disables) |
+| `WAL_BACKUP_RETENTION_FULL` | full backups kept by `pgbackrest expire` (default `4`) |
+| `WAL_BACKUP_RETENTION_DIFF` | differentials kept by `pgbackrest expire` (default `14`) |
 
 Image-level tuning knobs (pgBackRest-native, internal):
 
@@ -174,30 +178,88 @@ timeline and replaying again would corrupt it. To probe a different
 target, restore from a fresh volume snapshot (or, advanced: remove
 `$PGDATA/.pitr_configured` before the next start).
 
-PITR runs only against an existing data directory. If
-`POSTGRES_RECOVERY_TARGET_TIME` is set on a brand-new container with no
-`$PGDATA`, the wrapper refuses to start and points at the fix (restore
-from a base snapshot first, or unset the recovery target).
+When `POSTGRES_RECOVERY_TARGET_TIME` is set on a brand-new container
+(no `$PGDATA/PG_VERSION`), the wrapper runs `pgbackrest --repo=1 restore
+--type=time --target=<T> --target-action=promote` against the source
+bucket *before* `docker-entrypoint` initializes anything. pgBackRest
+pulls the most recent base backup ≤ T plus the WAL chain forward into
+`$PGDATA`, writes `recovery.signal` + recovery params, and Postgres
+boots straight into archive recovery. A `.pgbackrest_restored` marker is
+written on success; `configure_pgbackrest_recovery` defers to the
+restore's own settings on subsequent starts of the same volume.
 
-#### Retention coupling
+If `$PGDATA` is already populated (the legacy snapshot-based restore
+flow), the conf.d-include path is used as before — `recovery_target_time`
++ `restore_command` are written to `$PGDATA/conf.d/pgbackrest-recovery.conf`,
+`recovery.signal` is touched, and Postgres replays WAL from the source
+bucket via `archive-get`. The two paths share the same env contract
+(`WAL_RECOVER_FROM_*` + `POSTGRES_RECOVERY_TARGET_TIME`) and only differ
+on the initial-volume question.
 
-This image ships WAL archiving only — there is no `pgbackrest backup`
-running in-container. The "base" for any restore is a block-level
-snapshot of the data volume (e.g. a Railway volume snapshot); pgBackRest
-supplies the WAL needed to replay forward from that snapshot's
-checkpoint LSN to the target time.
+#### Image-owned base backups
 
-Because of that, **bucket WAL retention must be ≥ snapshot retention**.
-If snapshots live 30 days but the bucket TTL is 14 days, a 16-day-old
-snapshot is unrecoverable: there is no archived WAL to bridge from its
-checkpoint LSN to anywhere useful. Pick a bucket TTL (or lifecycle rule)
-that covers your oldest restorable snapshot plus the longest replay
-window you care about.
+When `WAL_ARCHIVE_BUCKET` is set, the wrapper forks a background watcher
+(`pgbackrest-backup-watcher.sh`) that polls Postgres every 60 s and
+runs `pgbackrest backup` against the archive bucket when one of three
+conditions holds:
 
-This image does not enforce the coupling. The bucket lifecycle is the
-sole source of truth for WAL retention — the image never runs
-`pgbackrest backup`/`expire`, so no `repo1-retention-*` settings are
-written to `/etc/pgbackrest/pgbackrest.conf`.
+1. **Initial backup** — `pg_stat_archiver.archived_count > 0` and no
+   full has been recorded on this volume. Triggers the first
+   `--type=full`, anchoring the PITR window from the first archived LSN
+   forward.
+2. **Gap recovery** — either the archive-push wrapper dropped a segment
+   (touches `$PGDATA/.pgbackrest_gap_pending`) or
+   `pg_stat_archiver.failed_count` grew since the last full. Once
+   archive failures have been quiescent for 5 minutes, runs a fresh full
+   so the PITR window resumes from the new base. The dropped segment
+   itself remains unrestorable; everything from the new base forward is.
+3. **Periodic** — `WAL_BACKUP_FULL_INTERVAL_HOURS` (default 168 h /
+   weekly) for fulls, `WAL_BACKUP_DIFF_INTERVAL_HOURS` (default 24 h)
+   for differentials. Set either to `0` to disable that schedule.
+
+State persists at `$PGDATA/.pgbackrest_backup_state` (key=value lines:
+`last_full_at`, `last_diff_at`, `last_full_failed_count`). The
+bucket-side `pgbackrest --stanza=main info --output=json` is the
+canonical source of truth for what actually exists in the repo; the
+local file is a cache that survives restarts. A wiped volume re-derives
+from a single redundant initial full — pgBackRest's stanza locks
+prevent concurrent backups across cluster nodes.
+
+In HA, every Postgres node runs the watcher and standbys exit early on
+`SELECT pg_is_in_recovery()` — only the leader performs backups. v1 of
+the watcher backs up from the primary; `--backup-standby` is a
+follow-up. After a Patroni failover, the new leader's watcher takes
+over; if its local state is stale, an extra full may run, which is
+harmless.
+
+**Known gap**: pgBackRest's `archive-push-queue-max` trip drops segments
+without going through the archive-push wrapper *and* without
+incrementing `failed_count`, so neither gap signal fires. Until log
+parsing or LSN-lag detection lands, queue-max-trip gaps are sealed by
+the next periodic full rather than promptly.
+
+`pgbackrest backup` is invoked with `--type=full` or `--type=diff`
+depending on the trigger; the `process-max=backup` setting (default
+`clamp(cpus/4, 1, 16)`) caps copy concurrency to leave CPU for live DB
+traffic. `pgbackrest expire` runs automatically after each backup and
+removes fulls/diffs beyond `WAL_BACKUP_RETENTION_FULL` /
+`_DIFF`, plus the WAL their manifests no longer pin.
+
+#### Retention
+
+For PITR-enabled services, **`pgbackrest expire` is the source of truth
+for WAL retention**, not the bucket lifecycle policy. Backup manifests
+pin the WAL needed to make each backup restorable; expire removes them
+together when a backup ages out. The bucket's lifecycle TTL should be
+set as a safety net (≈ 2 × the longest pinned-WAL window) — looser than
+expire's effective horizon, so it never expires WAL out from under a
+live manifest.
+
+The default retention (full=4, diff=14, weekly fulls + daily diffs)
+covers approximately a four-week PITR window before the oldest full
+ages out. Tune via `WAL_BACKUP_RETENTION_FULL`,
+`WAL_BACKUP_RETENTION_DIFF`, `WAL_BACKUP_FULL_INTERVAL_HOURS`,
+`WAL_BACKUP_DIFF_INTERVAL_HOURS`.
 
 ### Disabling PITR
 
@@ -206,6 +268,9 @@ container on next start wipes the archive-side state so a later
 re-enable starts from a clean slate:
 
 - `$PGDATA/conf.d/pgbackrest.conf` (archive settings)
+- `$PGDATA/.pgbackrest_backup_state` and `$PGDATA/.pgbackrest_gap_pending`
+  (backup-watcher state — bucket-scoped, so re-enable starts from
+  `NEEDS_INITIAL_BACKUP` rather than a stale cache)
 - `/etc/pgbackrest/pgbackrest.conf` (image-level operator policy — only
   removed when both `WAL_ARCHIVE_BUCKET` and `WAL_RECOVER_FROM_BUCKET`
   are unset, since recovery-only services still need it)
@@ -213,9 +278,10 @@ re-enable starts from a clean slate:
   repo to push to; any in-flight WAL was already covered by the
   archive-push wrapper's drop-on-failure path)
 - `$PGDATA/conf.d/pgbackrest-recovery.conf` and the
-  `$PGDATA/.pitr_staging` / `$PGDATA/.pitr_configured` markers are
-  scoped to `WAL_RECOVER_FROM_BUCKET` and only cleared when *that*
-  variable goes away.
+  `$PGDATA/.pitr_staging` / `$PGDATA/.pitr_configured` /
+  `$PGDATA/.pgbackrest_restored` markers are scoped to
+  `WAL_RECOVER_FROM_BUCKET` and only cleared when *that* variable goes
+  away.
 
 With the conf-file-as-sentinel model, removal IS the disable —
 `archive_mode`, `archive_command`, and any recovery settings vanish on
