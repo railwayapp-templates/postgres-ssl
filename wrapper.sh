@@ -533,35 +533,18 @@ EOF
 #
 # Container restart on an already-restored volume: $PGDATA is populated, so
 # the empty-PGDATA gate fails and we skip — Postgres starts normally.
-# pgbackrest --target rejects ISO 8601 with T/Z separators ("automatic backup
-# set selection cannot be performed with provided time"); it wants
-# `YYYY-MM-DD HH:MM:SS[.msec][±HH[MM|:MM]]`. Backboard always emits
-# `Date.toISOString()` (T separator, Z suffix), so convert before passing to
-# pgbackrest. PG's own recovery_target_time accepts both forms — we keep the
-# original env-var value for that path.
-to_pgbackrest_target_time() {
-  local t="$1"
-  case "$t" in
-    *Z) t="${t%Z}+00" ;;
-  esac
-  printf '%s' "${t//T/ }"
-}
-
 restore_from_pgbackrest_if_empty_volume() {
   [ -z "${WAL_RECOVER_FROM_BUCKET:-}" ] && return 0
   [ -z "${POSTGRES_RECOVERY_TARGET_TIME:-}" ] && return 0
   [ -f "$PGDATA/PG_VERSION" ] && return 0
   [ -f "$PGBACKREST_RESTORED_MARKER" ] && return 0
 
-  local pgbackrest_target
-  pgbackrest_target=$(to_pgbackrest_target_time "$POSTGRES_RECOVERY_TARGET_TIME")
-
-  echo "pgbackrest: empty PGDATA + recovery target — restoring from source bucket (target=${pgbackrest_target})"
+  echo "pgbackrest: empty PGDATA + recovery target — restoring from source bucket (target=${POSTGRES_RECOVERY_TARGET_TIME})"
 
   install -d -m 0700 -o postgres -g postgres "$PGDATA"
 
   if ! gosu postgres pgbackrest --stanza=main --repo=1 restore \
-       --type=time --target="$pgbackrest_target" \
+       --type=time --target="$POSTGRES_RECOVERY_TARGET_TIME" \
        --target-action=promote; then
     echo "pgbackrest: restore from source bucket failed; fix env vars (WAL_RECOVER_FROM_*, POSTGRES_RECOVERY_TARGET_TIME) and redeploy" >&2
     exit 1
@@ -569,7 +552,7 @@ restore_from_pgbackrest_if_empty_volume() {
 
   touch "$PGBACKREST_RESTORED_MARKER"
   chown postgres:postgres "$PGBACKREST_RESTORED_MARKER" 2>/dev/null || true
-  echo "pgbackrest: restore complete; postgres will replay forward to ${pgbackrest_target} and promote on first start"
+  echo "pgbackrest: restore complete; postgres will replay forward to ${POSTGRES_RECOVERY_TARGET_TIME} and promote on first start"
 }
 
 # Fork the backup watcher. Subshell pattern matches bootstrap_pgbackrest_stanza
@@ -582,43 +565,8 @@ fork_pgbackrest_backup_watcher() {
   gosu postgres /usr/local/bin/pgbackrest-backup-watcher.sh &
 }
 
-# Crash-loop escape hatch for unreachable PITR targets. pgbackrest restore
-# bakes recovery_target_time into postgresql.auto.conf; if T is past the
-# last archived WAL, postgres replays end-of-WAL and FATALs with "recovery
-# ended before configured recovery target was reached" — every container
-# start hits the same wall, forever. Backboard's restore mutation now
-# rejects T > lastArchivedAt at submit time, but volumes restored before
-# that guard landed (or via stale clients) can still get stuck. Track
-# consecutive boots; after a few failed attempts strip the target so
-# postgres promotes at end-of-WAL on the next start. Idempotent — once
-# stripped, the marker prevents re-stripping after a clean boot.
-maybe_strip_unreachable_recovery_target() {
-  [ ! -f "$PGBACKREST_RESTORED_MARKER" ] && return 0
-  [ -f "$PGDATA/.pitr_target_stripped" ] && return 0
-  local auto_conf="$PGDATA/postgresql.auto.conf"
-  [ ! -f "$auto_conf" ] && return 0
-  grep -qE "^[[:space:]]*recovery_target_time" "$auto_conf" || return 0
-
-  local attempts_file="$PGDATA/.pitr_recovery_attempts"
-  local attempts
-  attempts=$(cat "$attempts_file" 2>/dev/null || echo 0)
-  attempts=$((attempts + 1))
-  echo "$attempts" > "$attempts_file"
-  chown postgres:postgres "$attempts_file" 2>/dev/null || true
-
-  local threshold=3
-  if [ "$attempts" -ge "$threshold" ]; then
-    echo "wrapper.sh: PITR recovery has crash-looped ${attempts}x — target is likely past end of available WAL. Stripping recovery_target_time so postgres promotes at end-of-WAL on next start (T may have been after the source's last archived transaction)." >&2
-    sed -i.bak "/^[[:space:]]*recovery_target_time/d" "$auto_conf"
-    touch "$PGDATA/.pitr_target_stripped"
-    chown postgres:postgres "$PGDATA/.pitr_target_stripped" 2>/dev/null || true
-    rm -f "$attempts_file"
-  fi
-}
-
 render_pgbackrest_conf
 restore_from_pgbackrest_if_empty_volume
-maybe_strip_unreachable_recovery_target
 clear_pgbackrest_state_if_disabled
 apply_pgbackrest_archive_conf
 configure_pgbackrest_recovery
