@@ -28,6 +28,16 @@
 # Only the leader runs backups. v1 of this watcher backs up from the primary;
 # `--backup-standby` is a follow-up.
 #
+# Idle-DB heartbeat: each iteration emits a tiny non-transactional WAL record
+# via pg_logical_emit_message. Without it, idle Postgres never advances the
+# LSN, so archive_timeout=60 never forces a segment switch and
+# pg_stat_archiver.last_archived_time stalls until the next CHECKPOINT
+# (default 5 min) — meaning the picker's "latest restorable" lags wall-clock
+# by minutes on quiet services. The heartbeat keeps PITR RPO tracking
+# archive_timeout (~60s) instead of checkpoint_timeout (~5min). Cost is
+# ~one 16MB WAL segment per minute on idle DBs (zstd-3 compresses to a
+# handful of KB → ~30-70MB/day). Set WAL_HEARTBEAT_DISABLED=1 to skip.
+#
 # Known gap: pgBackRest's archive-push-queue-max trip drops segments without
 # incrementing pg_stat_archiver.failed_count and without going through our
 # archive-push wrapper, so neither gap signal fires. Until log-parsing or LSN-
@@ -184,9 +194,22 @@ decide_action() {
   fi
 }
 
+# Emits a few bytes of WAL with no table side-effects so archive_timeout=60
+# has something to flush on idle DBs. transactional=false bypasses txn
+# context — non-blocking, cheap. Failure is non-fatal: a temporarily blocked
+# emit just postpones the next segment switch by one tick.
+emit_wal_heartbeat() {
+  [ "${WAL_HEARTBEAT_DISABLED:-0}" = "1" ] && return 0
+  psql -U postgres -tAXq -c \
+    "SELECT pg_logical_emit_message(false, 'rwy_pitr_heartbeat', '')" \
+    >/dev/null 2>&1 || true
+}
+
 watcher_iteration() {
   pg_isready -h 127.0.0.1 -p 5432 -U postgres -q 2>/dev/null || return 0
   is_standby && return 0
+
+  emit_wal_heartbeat
 
   local action
   action=$(decide_action)
