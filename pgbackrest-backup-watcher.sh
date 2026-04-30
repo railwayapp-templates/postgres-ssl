@@ -60,8 +60,11 @@ POLL_INTERVAL_SECONDS="${WAL_BACKUP_POLL_INTERVAL_SECONDS:-60}"
 # creds); without the grace the watcher burns one full per flap.
 GAP_RESOLVED_GRACE_SECONDS="${WAL_BACKUP_GAP_RESOLVED_GRACE_SECONDS:-300}"
 
-FULL_INTERVAL_HOURS="${WAL_BACKUP_FULL_INTERVAL_HOURS:-168}"
-DIFF_INTERVAL_HOURS="${WAL_BACKUP_DIFF_INTERVAL_HOURS:-24}"
+FULL_INTERVAL_HOURS="${WAL_BACKUP_FULL_INTERVAL_HOURS:-24}"
+# Diffs are off by default — with daily fulls and pgBackRest's block-incremental
+# fulls (only changed blocks re-copy), there's nothing for diffs to add. Set
+# to a non-zero value to enable.
+DIFF_INTERVAL_HOURS="${WAL_BACKUP_DIFF_INTERVAL_HOURS:-0}"
 
 log() { echo "pgbackrest-watcher: $*"; }
 
