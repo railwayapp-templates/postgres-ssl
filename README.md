@@ -121,10 +121,10 @@ Operator-facing env contract:
 | `WAL_RECOVER_FROM_BUCKET` / `_ENDPOINT` / `_REGION` / `_KEY` / `_SECRET` / `_PATH` | source-bucket coordinates on a PITR-restored fork; mounted as `repo2` (read-only) so `archive-get` and the empty-volume `pgbackrest restore` can pull source WAL during replay. Set by backboard on restore; not normally a manual knob. |
 | `POSTGRES_RECOVERY_TARGET_TIME` | ISO 8601 timestamp; stages archive-recovery replay on next start |
 | `POSTGRES_ARCHIVE_TIMEOUT` | seconds Postgres waits before forcing a WAL switch (default `60`) |
-| `WAL_BACKUP_FULL_INTERVAL_HOURS` | image-owned full base-backup cadence (default `168` = weekly; `0` disables periodic fulls). Initial / gap-recovery fulls fire regardless. |
-| `WAL_BACKUP_DIFF_INTERVAL_HOURS` | image-owned differential base-backup cadence (default `24`; `0` disables) |
-| `WAL_BACKUP_RETENTION_FULL` | full backups kept by `pgbackrest expire` (default `4`) |
-| `WAL_BACKUP_RETENTION_DIFF` | differentials kept by `pgbackrest expire` (default `14`) |
+| `WAL_BACKUP_FULL_INTERVAL_HOURS` | image-owned full base-backup cadence (default `24` = daily; `0` disables periodic fulls). Initial / gap-recovery fulls fire regardless. |
+| `WAL_BACKUP_DIFF_INTERVAL_HOURS` | image-owned differential base-backup cadence (default `0` = disabled). Daily fulls + pgBackRest block-incremental (only changed blocks re-copy) make diffs redundant for the typical workload; set non-zero to enable. |
+| `WAL_BACKUP_RETENTION_FULL` | full backups kept by `pgbackrest expire` (default `7` — 7 daily fulls = 1-week PITR window, matching default WAL retention) |
+| `WAL_BACKUP_RETENTION_DIFF` | differentials kept by `pgbackrest expire` (default `14`; only relevant when diff cadence is enabled) |
 
 Image-level tuning knobs (pgBackRest-native, internal):
 
@@ -217,9 +217,12 @@ conditions holds:
    archive failures have been quiescent for 5 minutes, runs a fresh full
    so the PITR window resumes from the new base. The dropped segment
    itself remains unrestorable; everything from the new base forward is.
-3. **Periodic** — `WAL_BACKUP_FULL_INTERVAL_HOURS` (default 168 h /
-   weekly) for fulls, `WAL_BACKUP_DIFF_INTERVAL_HOURS` (default 24 h)
-   for differentials. Set either to `0` to disable that schedule.
+3. **Periodic** — `WAL_BACKUP_FULL_INTERVAL_HOURS` (default `24` h /
+   daily) for fulls. Diffs are off by default
+   (`WAL_BACKUP_DIFF_INTERVAL_HOURS=0`) — daily fulls plus pgBackRest's
+   block-incremental fulls make diff backups redundant for typical
+   workloads. Set either to `0` to disable a schedule, or non-zero to
+   tune the cadence.
 
 State persists at `$PGDATA/.pgbackrest_backup_state` (key=value lines:
 `last_full_at`, `last_diff_at`, `last_full_failed_count`). The
@@ -293,9 +296,9 @@ proposed a bucket-side TTL as a safety net but it's superfluous: any
 TTL shorter than expire's horizon would yank WAL out from under live
 manifests, and any TTL ≥ that horizon is redundant.
 
-The default retention (full=4, diff=14, weekly fulls + daily diffs)
-covers approximately a four-week PITR window before the oldest full
-ages out. Tune via `WAL_BACKUP_RETENTION_FULL`,
+The default cadence (daily fulls, diffs off, retention=7) gives a
+7-day PITR window — matching the default WAL retention — with one
+LSN-coordinated base per day. Tune via `WAL_BACKUP_RETENTION_FULL`,
 `WAL_BACKUP_RETENTION_DIFF`, `WAL_BACKUP_FULL_INTERVAL_HOURS`,
 `WAL_BACKUP_DIFF_INTERVAL_HOURS`.
 
