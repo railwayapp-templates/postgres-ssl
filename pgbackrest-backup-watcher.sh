@@ -1,0 +1,215 @@
+#!/bin/bash
+# pgbackrest-backup-watcher.sh — long-running daemon that triggers pgBackRest
+# base backups based on archiving health. Forked from wrapper.sh at container
+# start when WAL_ARCHIVE_BUCKET is set; same pattern as bootstrap_pgbackrest_stanza.
+#
+# Triggers (any of):
+#   1. NEEDS_INITIAL_BACKUP — first archive-push success after enable. Takes
+#      the first full so PITR is restorable from this LSN forward. Replaces
+#      v1's "immediate snapshot on enable" race: pgbackrest backup brackets
+#      the base in pg_backup_start/stop so the LSN window of the base and
+#      the WAL covering it are the same thing — no coordination gap.
+#   2. Gap recovery — archive-push had hard failures since the last full
+#      (either pgbackrest-archive-push-wrapper.sh dropped a segment and
+#      touched .pgbackrest_gap_pending, or pg_stat_archiver.failed_count grew
+#      since the last full's checkpoint). Once failures are decisively over,
+#      runs a fresh full so PITR window resumes from this base forward.
+#   3. Periodic — full every WAL_BACKUP_FULL_INTERVAL_HOURS, diff every
+#      WAL_BACKUP_DIFF_INTERVAL_HOURS.
+#
+# State persists at $PGDATA/.pgbackrest_backup_state (key=value lines, no JSON
+# dep). The bucket-side `pgbackrest --stanza=main info` is the canonical
+# source of truth for backup history; the local file is a cache that survives
+# restarts. A wiped volume / fresh failover-promote with stale local state
+# triggers an extra full — harmless, pgBackRest's stanza locks prevent
+# concurrent backups across nodes.
+#
+# HA: every node runs the watcher. Standbys exit early via pg_is_in_recovery().
+# Only the leader runs backups. v1 of this watcher backs up from the primary;
+# `--backup-standby` is a follow-up.
+#
+# Known gap: pgBackRest's archive-push-queue-max trip drops segments without
+# incrementing pg_stat_archiver.failed_count and without going through our
+# archive-push wrapper, so neither gap signal fires. Until log-parsing or LSN-
+# lag detection lands, queue-max-trip gaps are sealed by the next periodic
+# full rather than promptly. Documented in README.
+
+set -u
+
+PGDATA="${PGDATA:-/var/lib/postgresql/data}"
+STATE_FILE="$PGDATA/.pgbackrest_backup_state"
+GAP_MARKER="$PGDATA/.pgbackrest_gap_pending"
+
+POLL_INTERVAL_SECONDS=60
+
+# Failures must have been quiescent for this long before a gap-recovery backup
+# fires. Hard failures often resolve and re-fail (intermittent S3, half-rotated
+# creds); without the grace the watcher burns one full per flap.
+GAP_RESOLVED_GRACE_SECONDS=300
+
+FULL_INTERVAL_HOURS="${WAL_BACKUP_FULL_INTERVAL_HOURS:-168}"
+DIFF_INTERVAL_HOURS="${WAL_BACKUP_DIFF_INTERVAL_HOURS:-24}"
+
+log() { echo "pgbackrest-watcher: $*"; }
+
+# State file is `key=value\n`-shaped: trivially read/written by bash without
+# adding a JSON dep. Schema (all values are integer epoch seconds or counts):
+#   last_full_at=<epoch>
+#   last_diff_at=<epoch>
+#   last_full_failed_count=<int>
+read_state() {
+  local field="$1"
+  [ ! -f "$STATE_FILE" ] && return 0
+  grep -E "^${field}=" "$STATE_FILE" 2>/dev/null | tail -1 | cut -d= -f2-
+}
+
+write_state_field() {
+  local field="$1" value="$2"
+  local tmp
+  tmp=$(mktemp "$STATE_FILE.XXXX") || return 1
+  if [ -f "$STATE_FILE" ]; then
+    grep -vE "^${field}=" "$STATE_FILE" > "$tmp" 2>/dev/null || true
+  fi
+  echo "${field}=${value}" >> "$tmp"
+  mv "$tmp" "$STATE_FILE"
+}
+
+# Stats from pg_stat_archiver. Sets globals so callers can branch on them
+# without repeated psql round-trips.
+ARCHIVED_COUNT=0
+FAILED_COUNT=0
+LAST_ARCHIVED_EPOCH=0
+LAST_FAILED_EPOCH=0
+
+refresh_archiver_stats() {
+  local stats
+  stats=$(psql -U postgres -tAXq -F' ' -c "
+    SELECT
+      archived_count,
+      failed_count,
+      COALESCE(EXTRACT(EPOCH FROM last_archived_time)::bigint, 0),
+      COALESCE(EXTRACT(EPOCH FROM last_failed_time)::bigint, 0)
+    FROM pg_stat_archiver
+  " 2>/dev/null) || return 1
+  [ -z "$stats" ] && return 1
+  read -r ARCHIVED_COUNT FAILED_COUNT LAST_ARCHIVED_EPOCH LAST_FAILED_EPOCH <<<"$stats"
+}
+
+# 0 = standby (skip backups). 1 = leader-or-unknown (proceed; pgBackRest's
+# stanza lock is the second-line guarantee against double-trigger).
+is_standby() {
+  local r
+  r=$(psql -U postgres -tAXq -c "SELECT pg_is_in_recovery()" 2>/dev/null) || return 1
+  [ "$r" = "t" ]
+}
+
+# Returns 0 if archive failures look decisively over.
+gap_recovered() {
+  local now="$1" last_fail="$2"
+  # Never failed (fresh stat reset, or never had a failure) → trivially recovered.
+  [ "$last_fail" -eq 0 ] && return 0
+  [ $((now - last_fail)) -ge "$GAP_RESOLVED_GRACE_SECONDS" ]
+}
+
+run_backup() {
+  local type="$1"
+  log "running pgbackrest backup --type=$type"
+  if pgbackrest --stanza=main backup --type="$type"; then
+    local now; now=$(date +%s)
+    case "$type" in
+      full)
+        write_state_field last_full_at "$now"
+        write_state_field last_diff_at "$now"
+        # Re-read failed_count *after* the backup so a failure during the
+        # backup itself is folded into the high-water mark; otherwise the
+        # next iteration would see growth and re-trigger immediately.
+        refresh_archiver_stats || true
+        write_state_field last_full_failed_count "$FAILED_COUNT"
+        [ -f "$GAP_MARKER" ] && rm -f "$GAP_MARKER" && log "cleared gap marker"
+        ;;
+      diff|incr)
+        write_state_field last_diff_at "$now"
+        ;;
+    esac
+    log "backup --type=$type completed"
+    return 0
+  fi
+  log "backup --type=$type failed (will retry on next poll)"
+  return 1
+}
+
+# Returns the type to run on stdout, or empty if no action.
+decide_action() {
+  refresh_archiver_stats || return 0
+
+  local now; now=$(date +%s)
+  local last_full last_diff last_full_failed
+  last_full=$(read_state last_full_at)
+  last_diff=$(read_state last_diff_at)
+  last_full_failed=$(read_state last_full_failed_count)
+  : "${last_full_failed:=0}"
+
+  # NEEDS_INITIAL_BACKUP — archiving has produced any segments, no full on record.
+  if [ -z "$last_full" ] && [ "$ARCHIVED_COUNT" -gt 0 ]; then
+    echo "full"; return 0
+  fi
+  [ -z "$last_full" ] && return 0  # archiving hasn't started, wait
+
+  # Gap recovery — explicit drop marker OR failed_count grew since last full.
+  # Either signal indicates archive-push had problems since the last
+  # LSN-coordinated baseline, so a fresh full re-anchors the PITR window.
+  local has_gap=0
+  [ -f "$GAP_MARKER" ] && has_gap=1
+  [ "$FAILED_COUNT" -gt "$last_full_failed" ] && has_gap=1
+
+  if [ "$has_gap" -eq 1 ]; then
+    if gap_recovered "$now" "$LAST_FAILED_EPOCH"; then
+      echo "full"; return 0
+    fi
+    return 0  # gap still open, waiting for grace
+  fi
+
+  # Periodic full.
+  if [ "$FULL_INTERVAL_HOURS" -gt 0 ] \
+     && [ "$now" -ge $((last_full + FULL_INTERVAL_HOURS * 3600)) ]; then
+    echo "full"; return 0
+  fi
+
+  # Periodic diff.
+  if [ "$DIFF_INTERVAL_HOURS" -gt 0 ]; then
+    local diff_anchor="${last_diff:-$last_full}"
+    if [ "$now" -ge $((diff_anchor + DIFF_INTERVAL_HOURS * 3600)) ]; then
+      echo "diff"; return 0
+    fi
+  fi
+}
+
+watcher_iteration() {
+  pg_isready -h 127.0.0.1 -p 5432 -U postgres -q 2>/dev/null || return 0
+  is_standby && return 0
+
+  local action
+  action=$(decide_action)
+  [ -z "$action" ] && return 0
+
+  run_backup "$action" || true
+}
+
+# wrapper.sh forks us unconditionally; bail silently if archiving isn't on.
+[ -z "${WAL_ARCHIVE_BUCKET:-}" ] && exit 0
+
+# In dual-repo recovery mode (WAL_RECOVER_FROM_* + WAL_ARCHIVE_*), backups
+# would target both repos by default, including source's read-only repo1.
+# The standard PITR-enable flow on a restored service clears WAL_RECOVER_FROM_*
+# before adding WAL_ARCHIVE_*; until then, skip.
+if [ -n "${WAL_RECOVER_FROM_BUCKET:-}" ]; then
+  log "skipping — both WAL_RECOVER_FROM_* and WAL_ARCHIVE_* are set; clear the recover-from vars to enable backups"
+  exit 0
+fi
+
+log "starting (poll=${POLL_INTERVAL_SECONDS}s, full=${FULL_INTERVAL_HOURS}h, diff=${DIFF_INTERVAL_HOURS}h, gap_grace=${GAP_RESOLVED_GRACE_SECONDS}s)"
+
+while true; do
+  watcher_iteration
+  sleep "$POLL_INTERVAL_SECONDS"
+done
