@@ -247,13 +247,13 @@ removes fulls/diffs beyond `WAL_BACKUP_RETENTION_FULL` /
 
 #### Retention
 
-For PITR-enabled services, **`pgbackrest expire` is the source of truth
-for WAL retention**, not the bucket lifecycle policy. Backup manifests
-pin the WAL needed to make each backup restorable; expire removes them
-together when a backup ages out. The bucket's lifecycle TTL should be
-set as a safety net (≈ 2 × the longest pinned-WAL window) — looser than
-expire's effective horizon, so it never expires WAL out from under a
-live manifest.
+For PITR-enabled services, **`pgbackrest expire` is the sole WAL
+retention authority** — no bucket-side lifecycle policy. Backup
+manifests pin the WAL needed to make each backup restorable; expire
+releases both together when a backup ages out. Earlier iterations
+proposed a bucket-side TTL as a safety net but it's superfluous: any
+TTL shorter than expire's horizon would yank WAL out from under live
+manifests, and any TTL ≥ that horizon is redundant.
 
 The default retention (full=4, diff=14, weekly fulls + daily diffs)
 covers approximately a four-week PITR window before the oldest full
