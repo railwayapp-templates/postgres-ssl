@@ -533,18 +533,35 @@ EOF
 #
 # Container restart on an already-restored volume: $PGDATA is populated, so
 # the empty-PGDATA gate fails and we skip — Postgres starts normally.
+# pgbackrest --target rejects ISO 8601 with T/Z separators ("automatic backup
+# set selection cannot be performed with provided time"); it wants
+# `YYYY-MM-DD HH:MM:SS[.msec][±HH[MM|:MM]]`. Backboard always emits
+# `Date.toISOString()` (T separator, Z suffix), so convert before passing to
+# pgbackrest. PG's own recovery_target_time accepts both forms — we keep the
+# original env-var value for that path.
+to_pgbackrest_target_time() {
+  local t="$1"
+  case "$t" in
+    *Z) t="${t%Z}+00" ;;
+  esac
+  printf '%s' "${t//T/ }"
+}
+
 restore_from_pgbackrest_if_empty_volume() {
   [ -z "${WAL_RECOVER_FROM_BUCKET:-}" ] && return 0
   [ -z "${POSTGRES_RECOVERY_TARGET_TIME:-}" ] && return 0
   [ -f "$PGDATA/PG_VERSION" ] && return 0
   [ -f "$PGBACKREST_RESTORED_MARKER" ] && return 0
 
-  echo "pgbackrest: empty PGDATA + recovery target — restoring from source bucket (target=${POSTGRES_RECOVERY_TARGET_TIME})"
+  local pgbackrest_target
+  pgbackrest_target=$(to_pgbackrest_target_time "$POSTGRES_RECOVERY_TARGET_TIME")
+
+  echo "pgbackrest: empty PGDATA + recovery target — restoring from source bucket (target=${pgbackrest_target})"
 
   install -d -m 0700 -o postgres -g postgres "$PGDATA"
 
   if ! gosu postgres pgbackrest --stanza=main --repo=1 restore \
-       --type=time --target="$POSTGRES_RECOVERY_TARGET_TIME" \
+       --type=time --target="$pgbackrest_target" \
        --target-action=promote; then
     echo "pgbackrest: restore from source bucket failed; fix env vars (WAL_RECOVER_FROM_*, POSTGRES_RECOVERY_TARGET_TIME) and redeploy" >&2
     exit 1
@@ -552,7 +569,7 @@ restore_from_pgbackrest_if_empty_volume() {
 
   touch "$PGBACKREST_RESTORED_MARKER"
   chown postgres:postgres "$PGBACKREST_RESTORED_MARKER" 2>/dev/null || true
-  echo "pgbackrest: restore complete; postgres will replay forward to ${POSTGRES_RECOVERY_TARGET_TIME} and promote on first start"
+  echo "pgbackrest: restore complete; postgres will replay forward to ${pgbackrest_target} and promote on first start"
 }
 
 # Fork the backup watcher. Subshell pattern matches bootstrap_pgbackrest_stanza
