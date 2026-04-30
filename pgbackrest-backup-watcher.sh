@@ -214,6 +214,55 @@ emit_wal_heartbeat() {
     >/dev/null 2>&1 || true
 }
 
+# Reconcile the local state cache against bucket truth on boot. The watcher's
+# decide_action() reads only pg_stat_archiver and the local cache for speed —
+# it never queries `pgbackrest info` per iteration. That's fine in steady
+# state, but a stale cache combined with a bucket that no longer matches it
+# stalls NEEDS_INITIAL_BACKUP for up to WAL_BACKUP_FULL_INTERVAL_HOURS. The
+# canonical case: operator changed WAL_ARCHIVE_BUCKET to a different bucket
+# without first unsetting it, so clear_pgbackrest_state_if_disabled never
+# wiped the cache. The cache says last_full_at=X, the new bucket has nothing,
+# and the watcher would sit idle until the next periodic full.
+#
+# Conservative: only clears the cache. Doesn't try to advance it when the
+# bucket is ahead of the cache (the existing "harmless extra full" path
+# handles that correctly via NEEDS_INITIAL_BACKUP if the cache were empty,
+# or via the periodic check if cache is set). And only runs once at boot —
+# per-iteration `pgbackrest info` calls would add S3 round-trips to a hot
+# loop that's currently psql-only.
+reconcile_state_with_bucket() {
+  local last_full_cached
+  last_full_cached=$(read_state last_full_at)
+  [ -z "$last_full_cached" ] && return 0
+
+  # `pgbackrest info` may transiently fail on boot — bucket-side stanza
+  # metadata might not be readable yet, especially if bootstrap_pgbackrest_stanza
+  # hasn't reached its stanza-create call. Retry a few times before giving
+  # up; on persistent error we leave the cache alone (better to skip
+  # reconciliation than clear a valid cache on a transient S3 hiccup).
+  # Empty/non-existent stanza is *not* an error to pgbackrest — it returns
+  # exit 0 with text indicating no backups, which we count as zero fulls.
+  local info_output info_rc=1
+  local i
+  for i in 1 2 3 4 5; do
+    info_rc=0
+    info_output=$(pgbackrest --stanza=main info 2>/dev/null) || info_rc=$?
+    [ "$info_rc" -eq 0 ] && break
+    sleep 2
+  done
+  if [ "$info_rc" -ne 0 ]; then
+    log "reconcile: pgbackrest info errored after retries; leaving cache untouched"
+    return 0
+  fi
+
+  local fulls
+  fulls=$(echo "$info_output" | grep -cE "^[[:space:]]+full backup: " || true)
+  if [ "${fulls:-0}" -eq 0 ]; then
+    log "reconcile: bucket has no full but cache claims last_full_at=${last_full_cached}; clearing cache"
+    rm -f "$STATE_FILE"
+  fi
+}
+
 watcher_iteration() {
   pg_isready -h 127.0.0.1 -p 5432 -U postgres -q 2>/dev/null || return 0
   is_standby && return 0
@@ -250,6 +299,8 @@ sync_repo_path_from_marker() {
 sync_repo_path_from_marker
 
 log "starting (poll=${POLL_INTERVAL_SECONDS}s, full=${FULL_INTERVAL_HOURS}h, diff=${DIFF_INTERVAL_HOURS}h, gap_grace=${GAP_RESOLVED_GRACE_SECONDS}s, repo1-path=${PGBACKREST_REPO1_PATH:-unset})"
+
+reconcile_state_with_bucket
 
 while true; do
   sync_repo_path_from_marker

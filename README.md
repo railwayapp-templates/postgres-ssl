@@ -209,8 +209,13 @@ conditions holds:
 
 1. **Initial backup** — `pg_stat_archiver.archived_count > 0` and no
    full has been recorded on this volume. Triggers the first
-   `--type=full`, anchoring the PITR window from the first archived LSN
-   forward.
+   `--type=full`, anchoring the PITR window from this base's LSN
+   forward. WAL archived between archive-enable and the first full lands
+   in the bucket but isn't restorable on its own — pgBackRest restore
+   needs a base to apply WAL onto. The pre-first-full window is a
+   typically-sub-minute boundary; targets inside it return "no backup
+   set with stop time less than &lt;target&gt;" rather than a partial
+   restore.
 2. **Gap recovery** — either the archive-push wrapper dropped a segment
    (touches `$PGDATA/.pgbackrest_gap_pending`) or
    `pg_stat_archiver.failed_count` grew since the last full. Once

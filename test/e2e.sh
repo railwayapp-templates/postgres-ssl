@@ -189,6 +189,24 @@ wait_for_pg() {
   return 1
 }
 
+# Wait for the cluster to finish recovery and promote (i.e.
+# pg_is_in_recovery() returns 'f'). pg_isready / wait_for_pg returns true
+# during archive recovery — postgres accepts read-only connections before
+# the promote completes — which can let restart-mid-flight tests rip the
+# container before recovery flushes recovery.signal. Use this helper after
+# wait_for_pg in tests that depend on the cluster being fully promoted
+# (e.g. a second boot must NOT re-stage recovery).
+wait_for_promoted() {
+  local container="$1" deadline=$(($(date +%s) + 60))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    local in_rec
+    in_rec=$(docker exec "$container" psql -U postgres -At -c "SELECT pg_is_in_recovery()" 2>/dev/null || echo "?")
+    [ "$in_rec" = "f" ] && return 0
+    sleep 1
+  done
+  return 1
+}
+
 cleanup_test_resources() {
   docker rm -f $(docker ps -aq --filter "label=postgres-ssl-e2e=1") 2>/dev/null >/dev/null || true
   for v in $(docker volume ls -q --filter "label=postgres-ssl-e2e=1" 2>/dev/null); do
@@ -1159,9 +1177,17 @@ t_watcher_dual_repo_skips() {
     -v "$vol:/var/lib/postgresql/data" \
     "$IMAGE" >/dev/null
   wait_for_pg "$name" || { ko t_watcher_dual_repo_skips "no startup"; fail_dump t_watcher_dual_repo_skips "$name"; return; }
-  sleep 6
-
-  if ! docker logs "$name" 2>&1 | grep -q "pgbackrest-watcher: skipping — both WAL_RECOVER_FROM_\* and WAL_ARCHIVE_\* are set"; then
+  # Poll for the watcher's skip line. wrapper.sh forks the watcher right
+  # after wait_for_pg's gate (postgres up), but on a busy docker host the
+  # subshell's first echo may not have shipped to the log buffer yet.
+  local deadline=$(($(date +%s) + 30)) hit=0
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if docker logs "$name" 2>&1 | grep -q "pgbackrest-watcher: skipping — both"; then
+      hit=1; break
+    fi
+    sleep 1
+  done
+  if [ "$hit" != "1" ]; then
     ko t_watcher_dual_repo_skips "watcher did not log dual-repo skip"
     fail_dump t_watcher_dual_repo_skips "$name"
     return
@@ -1296,6 +1322,872 @@ t_retention_expires_old_fulls() {
   docker volume rm "$vol" >/dev/null
 }
 
+# ----- defense-in-depth + lifecycle tests ------------------------------------
+#
+# These cover the customer-perceived PITR window contract end-to-end and the
+# volume × bucket lifecycle transitions that surface in real ops. The mono
+# mutation pre-validates target ≥ earliestBackupAt, but that check can be
+# stale by the time the workflow boots the restored container, and operators
+# hitting the image directly bypass the mutation entirely. So the image must
+# carry the same loud-refuse guarantee.
+
+# Run a manual `pgbackrest backup --type=<type>` inside the container, with
+# all REPO1_S3_* env vars exported from the WAL_ARCHIVE_* set the wrapper
+# already populated. Triggers `pgbackrest expire` automatically post-backup.
+take_pgbackrest_backup() {
+  local container="$1" backup_type="${2:-full}"
+  docker exec -u postgres "$container" bash -c "
+    export PGBACKREST_REPO1_S3_BUCKET=\"\$WAL_ARCHIVE_BUCKET\"
+    export PGBACKREST_REPO1_S3_KEY=\"\$WAL_ARCHIVE_KEY\"
+    export PGBACKREST_REPO1_S3_KEY_SECRET=\"\$WAL_ARCHIVE_SECRET\"
+    export PGBACKREST_REPO1_S3_REGION=\"\$WAL_ARCHIVE_REGION\"
+    export PGBACKREST_REPO1_S3_ENDPOINT=\"\$WAL_ARCHIVE_ENDPOINT\"
+    export PGBACKREST_REPO1_PATH=\"\${WAL_ARCHIVE_PATH:-/pgbackrest}\"
+    pgbackrest --stanza=main backup --type=$backup_type
+  " >/dev/null 2>&1
+}
+
+# Count zst-compressed WAL segments under the bucket's archive/main/<timeline>
+# tree. Used by retention-cascade tests.
+count_archived_wal_segments() {
+  mc "mc find local/${BUCKET}/pgbackrest/archive --name '*.zst' 2>/dev/null | wc -l" \
+    | tail -1 | tr -d ' '
+}
+
+# G1. Real failure-driven gap recovery via pg_stat_archiver.failed_count
+# growth (with the .pgbackrest_gap_pending marker NEVER touched). Catches
+# the t_watcher_gap_recovery_full test's cheat: that test pokes the marker
+# directly. This one drives the watcher purely off failed_count.
+t_watcher_gap_recovery_failed_count_path() {
+  local name=t-gap-fc-${PG_VERSION}
+  local vol=${name}-vol
+  local user=t-gap-fc-user
+  local pass=t-gap-fc-pass-12345
+  reset_bucket
+  new_volume "$vol"
+  docker rm -f "$name" >/dev/null 2>&1 || true
+
+  # Dedicated MinIO user the test can disable/enable mid-flight without
+  # locking out the harness's admin creds. Idempotent — if a prior failed
+  # run left the user behind, recreate it cleanly.
+  mc "
+    mc admin user remove local ${user} >/dev/null 2>&1 || true
+    mc admin user add local ${user} ${pass}
+    mc admin policy attach local readwrite --user ${user} 2>/dev/null || true
+  " >/dev/null
+
+  # Threshold absurdly high so the wrapper NEVER drops on its own → no
+  # .pgbackrest_gap_pending marker ever written → the only signal the
+  # watcher has is failed_count growing past last_full_failed_count.
+  # archive_timeout=5 so failed_count grows in seconds, not minutes.
+  docker run -d --name "$name" --label postgres-ssl-e2e=1 --network "$NET" \
+    -e POSTGRES_PASSWORD=test \
+    -e "WAL_ARCHIVE_BUCKET=$BUCKET" \
+    -e "WAL_ARCHIVE_ENDPOINT=http://${MINIO}:9000" \
+    -e WAL_ARCHIVE_REGION=us-east-1 \
+    -e "WAL_ARCHIVE_KEY=${user}" \
+    -e "WAL_ARCHIVE_SECRET=${pass}" \
+    -e WAL_ARCHIVE_PATH=/pgbackrest \
+    -e PGBACKREST_REPO1_S3_URI_STYLE=path \
+    -e WAL_DROP_THRESHOLD_MB=999999 \
+    -e POSTGRES_ARCHIVE_TIMEOUT=5 \
+    -e WAL_BACKUP_POLL_INTERVAL_SECONDS=5 \
+    -e WAL_BACKUP_GAP_RESOLVED_GRACE_SECONDS=10 \
+    -v "$vol:/var/lib/postgresql/data" \
+    "$IMAGE" >/dev/null
+  wait_for_pg "$name" || { ko t_watcher_gap_recovery_failed_count_path "no startup"; fail_dump t_watcher_gap_recovery_failed_count_path "$name"; return; }
+
+  for _ in $(seq 1 15); do
+    docker logs "$name" 2>&1 | grep -q "stanza-create completed" && break
+    sleep 1
+  done
+  docker exec "$name" psql -U postgres -c "CREATE TABLE t(id int); SELECT pg_switch_wal();" >/dev/null
+  wait_for_watcher_backup "$name" full 60 || { ko t_watcher_gap_recovery_failed_count_path "no initial full"; fail_dump t_watcher_gap_recovery_failed_count_path "$name"; return; }
+
+  local before_count
+  before_count=$(docker logs "$name" 2>&1 | grep -c "backup --type=full completed" || true)
+
+  # Disable the user → archive-push gets 403 → archive_command returns
+  # non-zero (wrapper threshold not met) → Postgres bumps failed_count.
+  mc "mc admin user disable local ${user}" >/dev/null
+  for i in 1 2 3 4 5; do
+    docker exec "$name" psql -U postgres -c "INSERT INTO t SELECT g FROM generate_series(${i}00000, ${i}00100) g; SELECT pg_switch_wal();" >/dev/null 2>&1
+    sleep 2
+  done
+
+  local failed_count
+  failed_count=$(docker exec "$name" psql -U postgres -At -c "SELECT failed_count FROM pg_stat_archiver" 2>/dev/null || echo 0)
+  if [ "${failed_count:-0}" -lt 1 ]; then
+    ko t_watcher_gap_recovery_failed_count_path "expected failed_count to grow under disabled user; got $failed_count"
+    fail_dump t_watcher_gap_recovery_failed_count_path "$name"
+    return
+  fi
+
+  # Marker should NOT have been written — that's the whole point of this
+  # test (proves the failed_count branch fires independently of the marker).
+  if docker exec "$name" test -f /var/lib/postgresql/data/.pgbackrest_gap_pending; then
+    ko t_watcher_gap_recovery_failed_count_path ".pgbackrest_gap_pending was written; threshold should not have tripped"
+    return
+  fi
+
+  # Re-enable the user → archive-push succeeds again → grace window starts
+  # from last_failed_time. Wait grace + a few polls.
+  mc "mc admin user enable local ${user}" >/dev/null
+
+  local deadline=$(($(date +%s) + 60)) hit=0
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    local now_count
+    now_count=$(docker logs "$name" 2>&1 | grep -c "backup --type=full completed" || true)
+    if [ "$now_count" -gt "$before_count" ]; then hit=1; break; fi
+    sleep 2
+  done
+  if [ "$hit" != "1" ]; then
+    ko t_watcher_gap_recovery_failed_count_path "watcher did not take gap-recovery full via failed_count path"
+    fail_dump t_watcher_gap_recovery_failed_count_path "$name"
+    return
+  fi
+
+  # last_full_failed_count must have advanced past 0 — otherwise next
+  # iteration would re-trigger immediately.
+  local last_failed_in_state
+  last_failed_in_state=$(docker exec "$name" grep -E "^last_full_failed_count=" /var/lib/postgresql/data/.pgbackrest_backup_state 2>/dev/null | cut -d= -f2)
+  if [ -z "$last_failed_in_state" ] || [ "$last_failed_in_state" = "0" ]; then
+    ko t_watcher_gap_recovery_failed_count_path "last_full_failed_count not advanced (got '$last_failed_in_state'); next poll would re-trigger"
+    return
+  fi
+
+  ok t_watcher_gap_recovery_failed_count_path
+  note "failed_count=${failed_count} → grace → 2nd full; marker never written; last_full_failed_count=${last_failed_in_state}"
+  mc "mc admin user remove local ${user}" >/dev/null 2>&1 || true
+  docker rm -f "$name" >/dev/null
+  docker volume rm "$vol" >/dev/null
+}
+
+# G2. PITR target older than oldest-retained full → wrapper exits 1 with a
+# clear "no matching backup set" error. Image-level defense-in-depth for the
+# mono mutation's pre-validation, which can be stale by the time the
+# restored container actually boots.
+t_pitr_target_before_retention_window_refuses() {
+  local src_name=t-rwsrc-${PG_VERSION}
+  local src_vol=${src_name}-vol
+  local rest_name=t-rwrest-${PG_VERSION}
+  local rest_vol=${rest_name}-vol
+  reset_bucket
+  new_volume "$src_vol"
+
+  # Retention=2 + 3 fulls → oldest expired. Take the fulls back-to-back
+  # to keep the test fast. setup_pitr_source isn't reusable here because
+  # we need explicit timing control + an early target capture.
+  docker rm -f "$src_name" >/dev/null 2>&1 || true
+  run_archiving_pg_fast_watcher "$src_name" "$src_vol" -e "WAL_BACKUP_RETENTION_FULL=2"
+  wait_for_pg "$src_name" || { ko t_pitr_target_before_retention_window_refuses "src no startup"; return; }
+
+  for _ in $(seq 1 15); do
+    docker logs "$src_name" 2>&1 | grep -q "stanza-create completed" && break
+    sleep 1
+  done
+  docker exec "$src_name" psql -U postgres -c "CREATE TABLE t(id int); SELECT pg_switch_wal();" >/dev/null
+  wait_for_watcher_backup "$src_name" full 60 || { ko t_pitr_target_before_retention_window_refuses "no initial full"; return; }
+
+  # T_TARGET captured during the original full's window. Once retention
+  # culls that backup, T_TARGET points into a hole — pgbackrest restore
+  # must error with code 075.
+  local target
+  target=$(docker exec "$src_name" psql -U postgres -At -c "SELECT now()::timestamptz(0)")
+  sleep 2
+
+  # Insert + WAL switch between fulls so each backup has distinct WAL
+  # ranges; pgbackrest expire then has clear segments to remove with the
+  # oldest full.
+  docker exec "$src_name" psql -U postgres -c "INSERT INTO t VALUES (2); SELECT pg_switch_wal();" >/dev/null
+  sleep 2
+  take_pgbackrest_backup "$src_name" full || { ko t_pitr_target_before_retention_window_refuses "manual full #2 failed"; return; }
+  docker exec "$src_name" psql -U postgres -c "INSERT INTO t VALUES (3); SELECT pg_switch_wal();" >/dev/null
+  sleep 2
+  take_pgbackrest_backup "$src_name" full || { ko t_pitr_target_before_retention_window_refuses "manual full #3 failed"; return; }
+
+  local fulls
+  fulls=$(count_backups_of_type "$src_name" full)
+  if [ "$fulls" != "2" ]; then
+    ko t_pitr_target_before_retention_window_refuses "expected 2 fulls after expire, got $fulls"
+    fail_dump t_pitr_target_before_retention_window_refuses "$src_name"
+    return
+  fi
+
+  # Now attempt restore to T_TARGET on a fresh empty volume. The mono path
+  # uses WAL_RECOVER_FROM_* against the source bucket; the image must
+  # refuse loudly because no retained backup has stop_time ≤ T_TARGET.
+  new_volume "$rest_vol"
+  docker rm -f "$rest_name" >/dev/null 2>&1 || true
+  docker run -d --name "$rest_name" --label postgres-ssl-e2e=1 --network "$NET" \
+    -e POSTGRES_PASSWORD=test \
+    -e "WAL_RECOVER_FROM_BUCKET=$BUCKET" \
+    -e "WAL_RECOVER_FROM_ENDPOINT=http://${MINIO}:9000" \
+    -e WAL_RECOVER_FROM_REGION=us-east-1 \
+    -e WAL_RECOVER_FROM_KEY=$MINIO_USER \
+    -e WAL_RECOVER_FROM_SECRET=$MINIO_PASS \
+    -e WAL_RECOVER_FROM_PATH=/pgbackrest \
+    -e PGBACKREST_REPO1_S3_URI_STYLE=path \
+    -e "POSTGRES_RECOVERY_TARGET_TIME=$target" \
+    -v "$rest_vol:/var/lib/postgresql/data" \
+    "$IMAGE" >/dev/null
+
+  local deadline=$(($(date +%s) + 30)) status="running"
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    status=$(docker inspect -f '{{.State.Status}}' "$rest_name" 2>/dev/null || echo missing)
+    [ "$status" = "exited" ] && break
+    sleep 1
+  done
+  if [ "$status" != "exited" ]; then
+    ko t_pitr_target_before_retention_window_refuses "wrapper should have exited; status=$status"
+    fail_dump t_pitr_target_before_retention_window_refuses "$rest_name"
+    return
+  fi
+  local exit_code; exit_code=$(docker inspect -f '{{.State.ExitCode}}' "$rest_name")
+  if [ "$exit_code" = "0" ]; then
+    ko t_pitr_target_before_retention_window_refuses "wrapper exited 0; expected non-zero refusal"
+    return
+  fi
+  if ! docker logs "$rest_name" 2>&1 | grep -q "unable to find backup set"; then
+    ko t_pitr_target_before_retention_window_refuses "expected 'unable to find backup set' from pgbackrest; logs:"
+    fail_dump t_pitr_target_before_retention_window_refuses "$rest_name"
+    return
+  fi
+  if docker run --rm -v "$rest_vol:/data" alpine test -f /data/PG_VERSION; then
+    ko t_pitr_target_before_retention_window_refuses "PG_VERSION exists; initdb should not have run"
+    return
+  fi
+
+  ok t_pitr_target_before_retention_window_refuses
+  note "target=${target}; oldest full expired; wrapper exit=${exit_code}; PGDATA untouched"
+  docker rm -f "$src_name" "$rest_name" >/dev/null
+  docker volume rm "$src_vol" "$rest_vol" >/dev/null
+}
+
+# G3. WAL retention cascades on expire — when a full is expired, the WAL
+# pinned by its manifest is removed too. Pins the README's "expire is the
+# source of truth for WAL retention" claim and validates the 2× bucket-TTL
+# safety-net guidance (TTL only matters if expire is actually working).
+t_retention_expire_cascades_to_wal() {
+  local name=t-walret-${PG_VERSION}
+  local vol=${name}-vol
+  reset_bucket
+  new_volume "$vol"
+  docker rm -f "$name" >/dev/null 2>&1 || true
+  run_archiving_pg_fast_watcher "$name" "$vol" -e "WAL_BACKUP_RETENTION_FULL=2"
+  wait_for_pg "$name" || { ko t_retention_expire_cascades_to_wal "no startup"; return; }
+
+  for _ in $(seq 1 15); do
+    docker logs "$name" 2>&1 | grep -q "stanza-create completed" && break
+    sleep 1
+  done
+  docker exec "$name" psql -U postgres -c "CREATE TABLE t(id int);" >/dev/null
+  # Force several WAL switches so the bucket has more than one segment per
+  # full's pinned range — a single-segment bucket would make the cascade
+  # un-observable.
+  for i in 1 2 3 4 5; do
+    docker exec "$name" psql -U postgres -c "INSERT INTO t VALUES ($i); SELECT pg_switch_wal();" >/dev/null
+    sleep 1
+  done
+  wait_for_watcher_backup "$name" full 60 || { ko t_retention_expire_cascades_to_wal "no initial full"; return; }
+
+  # Take a second full so retention=2 is at the boundary; capture WAL count
+  # *before* the third full (which is what triggers expire of the first).
+  for i in 6 7 8; do
+    docker exec "$name" psql -U postgres -c "INSERT INTO t VALUES ($i); SELECT pg_switch_wal();" >/dev/null
+    sleep 1
+  done
+  take_pgbackrest_backup "$name" full || { ko t_retention_expire_cascades_to_wal "manual #2 failed"; return; }
+  for i in 9 10 11; do
+    docker exec "$name" psql -U postgres -c "INSERT INTO t VALUES ($i); SELECT pg_switch_wal();" >/dev/null
+    sleep 1
+  done
+
+  local wal_before; wal_before=$(count_archived_wal_segments)
+
+  take_pgbackrest_backup "$name" full || { ko t_retention_expire_cascades_to_wal "manual #3 failed (expire trigger)"; return; }
+  sleep 3  # let pgbackrest expire's S3 deletes settle
+
+  local wal_after; wal_after=$(count_archived_wal_segments)
+
+  if [ "${wal_after:-0}" -ge "${wal_before:-0}" ]; then
+    ko t_retention_expire_cascades_to_wal "expected WAL count to drop after expire; before=$wal_before after=$wal_after"
+    fail_dump t_retention_expire_cascades_to_wal "$name"
+    return
+  fi
+
+  local fulls; fulls=$(count_backups_of_type "$name" full)
+  if [ "$fulls" != "2" ]; then
+    ko t_retention_expire_cascades_to_wal "expected 2 fulls retained, got $fulls"
+    return
+  fi
+
+  ok t_retention_expire_cascades_to_wal
+  note "WAL segments before expire=${wal_before}, after=${wal_after} (cascaded with expired full)"
+  docker rm -f "$name" >/dev/null
+  docker volume rm "$vol" >/dev/null
+}
+
+# G4. Empty-volume restore with bad creds → loud refuse. The wrapper exits
+# non-zero, PGDATA stays empty, no half-init. Operator with a typo in
+# WAL_RECOVER_FROM_KEY must NOT silently get a vanilla initdb.
+t_empty_volume_restore_refuses_on_bad_creds() {
+  setup_pitr_source >&2 || { ko "${FUNCNAME[0]}" "setup_pitr_source failed"; return; }
+  read -r src_name src_vol < "/tmp/pitr-source-${PG_VERSION}"
+  local target; target=$(cat "/tmp/pitr-target-${PG_VERSION}")
+  local rest_name=t-badcreds-${PG_VERSION}
+  local rest_vol=${rest_name}-vol
+  new_volume "$rest_vol"
+  docker rm -f "$rest_name" >/dev/null 2>&1 || true
+
+  docker run -d --name "$rest_name" --label postgres-ssl-e2e=1 --network "$NET" \
+    -e POSTGRES_PASSWORD=test \
+    -e "WAL_RECOVER_FROM_BUCKET=$BUCKET" \
+    -e "WAL_RECOVER_FROM_ENDPOINT=http://${MINIO}:9000" \
+    -e WAL_RECOVER_FROM_REGION=us-east-1 \
+    -e WAL_RECOVER_FROM_KEY=DELIBERATELY_BAD_KEY \
+    -e WAL_RECOVER_FROM_SECRET=DELIBERATELY_BAD_SECRET \
+    -e WAL_RECOVER_FROM_PATH=/pgbackrest \
+    -e PGBACKREST_REPO1_S3_URI_STYLE=path \
+    -e "POSTGRES_RECOVERY_TARGET_TIME=$target" \
+    -v "$rest_vol:/var/lib/postgresql/data" \
+    "$IMAGE" >/dev/null
+
+  local deadline=$(($(date +%s) + 30)) status="running"
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    status=$(docker inspect -f '{{.State.Status}}' "$rest_name" 2>/dev/null || echo missing)
+    [ "$status" = "exited" ] && break
+    sleep 1
+  done
+  if [ "$status" != "exited" ]; then
+    ko t_empty_volume_restore_refuses_on_bad_creds "wrapper should have exited; status=$status"
+    fail_dump t_empty_volume_restore_refuses_on_bad_creds "$rest_name"
+    return
+  fi
+  local exit_code; exit_code=$(docker inspect -f '{{.State.ExitCode}}' "$rest_name")
+  if [ "$exit_code" = "0" ]; then
+    ko t_empty_volume_restore_refuses_on_bad_creds "wrapper exited 0; expected non-zero refusal"
+    return
+  fi
+  if ! docker logs "$rest_name" 2>&1 | grep -q "restore from source bucket failed"; then
+    ko t_empty_volume_restore_refuses_on_bad_creds "expected 'restore from source bucket failed' in logs"
+    fail_dump t_empty_volume_restore_refuses_on_bad_creds "$rest_name"
+    return
+  fi
+  if docker run --rm -v "$rest_vol:/data" alpine test -f /data/PG_VERSION; then
+    ko t_empty_volume_restore_refuses_on_bad_creds "PG_VERSION exists; initdb should not have run"
+    return
+  fi
+
+  ok t_empty_volume_restore_refuses_on_bad_creds
+  note "wrapper exit=${exit_code}; PGDATA untouched"
+  docker rm -f "$src_name" "$rest_name" >/dev/null
+  docker volume rm "$src_vol" "$rest_vol" >/dev/null
+}
+
+# E1. Wipe volume + reuse same bucket → loud failure on stanza mismatch.
+# Operator wipes the data volume but redeploys with the same
+# WAL_ARCHIVE_BUCKET set and no recover-from. New initdb produces a new
+# system identifier; pgbackrest stanza-create errors loudly on the
+# DB-id mismatch rather than letting the new cluster overwrite the
+# previous cluster's repo. Cluster stays up but PITR is broken (loud).
+t_volume_wipe_same_bucket_loud_fail() {
+  local name=t-wipebucket-${PG_VERSION}
+  local vol=${name}-vol
+  reset_bucket
+  new_volume "$vol"
+
+  # Cluster A: archive a few segments, take initial full.
+  docker rm -f "$name" >/dev/null 2>&1 || true
+  run_archiving_pg_fast_watcher "$name" "$vol"
+  wait_for_pg "$name" || { ko t_volume_wipe_same_bucket_loud_fail "A no startup"; return; }
+  for _ in $(seq 1 15); do
+    docker logs "$name" 2>&1 | grep -q "stanza-create completed" && break
+    sleep 1
+  done
+  docker exec "$name" psql -U postgres -c "CREATE TABLE t(id int); INSERT INTO t VALUES (1); SELECT pg_switch_wal();" >/dev/null
+  wait_for_watcher_backup "$name" full 60 || { ko t_volume_wipe_same_bucket_loud_fail "A no initial full"; return; }
+  local fulls_a; fulls_a=$(count_backups_of_type "$name" full)
+  assert_eq "$fulls_a" "1" "A took 1 full" || { ko t_volume_wipe_same_bucket_loud_fail ""; return; }
+
+  # Wipe: stop container, recreate volume, redeploy with same env vars.
+  docker rm -f "$name" >/dev/null
+  docker volume rm "$vol" >/dev/null
+  docker volume create --label postgres-ssl-e2e=1 "$vol" >/dev/null
+  run_archiving_pg_fast_watcher "$name" "$vol" -e "WAL_DROP_THRESHOLD_MB=50"
+  wait_for_pg "$name" || { ko t_volume_wipe_same_bucket_loud_fail "C no startup"; fail_dump t_volume_wipe_same_bucket_loud_fail "$name"; return; }
+
+  # stanza-create against the now-stale repo must fail loudly. pgBackRest's
+  # error message starts with "ERROR: [055]" or contains "backup and archive
+  # info files exist but do not match" / "system identifiers do not match"
+  # depending on version. Match either.
+  local stanza_err deadline=$(($(date +%s) + 25))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if docker logs "$name" 2>&1 | grep -qE "system-id.*do not match|backup info file.*do not match|stanza-create failed|FileMissingError.*archive\\.info"; then
+      stanza_err=1; break
+    fi
+    sleep 1
+  done
+  if [ "${stanza_err:-0}" != "1" ]; then
+    ko t_volume_wipe_same_bucket_loud_fail "stanza-create did not loudly fail on DB-id mismatch"
+    fail_dump t_volume_wipe_same_bucket_loud_fail "$name"
+    return
+  fi
+
+  # Force WAL switches; archive-push fails on every one; eventually wrapper
+  # drops on the lowered threshold.
+  docker exec "$name" psql -U postgres -c "CREATE TABLE u(id int);" >/dev/null
+  for i in 1 2 3 4 5 6 7 8; do
+    docker exec "$name" psql -U postgres -c "INSERT INTO u SELECT g FROM generate_series(${i}00000, ${i}00100) g; SELECT pg_switch_wal();" >/dev/null 2>&1
+  done
+  sleep 4
+
+  local failed_count
+  failed_count=$(docker exec "$name" psql -U postgres -At -c "SELECT failed_count FROM pg_stat_archiver" 2>/dev/null || echo 0)
+  if [ "${failed_count:-0}" -lt 1 ]; then
+    ko t_volume_wipe_same_bucket_loud_fail "expected failed_count to grow on stanza-mismatched archive-push; got $failed_count"
+    return
+  fi
+
+  # Bucket-side full count must still be 1 — the original cluster A's
+  # data must NOT have been overwritten. (No new full from the new
+  # cluster; pgbackrest backup would also fail on the stanza mismatch.)
+  local fulls_after
+  fulls_after=$(count_backups_of_type "$name" full)
+  if [ "$fulls_after" != "1" ]; then
+    ko t_volume_wipe_same_bucket_loud_fail "bucket full count changed after wipe+reuse; expected 1, got $fulls_after"
+    return
+  fi
+
+  # Postgres must still be up — loud failure, not crash.
+  local alive; alive=$(docker exec "$name" psql -U postgres -At -c "SELECT 1" 2>/dev/null || echo DEAD)
+  assert_eq "$alive" "1" "postgres alive after stanza-mismatch failures" || { ko t_volume_wipe_same_bucket_loud_fail ""; return; }
+
+  ok t_volume_wipe_same_bucket_loud_fail
+  note "stanza-mismatch loud-failed; cluster A's full preserved; failed_count=${failed_count}"
+  docker rm -f "$name" >/dev/null
+  docker volume rm "$vol" >/dev/null
+}
+
+# E2. Restore + change recovery target after promote → no-op. Pins the
+# README guarantee that a different POSTGRES_RECOVERY_TARGET_TIME on a
+# subsequent boot is ignored once .pitr_configured / .pgbackrest_restored
+# is set. Replaying again on a promoted timeline would corrupt the cluster.
+t_restore_change_target_after_promote_noop() {
+  setup_pitr_source >&2 || { ko "${FUNCNAME[0]}" "setup_pitr_source failed"; return; }
+  read -r src_name src_vol < "/tmp/pitr-source-${PG_VERSION}"
+  local target_t1; target_t1=$(cat "/tmp/pitr-target-${PG_VERSION}")
+  local rest_name=t-target-noop-${PG_VERSION}
+  local rest_vol=${rest_name}-vol
+  new_volume "$rest_vol"
+
+  docker rm -f "$rest_name" >/dev/null 2>&1 || true
+  docker run -d --name "$rest_name" --label postgres-ssl-e2e=1 --network "$NET" \
+    -e POSTGRES_PASSWORD=test \
+    -e "WAL_RECOVER_FROM_BUCKET=$BUCKET" \
+    -e "WAL_RECOVER_FROM_ENDPOINT=http://${MINIO}:9000" \
+    -e WAL_RECOVER_FROM_REGION=us-east-1 \
+    -e WAL_RECOVER_FROM_KEY=$MINIO_USER \
+    -e WAL_RECOVER_FROM_SECRET=$MINIO_PASS \
+    -e WAL_RECOVER_FROM_PATH=/pgbackrest \
+    -e PGBACKREST_REPO1_S3_URI_STYLE=path \
+    -e "POSTGRES_RECOVERY_TARGET_TIME=$target_t1" \
+    -v "$rest_vol:/var/lib/postgresql/data" \
+    "$IMAGE" >/dev/null
+  wait_for_pg "$rest_name" || { ko t_restore_change_target_after_promote_noop "first boot"; fail_dump t_restore_change_target_after_promote_noop "$rest_name"; return; }
+  wait_for_promoted "$rest_name" || { ko t_restore_change_target_after_promote_noop "first boot did not promote in time"; fail_dump t_restore_change_target_after_promote_noop "$rest_name"; return; }
+  local rows_t1
+  rows_t1=$(docker exec "$rest_name" psql -U postgres -At -c "SELECT count(*) FROM pitrtest WHERE id IN (2,3)")
+  assert_eq "$rows_t1" "0" "T1 restore: rows after T1 absent" || { ko t_restore_change_target_after_promote_noop ""; return; }
+
+  # Restart with a different (much later) target. The marker(s) must keep
+  # recovery from re-running.
+  docker rm -f "$rest_name" >/dev/null
+  docker run -d --name "$rest_name" --label postgres-ssl-e2e=1 --network "$NET" \
+    -e POSTGRES_PASSWORD=test \
+    -e "WAL_RECOVER_FROM_BUCKET=$BUCKET" \
+    -e "WAL_RECOVER_FROM_ENDPOINT=http://${MINIO}:9000" \
+    -e WAL_RECOVER_FROM_REGION=us-east-1 \
+    -e WAL_RECOVER_FROM_KEY=$MINIO_USER \
+    -e WAL_RECOVER_FROM_SECRET=$MINIO_PASS \
+    -e WAL_RECOVER_FROM_PATH=/pgbackrest \
+    -e PGBACKREST_REPO1_S3_URI_STYLE=path \
+    -e "POSTGRES_RECOVERY_TARGET_TIME=2099-01-01 00:00:00+00" \
+    -v "$rest_vol:/var/lib/postgresql/data" \
+    "$IMAGE" >/dev/null
+  wait_for_pg "$rest_name" || { ko t_restore_change_target_after_promote_noop "restart"; fail_dump t_restore_change_target_after_promote_noop "$rest_name"; return; }
+
+  # No new restore: PG_VERSION already exists, restore_from_pgbackrest_if_empty_volume
+  # bails on the populated-volume check.
+  if docker logs "$rest_name" 2>&1 | grep -q "restoring from source bucket"; then
+    ko t_restore_change_target_after_promote_noop "wrapper attempted a second restore on populated volume"
+    fail_dump t_restore_change_target_after_promote_noop "$rest_name"
+    return
+  fi
+  # No new conf.d/pgbackrest-recovery.conf written either.
+  if docker exec "$rest_name" test -f /var/lib/postgresql/data/conf.d/pgbackrest-recovery.conf; then
+    ko t_restore_change_target_after_promote_noop "conf.d/pgbackrest-recovery.conf reappeared after restart"
+    return
+  fi
+  # T1 contents preserved — T2 was ignored, no new replay happened.
+  local rows_after
+  rows_after=$(docker exec "$rest_name" psql -U postgres -At -c "SELECT count(*) FROM pitrtest WHERE id IN (2,3)")
+  assert_eq "$rows_after" "0" "after-T2 rows still absent (T2 ignored)" || { ko t_restore_change_target_after_promote_noop ""; return; }
+  local rows_id1
+  rows_id1=$(docker exec "$rest_name" psql -U postgres -At -c "SELECT count(*) FROM pitrtest WHERE id=1")
+  assert_eq "$rows_id1" "1" "id=1 still present" || { ko t_restore_change_target_after_promote_noop ""; return; }
+
+  ok t_restore_change_target_after_promote_noop
+  note "T2 (2099) ignored on second boot; cluster stayed on T1 timeline"
+  docker rm -f "$src_name" "$rest_name" >/dev/null
+  docker volume rm "$src_vol" "$rest_vol" >/dev/null
+}
+
+# E3. Restore → wipe volume → re-restore is idempotent. Wrapper runs
+# pgbackrest restore again on the empty volume; same env vars produce the
+# same outcome. Documents the "force a re-stage by wiping the volume"
+# operator pattern.
+t_restore_then_wipe_volume_redoes_restore() {
+  setup_pitr_source >&2 || { ko "${FUNCNAME[0]}" "setup_pitr_source failed"; return; }
+  read -r src_name src_vol < "/tmp/pitr-source-${PG_VERSION}"
+  local target; target=$(cat "/tmp/pitr-target-${PG_VERSION}")
+  local rest_name=t-redo-${PG_VERSION}
+  local rest_vol=${rest_name}-vol
+  new_volume "$rest_vol"
+  docker rm -f "$rest_name" >/dev/null 2>&1 || true
+
+  local restore_env=(
+    -e POSTGRES_PASSWORD=test
+    -e "WAL_RECOVER_FROM_BUCKET=$BUCKET"
+    -e "WAL_RECOVER_FROM_ENDPOINT=http://${MINIO}:9000"
+    -e WAL_RECOVER_FROM_REGION=us-east-1
+    -e "WAL_RECOVER_FROM_KEY=$MINIO_USER"
+    -e "WAL_RECOVER_FROM_SECRET=$MINIO_PASS"
+    -e WAL_RECOVER_FROM_PATH=/pgbackrest
+    -e PGBACKREST_REPO1_S3_URI_STYLE=path
+    -e "POSTGRES_RECOVERY_TARGET_TIME=$target"
+  )
+
+  docker run -d --name "$rest_name" --label postgres-ssl-e2e=1 --network "$NET" \
+    "${restore_env[@]}" \
+    -v "$rest_vol:/var/lib/postgresql/data" \
+    "$IMAGE" >/dev/null
+  wait_for_pg "$rest_name" || { ko t_restore_then_wipe_volume_redoes_restore "1st boot"; fail_dump t_restore_then_wipe_volume_redoes_restore "$rest_name"; return; }
+  wait_for_promoted "$rest_name" || { ko t_restore_then_wipe_volume_redoes_restore "1st boot did not promote"; fail_dump t_restore_then_wipe_volume_redoes_restore "$rest_name"; return; }
+  if ! docker exec "$rest_name" test -f /var/lib/postgresql/data/.pgbackrest_restored; then
+    ko t_restore_then_wipe_volume_redoes_restore "1st boot didn't write .pgbackrest_restored"
+    return
+  fi
+
+  # Wipe volume + redeploy with identical env. wrapper must run pgbackrest
+  # restore again from scratch. new_volume() handles container-still-holds-
+  # volume races that bare `docker volume rm` doesn't — without it, the wipe
+  # silently no-ops and the .pgbackrest_restored marker from the first boot
+  # short-circuits restore_from_pgbackrest_if_empty_volume.
+  docker rm -f "$rest_name" >/dev/null
+  new_volume "$rest_vol"
+
+  docker run -d --name "$rest_name" --label postgres-ssl-e2e=1 --network "$NET" \
+    "${restore_env[@]}" \
+    -v "$rest_vol:/var/lib/postgresql/data" \
+    "$IMAGE" >/dev/null
+  wait_for_pg "$rest_name" || { ko t_restore_then_wipe_volume_redoes_restore "2nd boot after wipe"; fail_dump t_restore_then_wipe_volume_redoes_restore "$rest_name"; return; }
+
+  # Poll for the restore log line — wrapper writes it before pgbackrest
+  # actually runs, so wait_for_pg returning is sufficient evidence that
+  # the line is in the buffer, but harmless to give it a couple seconds
+  # in case docker's log shipping lags under suite-load.
+  local deadline=$(($(date +%s) + 10)) hit=0
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if docker logs "$rest_name" 2>&1 | grep -q "restoring from source bucket"; then
+      hit=1; break
+    fi
+    sleep 1
+  done
+  if [ "$hit" != "1" ]; then
+    ko t_restore_then_wipe_volume_redoes_restore "2nd boot did not re-run pgbackrest restore"
+    fail_dump t_restore_then_wipe_volume_redoes_restore "$rest_name"
+    return
+  fi
+  if ! docker exec "$rest_name" test -f /var/lib/postgresql/data/.pgbackrest_restored; then
+    ko t_restore_then_wipe_volume_redoes_restore "2nd boot didn't re-write .pgbackrest_restored"
+    return
+  fi
+  # Same data outcome as 1st boot: id=1 present, id=2,3 absent.
+  local rows_after
+  rows_after=$(docker exec "$rest_name" psql -U postgres -At -c "SELECT count(*) FROM pitrtest WHERE id IN (2,3)")
+  assert_eq "$rows_after" "0" "id=2,3 absent in re-restored cluster" || { ko t_restore_then_wipe_volume_redoes_restore ""; return; }
+
+  ok t_restore_then_wipe_volume_redoes_restore
+  note "wipe + redeploy → wrapper re-restored from source"
+  docker rm -f "$src_name" "$rest_name" >/dev/null
+  docker volume rm "$src_vol" "$rest_vol" >/dev/null
+}
+
+# E4. Restore + add WAL_ARCHIVE_* without clearing recover-from → dual-repo
+# guard fires, archiving silently broken until operator clears recover-from.
+# Then unset recover-from → archiving activates, watcher takes initial
+# full on the new bucket. Pins the documented "clear recover-from before
+# adding archive" lifecycle.
+t_restore_then_enable_archive_dual_repo_blocked_until_clear() {
+  setup_pitr_source >&2 || { ko "${FUNCNAME[0]}" "setup_pitr_source failed"; return; }
+  read -r src_name src_vol < "/tmp/pitr-source-${PG_VERSION}"
+  local target; target=$(cat "/tmp/pitr-target-${PG_VERSION}")
+  local rest_name=t-dualadd-${PG_VERSION}
+  local rest_vol=${rest_name}-vol
+  local new_bucket=pgbackrest-restored
+  new_volume "$rest_vol"
+
+  # Prep a second bucket the restored service will own. Same MinIO instance.
+  mc "mc rm -r --force local/${new_bucket} >/dev/null 2>&1; mc mb -p local/${new_bucket} >/dev/null"
+
+  # Phase 1: vanilla restore → cluster running on T1, no archiving.
+  docker rm -f "$rest_name" >/dev/null 2>&1 || true
+  docker run -d --name "$rest_name" --label postgres-ssl-e2e=1 --network "$NET" \
+    -e POSTGRES_PASSWORD=test \
+    -e "WAL_RECOVER_FROM_BUCKET=$BUCKET" \
+    -e "WAL_RECOVER_FROM_ENDPOINT=http://${MINIO}:9000" \
+    -e WAL_RECOVER_FROM_REGION=us-east-1 \
+    -e WAL_RECOVER_FROM_KEY=$MINIO_USER \
+    -e WAL_RECOVER_FROM_SECRET=$MINIO_PASS \
+    -e WAL_RECOVER_FROM_PATH=/pgbackrest \
+    -e PGBACKREST_REPO1_S3_URI_STYLE=path \
+    -e "POSTGRES_RECOVERY_TARGET_TIME=$target" \
+    -v "$rest_vol:/var/lib/postgresql/data" \
+    "$IMAGE" >/dev/null
+  wait_for_pg "$rest_name" || { ko t_restore_then_enable_archive_dual_repo_blocked_until_clear "phase1 wait_for_pg"; fail_dump t_restore_then_enable_archive_dual_repo_blocked_until_clear "$rest_name"; return; }
+  # Don't move on to phase 2 until promote completes. wait_for_pg returns
+  # while the cluster is still in recovery accepting read-only connections;
+  # killing it then leaves recovery.signal in PGDATA, so phase 2's wrapper
+  # restarts mid-recovery instead of hitting the dual-repo gate.
+  wait_for_promoted "$rest_name" || { ko t_restore_then_enable_archive_dual_repo_blocked_until_clear "phase1 promote"; fail_dump t_restore_then_enable_archive_dual_repo_blocked_until_clear "$rest_name"; return; }
+
+  # Phase 2: add WAL_ARCHIVE_* (different bucket) without unsetting recover-from.
+  # bootstrap_pgbackrest_stanza and the watcher should both refuse to operate.
+  docker rm -f "$rest_name" >/dev/null
+  docker run -d --name "$rest_name" --label postgres-ssl-e2e=1 --network "$NET" \
+    -e POSTGRES_PASSWORD=test \
+    -e "WAL_RECOVER_FROM_BUCKET=$BUCKET" \
+    -e "WAL_RECOVER_FROM_ENDPOINT=http://${MINIO}:9000" \
+    -e WAL_RECOVER_FROM_REGION=us-east-1 \
+    -e WAL_RECOVER_FROM_KEY=$MINIO_USER \
+    -e WAL_RECOVER_FROM_SECRET=$MINIO_PASS \
+    -e WAL_RECOVER_FROM_PATH=/pgbackrest \
+    -e "WAL_ARCHIVE_BUCKET=$new_bucket" \
+    -e "WAL_ARCHIVE_ENDPOINT=http://${MINIO}:9000" \
+    -e WAL_ARCHIVE_REGION=us-east-1 \
+    -e WAL_ARCHIVE_KEY=$MINIO_USER \
+    -e WAL_ARCHIVE_SECRET=$MINIO_PASS \
+    -e WAL_ARCHIVE_PATH=/pgbackrest \
+    -e PGBACKREST_REPO1_S3_URI_STYLE=path \
+    -e WAL_BACKUP_POLL_INTERVAL_SECONDS=5 \
+    -v "$rest_vol:/var/lib/postgresql/data" \
+    "$IMAGE" >/dev/null
+  wait_for_pg "$rest_name" || { ko t_restore_then_enable_archive_dual_repo_blocked_until_clear "phase2"; fail_dump t_restore_then_enable_archive_dual_repo_blocked_until_clear "$rest_name"; return; }
+
+  # Poll for both skip lines instead of a fixed sleep — under suite load
+  # docker's log shipping lags the actual writes by a few seconds.
+  local deadline=$(($(date +%s) + 30)) stanza_hit=0 watcher_hit=0
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if [ "$stanza_hit" != "1" ] && docker logs "$rest_name" 2>&1 | grep -q "skipping stanza-create — both"; then
+      stanza_hit=1
+    fi
+    if [ "$watcher_hit" != "1" ] && docker logs "$rest_name" 2>&1 | grep -q "pgbackrest-watcher: skipping — both"; then
+      watcher_hit=1
+    fi
+    [ "$stanza_hit" = "1" ] && [ "$watcher_hit" = "1" ] && break
+    sleep 1
+  done
+  if [ "$stanza_hit" != "1" ]; then
+    ko t_restore_then_enable_archive_dual_repo_blocked_until_clear "stanza-create did not log dual-repo skip"
+    fail_dump t_restore_then_enable_archive_dual_repo_blocked_until_clear "$rest_name"
+    return
+  fi
+  if [ "$watcher_hit" != "1" ]; then
+    ko t_restore_then_enable_archive_dual_repo_blocked_until_clear "watcher did not log dual-repo skip"
+    fail_dump t_restore_then_enable_archive_dual_repo_blocked_until_clear "$rest_name"
+    return
+  fi
+
+  # New bucket must remain empty (no fulls written by the silently-broken
+  # archiving setup).
+  local new_bucket_objects
+  new_bucket_objects=$(mc "mc ls --recursive local/${new_bucket} 2>/dev/null | wc -l" | tail -1 | tr -d ' ')
+  if [ "${new_bucket_objects:-0}" -gt 0 ]; then
+    ko t_restore_then_enable_archive_dual_repo_blocked_until_clear "new bucket has objects despite dual-repo skip; got $new_bucket_objects"
+    return
+  fi
+
+  # Phase 3: clear recover-from, keep archive only. archiving activates,
+  # watcher takes initial full into the new bucket.
+  docker rm -f "$rest_name" >/dev/null
+  docker run -d --name "$rest_name" --label postgres-ssl-e2e=1 --network "$NET" \
+    -e POSTGRES_PASSWORD=test \
+    -e "WAL_ARCHIVE_BUCKET=$new_bucket" \
+    -e "WAL_ARCHIVE_ENDPOINT=http://${MINIO}:9000" \
+    -e WAL_ARCHIVE_REGION=us-east-1 \
+    -e WAL_ARCHIVE_KEY=$MINIO_USER \
+    -e WAL_ARCHIVE_SECRET=$MINIO_PASS \
+    -e WAL_ARCHIVE_PATH=/pgbackrest \
+    -e PGBACKREST_REPO1_S3_URI_STYLE=path \
+    -e WAL_BACKUP_POLL_INTERVAL_SECONDS=5 \
+    -v "$rest_vol:/var/lib/postgresql/data" \
+    "$IMAGE" >/dev/null
+  wait_for_pg "$rest_name" || { ko t_restore_then_enable_archive_dual_repo_blocked_until_clear "phase3"; return; }
+  for _ in $(seq 1 20); do
+    docker logs "$rest_name" 2>&1 | grep -q "stanza-create completed" && break
+    sleep 1
+  done
+  docker exec "$rest_name" psql -U postgres -c "CREATE TABLE postpromote(id int); INSERT INTO postpromote VALUES (1); SELECT pg_switch_wal();" >/dev/null
+  if ! wait_for_watcher_backup "$rest_name" full 60; then
+    ko t_restore_then_enable_archive_dual_repo_blocked_until_clear "watcher did not take initial full after recover-from cleared"
+    fail_dump t_restore_then_enable_archive_dual_repo_blocked_until_clear "$rest_name"
+    return
+  fi
+
+  ok t_restore_then_enable_archive_dual_repo_blocked_until_clear
+  note "phase2 dual-repo skip; phase3 cleared recover-from → initial full landed in new bucket"
+  mc "mc rm -r --force local/${new_bucket}" >/dev/null 2>&1 || true
+  docker rm -f "$src_name" "$rest_name" >/dev/null
+  docker volume rm "$src_vol" "$rest_vol" >/dev/null
+}
+
+# E5. Restored marker persists across restarts. Once .pgbackrest_restored
+# is set, configure_pgbackrest_recovery must early-return on every
+# subsequent boot — no duplicate recovery.signal, no duplicate conf.d
+# include. Catches a regression where a future change forgets to gate
+# on the marker.
+t_restored_marker_persists_across_restarts() {
+  setup_pitr_source >&2 || { ko "${FUNCNAME[0]}" "setup_pitr_source failed"; return; }
+  read -r src_name src_vol < "/tmp/pitr-source-${PG_VERSION}"
+  local target; target=$(cat "/tmp/pitr-target-${PG_VERSION}")
+  local rest_name=t-marker-persist-${PG_VERSION}
+  local rest_vol=${rest_name}-vol
+  new_volume "$rest_vol"
+  docker rm -f "$rest_name" >/dev/null 2>&1 || true
+
+  local restore_env=(
+    -e POSTGRES_PASSWORD=test
+    -e "WAL_RECOVER_FROM_BUCKET=$BUCKET"
+    -e "WAL_RECOVER_FROM_ENDPOINT=http://${MINIO}:9000"
+    -e WAL_RECOVER_FROM_REGION=us-east-1
+    -e "WAL_RECOVER_FROM_KEY=$MINIO_USER"
+    -e "WAL_RECOVER_FROM_SECRET=$MINIO_PASS"
+    -e WAL_RECOVER_FROM_PATH=/pgbackrest
+    -e PGBACKREST_REPO1_S3_URI_STYLE=path
+    -e "POSTGRES_RECOVERY_TARGET_TIME=$target"
+  )
+
+  docker run -d --name "$rest_name" --label postgres-ssl-e2e=1 --network "$NET" \
+    "${restore_env[@]}" \
+    -v "$rest_vol:/var/lib/postgresql/data" \
+    "$IMAGE" >/dev/null
+  wait_for_pg "$rest_name" || { ko t_restored_marker_persists_across_restarts "1st boot"; return; }
+  wait_for_promoted "$rest_name" || { ko t_restored_marker_persists_across_restarts "1st boot did not promote"; fail_dump t_restored_marker_persists_across_restarts "$rest_name"; return; }
+
+  if ! docker exec "$rest_name" test -f /var/lib/postgresql/data/.pgbackrest_restored; then
+    ko t_restored_marker_persists_across_restarts "first boot didn't write .pgbackrest_restored"
+    return
+  fi
+
+  # Restart with same env vars + same volume.
+  docker rm -f "$rest_name" >/dev/null
+  docker run -d --name "$rest_name" --label postgres-ssl-e2e=1 --network "$NET" \
+    "${restore_env[@]}" \
+    -v "$rest_vol:/var/lib/postgresql/data" \
+    "$IMAGE" >/dev/null
+  wait_for_pg "$rest_name" || { ko t_restored_marker_persists_across_restarts "2nd boot"; fail_dump t_restored_marker_persists_across_restarts "$rest_name"; return; }
+
+  if ! docker exec "$rest_name" test -f /var/lib/postgresql/data/.pgbackrest_restored; then
+    ko t_restored_marker_persists_across_restarts ".pgbackrest_restored disappeared on restart"
+    return
+  fi
+  # configure_pgbackrest_recovery must NOT have rewritten the include —
+  # restore already set its own recovery params; layering ours would be
+  # a duplicate (and on a promoted timeline would break future starts).
+  if docker exec "$rest_name" test -f /var/lib/postgresql/data/conf.d/pgbackrest-recovery.conf; then
+    ko t_restored_marker_persists_across_restarts "conf.d/pgbackrest-recovery.conf reappeared after restart (marker not respected)"
+    return
+  fi
+  # Wrapper logs from second boot must NOT show "PITR replay staged".
+  # That message is emitted by configure_pgbackrest_recovery's else-branch.
+  local replay_staged_count
+  replay_staged_count=$(docker logs "$rest_name" 2>&1 | grep -c "PITR replay staged" || true)
+  if [ "${replay_staged_count:-0}" -gt 0 ]; then
+    ko t_restored_marker_persists_across_restarts "configure_pgbackrest_recovery re-staged on restart; marker not respected (count=$replay_staged_count)"
+    fail_dump t_restored_marker_persists_across_restarts "$rest_name"
+    return
+  fi
+
+  ok t_restored_marker_persists_across_restarts
+  note ".pgbackrest_restored survived restart; configure_pgbackrest_recovery deferred"
+  docker rm -f "$src_name" "$rest_name" >/dev/null
+  docker volume rm "$src_vol" "$rest_vol" >/dev/null
+}
+
+# G9-companion: confirms the watcher's boot-time bucket reconcile clears a
+# stale cache when the bucket has been swapped out under it. Drives the new
+# reconcile_state_with_bucket() path in pgbackrest-backup-watcher.sh.
+t_watcher_reconciles_state_against_bucket_on_boot() {
+  local name=t-recon-${PG_VERSION}
+  local vol=${name}-vol
+  reset_bucket
+  new_volume "$vol"
+  docker rm -f "$name" >/dev/null 2>&1 || true
+
+  # Phase 1: archive + take initial full into bucket A. State file gets a
+  # last_full_at entry.
+  run_archiving_pg_fast_watcher "$name" "$vol"
+  wait_for_pg "$name" || { ko t_watcher_reconciles_state_against_bucket_on_boot "phase1 startup"; return; }
+  for _ in $(seq 1 15); do
+    docker logs "$name" 2>&1 | grep -q "stanza-create completed" && break
+    sleep 1
+  done
+  docker exec "$name" psql -U postgres -c "CREATE TABLE t(id int); SELECT pg_switch_wal();" >/dev/null
+  wait_for_watcher_backup "$name" full 60 || { ko t_watcher_reconciles_state_against_bucket_on_boot "no initial full"; return; }
+  if ! docker exec "$name" grep -q "^last_full_at=" /var/lib/postgresql/data/.pgbackrest_backup_state; then
+    ko t_watcher_reconciles_state_against_bucket_on_boot "phase1 didn't populate last_full_at"
+    return
+  fi
+
+  # Phase 2: stop, wipe the bucket externally (simulates "operator pointed
+  # WAL_ARCHIVE_BUCKET at a freshly-created bucket"), restart with same env.
+  # On boot, reconcile must clear the stale last_full_at.
+  docker rm -f "$name" >/dev/null
+  reset_bucket
+
+  run_archiving_pg_fast_watcher "$name" "$vol"
+  wait_for_pg "$name" || { ko t_watcher_reconciles_state_against_bucket_on_boot "phase2 startup"; return; }
+
+  # Reconcile fires once before the watcher's main loop. Wait a few polls.
+  local deadline=$(($(date +%s) + 30)) reconciled=0
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if docker logs "$name" 2>&1 | grep -q "reconcile: bucket has no full but cache claims"; then
+      reconciled=1; break
+    fi
+    sleep 2
+  done
+  if [ "$reconciled" != "1" ]; then
+    ko t_watcher_reconciles_state_against_bucket_on_boot "watcher did not log reconcile-cleared"
+    fail_dump t_watcher_reconciles_state_against_bucket_on_boot "$name"
+    return
+  fi
+
+  # Force a WAL switch and confirm NEEDS_INITIAL_BACKUP fires (bucket truly
+  # empty + cache cleared → archived_count > 0 + last_full_at empty → full).
+  docker exec "$name" psql -U postgres -c "INSERT INTO t VALUES (1); SELECT pg_switch_wal();" >/dev/null
+  if ! wait_for_watcher_backup "$name" full 60; then
+    ko t_watcher_reconciles_state_against_bucket_on_boot "watcher did not take fresh initial full after reconcile"
+    fail_dump t_watcher_reconciles_state_against_bucket_on_boot "$name"
+    return
+  fi
+
+  ok t_watcher_reconciles_state_against_bucket_on_boot
+  note "stale cache cleared on boot; NEEDS_INITIAL_BACKUP re-fired against the empty bucket"
+  docker rm -f "$name" >/dev/null
+  docker volume rm "$vol" >/dev/null
+}
+
 # ----- runner ----------------------------------------------------------------
 
 ALL_TESTS=(
@@ -1318,6 +2210,16 @@ ALL_TESTS=(
   t_watcher_dual_repo_skips
   t_empty_volume_restore_from_s3
   t_retention_expires_old_fulls
+  t_watcher_gap_recovery_failed_count_path
+  t_pitr_target_before_retention_window_refuses
+  t_retention_expire_cascades_to_wal
+  t_empty_volume_restore_refuses_on_bad_creds
+  t_volume_wipe_same_bucket_loud_fail
+  t_restore_change_target_after_promote_noop
+  t_restore_then_wipe_volume_redoes_restore
+  t_restore_then_enable_archive_dual_repo_blocked_until_clear
+  t_restored_marker_persists_across_restarts
+  t_watcher_reconciles_state_against_bucket_on_boot
 )
 
 trap 'cleanup_test_resources' EXIT
