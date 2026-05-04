@@ -71,14 +71,18 @@ The image reads a tool-agnostic `WAL_ARCHIVE_*` / `WAL_RECOVER_FROM_*`
 env contract and translates internally to pgBackRest's native
 `PGBACKREST_REPO{1,2}_S3_*`, so swapping pgBackRest for another archiver
 in the future is a wrapper change rather than a cross-repo rewrite.
-Three modes:
 
-- `WAL_ARCHIVE_*` only → standalone archiving service. `repo1` = archive bucket.
-- `WAL_RECOVER_FROM_*` only → PITR-restored service, no ongoing archiving.
-  `repo1` = source's bucket (read-only during recovery).
-- `WAL_ARCHIVE_*` + `WAL_RECOVER_FROM_*` → restored service that has been
-  re-enabled for archiving. `repo1` = source (read), `repo2` = own
-  archive bucket (write).
+Invariant: `repo1` is always "this service's own destination bucket" —
+the only place this service writes WAL. `repo2`, when present, is a
+read-only recovery source. No two services ever share a destination
+bucket. Two modes:
+
+- `WAL_ARCHIVE_*` only → standalone archiving service. `repo1` = own bucket.
+- `WAL_ARCHIVE_*` + `WAL_RECOVER_FROM_*` → PITR-restored fork. `repo1` =
+  fork's own fresh bucket (writes from boot), `repo2` = source's bucket
+  (read-only during recovery; ignored after promote, the fork's new
+  timeline doesn't exist there). The fork archives to its own bucket
+  from day one — no separate "re-enable PITR after restore" step.
 
 `archive_command` points at `/usr/local/bin/pgbackrest-archive-push-wrapper.sh`
 rather than calling `pgbackrest archive-push` directly. The wrapper tries the
@@ -114,7 +118,7 @@ Operator-facing env contract:
 | `WAL_ARCHIVE_REGION` | bucket region |
 | `WAL_ARCHIVE_KEY` / `WAL_ARCHIVE_SECRET` | bucket credentials |
 | `WAL_ARCHIVE_PATH` | path prefix where archive-push writes (default `/pgbackrest`) |
-| `WAL_RECOVER_FROM_BUCKET` / `_ENDPOINT` / `_REGION` / `_KEY` / `_SECRET` / `_PATH` | source-bucket coordinates on a PITR-restored service; `archive-get` reads source WAL from here during replay. Set by backboard on restore; not normally a manual knob. |
+| `WAL_RECOVER_FROM_BUCKET` / `_ENDPOINT` / `_REGION` / `_KEY` / `_SECRET` / `_PATH` | source-bucket coordinates on a PITR-restored fork; mounted as `repo2` (read-only) so `archive-get` and the empty-volume `pgbackrest restore` can pull source WAL during replay. Set by backboard on restore; not normally a manual knob. |
 | `POSTGRES_RECOVERY_TARGET_TIME` | ISO 8601 timestamp; stages archive-recovery replay on next start |
 | `POSTGRES_ARCHIVE_TIMEOUT` | seconds Postgres waits before forcing a WAL switch (default `60`) |
 | `WAL_BACKUP_FULL_INTERVAL_HOURS` | image-owned full base-backup cadence (default `168` = weekly; `0` disables periodic fulls). Initial / gap-recovery fulls fire regardless. |
@@ -143,15 +147,15 @@ default. The `PGBACKREST_*_PROCESS_MAX` env vars (table above) are
 escape hatches for workloads that disprove the heuristic. On vertical
 autoscale, the new values take effect on the next container restart.
 
-Stanza initialization (`pgbackrest stanza-create`) runs automatically the
-first time the container boots with `WAL_ARCHIVE_BUCKET` set: a
-background task waits for Postgres to accept connections, then writes the
-stanza metadata into the bucket. The command is idempotent and runs on
-every subsequent boot — already-correct repo metadata is a no-op; a
-mismatch (e.g. `WAL_ARCHIVE_PATH` pointing at another cluster's repo)
-errors loudly, which is the safety we want. Stanza-create only runs
-against the service's own archive bucket, never against a
-`WAL_RECOVER_FROM_*` source repo (which is read-only during recovery).
+Stanza initialization (`pgbackrest stanza-create --repo=1`) runs
+automatically the first time the container boots with `WAL_ARCHIVE_BUCKET`
+set: a background task waits for Postgres to accept connections, then
+writes the stanza metadata into the bucket. The command is idempotent
+and runs on every subsequent boot — already-correct repo metadata is a
+no-op; a mismatch (e.g. `WAL_ARCHIVE_PATH` pointing at another cluster's
+repo) errors loudly, which is the safety we want. The `--repo=1` scope
+keeps stanza-create off `repo2` on a fork, where source already owns the
+stanza and we have read-only intent.
 
 All Postgres-side config the image manages (archive settings, recovery
 settings) is written to `$PGDATA/conf.d/*.conf`, with a one-time
@@ -179,7 +183,7 @@ target, restore from a fresh volume snapshot (or, advanced: remove
 `$PGDATA/.pitr_configured` before the next start).
 
 When `POSTGRES_RECOVERY_TARGET_TIME` is set on a brand-new container
-(no `$PGDATA/PG_VERSION`), the wrapper runs `pgbackrest --repo=1 restore
+(no `$PGDATA/PG_VERSION`), the wrapper runs `pgbackrest --repo=2 restore
 --type=time --target=<T> --target-action=promote` against the source
 bucket *before* `docker-entrypoint` initializes anything. pgBackRest
 pulls the most recent base backup ≤ T plus the WAL chain forward into
@@ -187,14 +191,6 @@ pulls the most recent base backup ≤ T plus the WAL chain forward into
 boots straight into archive recovery. A `.pgbackrest_restored` marker is
 written on success; `configure_pgbackrest_recovery` defers to the
 restore's own settings on subsequent starts of the same volume.
-
-If `$PGDATA` is already populated (the legacy snapshot-based restore
-flow), the conf.d-include path is used as before — `recovery_target_time`
-+ `restore_command` are written to `$PGDATA/conf.d/pgbackrest-recovery.conf`,
-`recovery.signal` is touched, and Postgres replays WAL from the source
-bucket via `archive-get`. The two paths share the same env contract
-(`WAL_RECOVER_FROM_*` + `POSTGRES_RECOVERY_TARGET_TIME`) and only differ
-on the initial-volume question.
 
 #### Image-owned base backups
 
@@ -224,6 +220,34 @@ canonical source of truth for what actually exists in the repo; the
 local file is a cache that survives restarts. A wiped volume re-derives
 from a single redundant initial full — pgBackRest's stanza locks
 prevent concurrent backups across cluster nodes.
+
+#### Per-cluster archive paths
+
+Each cluster archives under a sub-prefix derived from its
+`system_identifier`:
+`${WAL_ARCHIVE_PATH}/cluster-<system_identifier>`. The path is
+persisted in `$PGDATA/.pgbackrest_repo_path` so the archive-push
+wrapper, the backup watcher, and `pgbackrest stanza-create` all
+converge on the same value.
+
+Why per-cluster: a wipe-and-reuse-bucket cycle (operator drops the
+data volume, redeploys the service against the same `WAL_ARCHIVE_BUCKET`)
+produces a brand-new `system_identifier` from `initdb`. Without
+discrimination, pgBackRest's stanza-create would refuse the new
+cluster on system-id mismatch and the new cluster's WAL would never
+land — silent data loss for any operator who didn't notice. With
+per-cluster paths, the new cluster lands at
+`cluster-<new_sysid>`, the previous cluster's archive stays put at
+`cluster-<old_sysid>`, and both histories coexist. The bucket
+becomes a multi-history store: list its `cluster-*` sub-prefixes to
+enumerate every cluster that ever archived to it; pick a subprefix
+to restore from.
+
+`WAL_RECOVER_FROM_PATH` on a restored service must point at the
+specific source-side `cluster-<sysid>` sub-prefix the user wants to
+restore from — `pgbackrest restore` reads from one path. Backboard
+discovers per-cluster sub-prefixes by listing the bucket and
+surfaces them as separate "histories" in the restore UI.
 
 In HA, every Postgres node runs the watcher and standbys exit early on
 `SELECT pg_is_in_recovery()` — only the leader performs backups. v1 of

@@ -54,16 +54,23 @@ PGDATA="${PGDATA:-/var/lib/postgresql/data}"
 PGWAL_THRESHOLD_MB="${WAL_DROP_THRESHOLD_MB:-500}"
 PGWAL_THRESHOLD_BYTES=$(( PGWAL_THRESHOLD_MB * 1024 * 1024 ))
 
-# When two repos are configured (restored service: repo1=recover-from,
-# repo2=archive), pin archive-push to repo2 so post-promote WAL doesn't
-# spray into the source bucket. Standalone services have only repo1 set
-# and skip the flag entirely.
-REPO_FLAG=""
-if [ -n "${PGBACKREST_REPO2_S3_BUCKET:-}" ]; then
-  REPO_FLAG="--repo=2"
+# Per-cluster repo-path: read the marker written by pgbackrest-init.sh /
+# wrapper.sh's bootstrap subshell. Without this, every archive-push would
+# go to the ${WAL_ARCHIVE_PATH} root and a wipe-and-reuse-bucket scenario
+# would collide on stanza identity. With it, archive-push targets
+# ${WAL_ARCHIVE_PATH}/cluster-<sysid> and post-wipe clusters get their own
+# sub-prefix instead of trying to overwrite the predecessor's repo.
+if [ -f "$PGDATA/.pgbackrest_repo_path" ]; then
+  PGBACKREST_REPO1_PATH=$(cat "$PGDATA/.pgbackrest_repo_path")
+  export PGBACKREST_REPO1_PATH
 fi
 
-pgbackrest --stanza=main $REPO_FLAG archive-push "$WAL_FILE"
+# Pin archive-push to repo1 unconditionally. REPO1 is always this service's
+# own destination bucket (invariant set in wrapper.sh's env translation).
+# On a fork, repo2 is the source's read-only bucket — pgBackRest's default
+# archive-push targets all configured repos, so without the pin the fork
+# would spray its post-promote WAL into source's bucket.
+pgbackrest --stanza=main --repo=1 archive-push "$WAL_FILE"
 PGB_RC=$?
 if [ "$PGB_RC" -eq 0 ]; then
   exit 0

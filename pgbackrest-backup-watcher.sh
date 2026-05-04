@@ -50,12 +50,15 @@ PGDATA="${PGDATA:-/var/lib/postgresql/data}"
 STATE_FILE="$PGDATA/.pgbackrest_backup_state"
 GAP_MARKER="$PGDATA/.pgbackrest_gap_pending"
 
-POLL_INTERVAL_SECONDS=60
+# POLL_INTERVAL_SECONDS / GAP_RESOLVED_GRACE_SECONDS are env-overridable so
+# the e2e harness can exercise gap-recovery in <1 min instead of 5+. The
+# defaults are conservative; nothing user-facing advertises these knobs.
+POLL_INTERVAL_SECONDS="${WAL_BACKUP_POLL_INTERVAL_SECONDS:-60}"
 
 # Failures must have been quiescent for this long before a gap-recovery backup
 # fires. Hard failures often resolve and re-fail (intermittent S3, half-rotated
 # creds); without the grace the watcher burns one full per flap.
-GAP_RESOLVED_GRACE_SECONDS=300
+GAP_RESOLVED_GRACE_SECONDS="${WAL_BACKUP_GAP_RESOLVED_GRACE_SECONDS:-300}"
 
 FULL_INTERVAL_HOURS="${WAL_BACKUP_FULL_INTERVAL_HOURS:-168}"
 DIFF_INTERVAL_HOURS="${WAL_BACKUP_DIFF_INTERVAL_HOURS:-24}"
@@ -124,7 +127,10 @@ gap_recovered() {
 run_backup() {
   local type="$1"
   log "running pgbackrest backup --type=$type"
-  if pgbackrest --stanza=main backup --type="$type"; then
+  # --repo=1 scopes backup + post-backup expire to this service's own bucket.
+  # On a fork repo2 is source's read-only bucket; without the pin pgBackRest
+  # would default to writing the new base into both repos.
+  if pgbackrest --stanza=main --repo=1 backup --type="$type"; then
     local now; now=$(date +%s)
     case "$type" in
       full)
@@ -219,20 +225,31 @@ watcher_iteration() {
 }
 
 # wrapper.sh forks us unconditionally; bail silently if archiving isn't on.
+# A fork has both WAL_ARCHIVE_* (own bucket / repo1) and WAL_RECOVER_FROM_*
+# (source bucket / repo2). The watcher targets only repo1 (run_backup pins
+# --repo=1), so the fork archives normally from boot — no skip path.
 [ -z "${WAL_ARCHIVE_BUCKET:-}" ] && exit 0
 
-# In dual-repo recovery mode (WAL_RECOVER_FROM_* + WAL_ARCHIVE_*), backups
-# would target both repos by default, including source's read-only repo1.
-# The standard PITR-enable flow on a restored service clears WAL_RECOVER_FROM_*
-# before adding WAL_ARCHIVE_*; until then, skip.
-if [ -n "${WAL_RECOVER_FROM_BUCKET:-}" ]; then
-  log "skipping — both WAL_RECOVER_FROM_* and WAL_ARCHIVE_* are set; clear the recover-from vars to enable backups"
-  exit 0
-fi
+# Per-cluster repo-path: read the marker (written by pgbackrest-init.sh
+# during initdb, or by wrapper.sh's bootstrap subshell on existing volumes).
+# pgbackrest backup needs to target the same path that archive-push is
+# pushing to, otherwise stanza-create / backup land at the wrong prefix.
+# The marker may not exist yet on the very first watcher iteration (we're
+# forked from wrapper.sh before exec'ing docker-entrypoint), so the loop
+# below re-reads it on every iteration as a cheap fallback.
+sync_repo_path_from_marker() {
+  if [ -f "$PGDATA/.pgbackrest_repo_path" ]; then
+    PGBACKREST_REPO1_PATH=$(cat "$PGDATA/.pgbackrest_repo_path")
+    export PGBACKREST_REPO1_PATH
+  fi
+}
 
-log "starting (poll=${POLL_INTERVAL_SECONDS}s, full=${FULL_INTERVAL_HOURS}h, diff=${DIFF_INTERVAL_HOURS}h, gap_grace=${GAP_RESOLVED_GRACE_SECONDS}s)"
+sync_repo_path_from_marker
+
+log "starting (poll=${POLL_INTERVAL_SECONDS}s, full=${FULL_INTERVAL_HOURS}h, diff=${DIFF_INTERVAL_HOURS}h, gap_grace=${GAP_RESOLVED_GRACE_SECONDS}s, repo1-path=${PGBACKREST_REPO1_PATH:-unset})"
 
 while true; do
+  sync_repo_path_from_marker
   watcher_iteration
   sleep "$POLL_INTERVAL_SECONDS"
 done
