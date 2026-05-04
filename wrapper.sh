@@ -80,29 +80,24 @@ fi
 # WAL archiving + PITR (tool-agnostic env contract)
 #
 # Backboard / frontend / template speak `WAL_ARCHIVE_*` (this service's own
-# archive bucket) and `WAL_RECOVER_FROM_*` (only on restored services, points
-# at source's bucket for read-during-recovery). The translation below maps
-# that contract onto pgBackRest's native `PGBACKREST_REPO{1,2}_S3_*` so the
-# rest of this script can stay pgBackRest-shaped.
+# destination bucket — write-only for this service) and `WAL_RECOVER_FROM_*`
+# (only on PITR-restored forks, points at source's bucket for read-during-
+# recovery). The translation below maps that contract onto pgBackRest's
+# native `PGBACKREST_REPO{1,2}_S3_*` so the rest of this script can stay
+# pgBackRest-shaped.
 #
-# Three modes:
-#   - WAL_ARCHIVE_* only → standalone archiving service. REPO1 = archive.
-#   - WAL_RECOVER_FROM_* only → restored service, no ongoing archiving. REPO1
-#     = source bucket (read for archive-get during recovery). After promote
-#     no archive_command runs; user enables PITR via the standard flow if
-#     they want continued archiving (which provisions a fresh bucket then).
-#   - WAL_ARCHIVE_* + WAL_RECOVER_FROM_* → restored service that already has
-#     PITR re-enabled. REPO1 = recover-from, REPO2 = archive; the archive-
-#     push wrapper adds --repo=2 so post-promote WAL never sprays into the
-#     source bucket.
-if [ -n "${WAL_RECOVER_FROM_BUCKET:-}" ]; then
-  export PGBACKREST_REPO1_S3_BUCKET="$WAL_RECOVER_FROM_BUCKET"
-  export PGBACKREST_REPO1_S3_KEY="$WAL_RECOVER_FROM_KEY"
-  export PGBACKREST_REPO1_S3_KEY_SECRET="$WAL_RECOVER_FROM_SECRET"
-  export PGBACKREST_REPO1_S3_REGION="$WAL_RECOVER_FROM_REGION"
-  export PGBACKREST_REPO1_S3_ENDPOINT="$WAL_RECOVER_FROM_ENDPOINT"
-  export PGBACKREST_REPO1_PATH="${WAL_RECOVER_FROM_PATH:-/pgbackrest}"
-elif [ -n "${WAL_ARCHIVE_BUCKET:-}" ]; then
+# Invariant: REPO1 = "where this service writes its WAL", always its own
+# bucket. REPO2, when present, = "read-only recovery source" only. No two
+# services ever share a destination bucket.
+#
+# Two modes:
+#   - WAL_ARCHIVE_* only → standalone archiving service. REPO1 = own bucket.
+#   - WAL_ARCHIVE_* + WAL_RECOVER_FROM_* → PITR-restored fork, archives from
+#     boot to its own fresh bucket. REPO1 = own bucket (write), REPO2 =
+#     source bucket (read for archive-get during recovery). After promote
+#     REPO2 is unused (the fork's new timeline doesn't exist there) but
+#     stays configured — harmless, removing it would require a restart.
+if [ -n "${WAL_ARCHIVE_BUCKET:-}" ]; then
   export PGBACKREST_REPO1_S3_BUCKET="$WAL_ARCHIVE_BUCKET"
   export PGBACKREST_REPO1_S3_KEY="$WAL_ARCHIVE_KEY"
   export PGBACKREST_REPO1_S3_KEY_SECRET="$WAL_ARCHIVE_SECRET"
@@ -111,13 +106,13 @@ elif [ -n "${WAL_ARCHIVE_BUCKET:-}" ]; then
   export PGBACKREST_REPO1_PATH="${WAL_ARCHIVE_PATH:-/pgbackrest}"
 fi
 
-if [ -n "${WAL_RECOVER_FROM_BUCKET:-}" ] && [ -n "${WAL_ARCHIVE_BUCKET:-}" ]; then
-  export PGBACKREST_REPO2_S3_BUCKET="$WAL_ARCHIVE_BUCKET"
-  export PGBACKREST_REPO2_S3_KEY="$WAL_ARCHIVE_KEY"
-  export PGBACKREST_REPO2_S3_KEY_SECRET="$WAL_ARCHIVE_SECRET"
-  export PGBACKREST_REPO2_S3_REGION="$WAL_ARCHIVE_REGION"
-  export PGBACKREST_REPO2_S3_ENDPOINT="$WAL_ARCHIVE_ENDPOINT"
-  export PGBACKREST_REPO2_PATH="${WAL_ARCHIVE_PATH:-/pgbackrest}"
+if [ -n "${WAL_RECOVER_FROM_BUCKET:-}" ]; then
+  export PGBACKREST_REPO2_S3_BUCKET="$WAL_RECOVER_FROM_BUCKET"
+  export PGBACKREST_REPO2_S3_KEY="$WAL_RECOVER_FROM_KEY"
+  export PGBACKREST_REPO2_S3_KEY_SECRET="$WAL_RECOVER_FROM_SECRET"
+  export PGBACKREST_REPO2_S3_REGION="$WAL_RECOVER_FROM_REGION"
+  export PGBACKREST_REPO2_S3_ENDPOINT="$WAL_RECOVER_FROM_ENDPOINT"
+  export PGBACKREST_REPO2_PATH="${WAL_RECOVER_FROM_PATH:-/pgbackrest}"
 fi
 
 # Helpers gate on whichever role is active. PGBACKREST_REPO1_S3_BUCKET acts
@@ -356,29 +351,25 @@ render_pgbackrest_conf() {
 
   echo "pgbackrest: detected ${cpus} vCPU; process-max push=${push_max} get=${get_max} backup=${backup_max} restore=${restore_max}"
 
-  # Two-repo mode: REPO1 reads source's WAL (archive-get during recovery),
-  # REPO2 receives the restored cluster's post-promote pushes. The
-  # archive-push wrapper picks the right repo at command time via --repo;
-  # here we just declare repo2 so pgBackRest reads the corresponding env vars.
+  # Two-repo mode (PITR-restored fork): REPO1 = own bucket (writes from boot),
+  # REPO2 = source bucket (read-only during recovery). archive-push pins
+  # --repo=1 so post-promote WAL lands only in REPO1; restore_command pins
+  # --repo=2 so archive-get reads from source. Here we just declare repo2's
+  # type so pgBackRest reads the corresponding env vars.
   local repo2_block=""
   if [ -n "${PGBACKREST_REPO2_S3_BUCKET:-}" ]; then
     repo2_block="repo2-type=s3"$'\n'
   fi
 
-  # Retention knobs are written for whichever repo this service archives to.
-  # In standalone (REPO1 = archive bucket) → write under repo1.
-  # In dual-repo recovery mode (REPO1 = source / read, REPO2 = own archive)
-  # → write under repo2; repo1's source bucket has its own retention owned
-  # by the source service. pgbackrest expire runs after every backup and
-  # uses these to remove stale fulls/diffs and the WAL they pinned.
-  # repo*-retention-archive is left to pgBackRest's default (= retention-full),
-  # which keeps WAL needed for the most recent N fulls.
+  # Retention is always scoped to REPO1 — every service writes only to its
+  # own bucket. REPO2 (source bucket on a fork) is read-only for this
+  # service; source owns its own retention. pgbackrest expire runs after
+  # every backup. repo1-retention-archive is left to pgBackRest's default
+  # (= retention-full), which keeps WAL needed for the most recent N fulls.
   local retention_full="${WAL_BACKUP_RETENTION_FULL:-4}"
   local retention_diff="${WAL_BACKUP_RETENTION_DIFF:-14}"
   local retention_block=""
-  if [ -n "${PGBACKREST_REPO2_S3_BUCKET:-}" ]; then
-    retention_block="repo2-retention-full=${retention_full}"$'\n'"repo2-retention-diff=${retention_diff}"$'\n'
-  elif [ -n "${WAL_ARCHIVE_BUCKET:-}" ]; then
+  if [ -n "${WAL_ARCHIVE_BUCKET:-}" ]; then
     retention_block="repo1-retention-full=${retention_full}"$'\n'"repo1-retention-diff=${retention_diff}"$'\n'
   fi
 
@@ -497,19 +488,10 @@ clear_pgbackrest_state_if_disabled() {
 # real postmaster binds TCP. If we time out, first WAL push fails until
 # the next boot retries — recoverable, but louder than necessary.
 bootstrap_pgbackrest_stanza() {
-  # stanza-create only runs when this service archives to its own bucket
-  # AND there is no in-flight recovery from another bucket. pgBackRest's
-  # stanza-create operates against all configured repos and doesn't accept
-  # --repo, so in dual-repo mode (WAL_RECOVER_FROM_* + WAL_ARCHIVE_*) it
-  # would target source's repo1 too — wrong. The standard PITR-enable flow
-  # on a restored service should clear WAL_RECOVER_FROM_* before adding
-  # WAL_ARCHIVE_* (post-promote env-var cleanup); until that lands, the
-  # operator runs stanza-create manually after the recover-from vars come off.
+  # stanza-create runs against repo1 (this service's own bucket). On a fork
+  # repo2 is the source's bucket — already has a stanza, owned by source —
+  # so we explicitly scope to --repo=1 to avoid touching it.
   [ -z "${WAL_ARCHIVE_BUCKET:-}" ] && return 0
-  if [ -n "${WAL_RECOVER_FROM_BUCKET:-}" ]; then
-    echo "pgbackrest: skipping stanza-create — both WAL_RECOVER_FROM_* and WAL_ARCHIVE_* are set; clear the recover-from vars then restart" >&2
-    return 0
-  fi
 
   (
     # No `local` here: subshells are their own scope so it's redundant, and
@@ -531,7 +513,7 @@ bootstrap_pgbackrest_stanza() {
     export PGBACKREST_REPO1_PATH="$repo_path"
     echo "pgbackrest: using repo1-path=${repo_path}"
 
-    if gosu postgres pgbackrest --stanza=main stanza-create; then
+    if gosu postgres pgbackrest --stanza=main --repo=1 stanza-create; then
       echo "pgbackrest: stanza-create completed"
     else
       echo "pgbackrest: stanza-create failed (will retry on next boot)" >&2
@@ -556,11 +538,10 @@ bootstrap_pgbackrest_stanza() {
 # .pitr_staging behind WITHOUT .pitr_configured — the operator can fix env
 # vars and restart, and the next boot will re-stage cleanly.
 #
-# restore_command pulls from repo1, which under the new-service restore
-# design is the source service's bucket (translated from `WAL_RECOVER_FROM_*`
-# at the top of this script). Post-promote archive_command writes to repo2
-# (the restored service's own bucket) — see archive-push-repo in the
-# rendered pgbackrest.conf.
+# restore_command pulls from repo2, which is the source service's bucket
+# (translated from `WAL_RECOVER_FROM_*` at the top of this script). Post-
+# promote archive_command writes to repo1 (this fork's own bucket) — see
+# the archive-push wrapper's --repo=1 pin.
 configure_pgbackrest_recovery() {
   [ -z "${WAL_RECOVER_FROM_BUCKET:-}" ] && return 0
   [ -z "$POSTGRES_RECOVERY_TARGET_TIME" ] && return 0
@@ -589,7 +570,7 @@ configure_pgbackrest_recovery() {
   ensure_pg_includes_confd
   install -d -m 0750 -o postgres -g postgres "$PGBACKREST_CONFD_DIR"
 
-  local restore_cmd="pgbackrest --stanza=main --repo=1 archive-get %f %p"
+  local restore_cmd="pgbackrest --stanza=main --repo=2 archive-get %f %p"
 
   # Escape single quotes per postgresql.conf rules (' -> '') so a value with
   # an embedded apostrophe can't break the conf file or smuggle a setting.
@@ -630,7 +611,7 @@ restore_from_pgbackrest_if_empty_volume() {
 
   install -d -m 0700 -o postgres -g postgres "$PGDATA"
 
-  if ! gosu postgres pgbackrest --stanza=main --repo=1 restore \
+  if ! gosu postgres pgbackrest --stanza=main --repo=2 restore \
        --type=time --target="$POSTGRES_RECOVERY_TARGET_TIME" \
        --target-action=promote; then
     echo "pgbackrest: restore from source bucket failed; fix env vars (WAL_RECOVER_FROM_*, POSTGRES_RECOVERY_TARGET_TIME) and redeploy" >&2

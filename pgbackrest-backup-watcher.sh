@@ -127,7 +127,10 @@ gap_recovered() {
 run_backup() {
   local type="$1"
   log "running pgbackrest backup --type=$type"
-  if pgbackrest --stanza=main backup --type="$type"; then
+  # --repo=1 scopes backup + post-backup expire to this service's own bucket.
+  # On a fork repo2 is source's read-only bucket; without the pin pgBackRest
+  # would default to writing the new base into both repos.
+  if pgbackrest --stanza=main --repo=1 backup --type="$type"; then
     local now; now=$(date +%s)
     case "$type" in
       full)
@@ -222,16 +225,10 @@ watcher_iteration() {
 }
 
 # wrapper.sh forks us unconditionally; bail silently if archiving isn't on.
+# A fork has both WAL_ARCHIVE_* (own bucket / repo1) and WAL_RECOVER_FROM_*
+# (source bucket / repo2). The watcher targets only repo1 (run_backup pins
+# --repo=1), so the fork archives normally from boot — no skip path.
 [ -z "${WAL_ARCHIVE_BUCKET:-}" ] && exit 0
-
-# In dual-repo recovery mode (WAL_RECOVER_FROM_* + WAL_ARCHIVE_*), backups
-# would target both repos by default, including source's read-only repo1.
-# The standard PITR-enable flow on a restored service clears WAL_RECOVER_FROM_*
-# before adding WAL_ARCHIVE_*; until then, skip.
-if [ -n "${WAL_RECOVER_FROM_BUCKET:-}" ]; then
-  log "skipping — both WAL_RECOVER_FROM_* and WAL_ARCHIVE_* are set; clear the recover-from vars to enable backups"
-  exit 0
-fi
 
 # Per-cluster repo-path: read the marker (written by pgbackrest-init.sh
 # during initdb, or by wrapper.sh's bootstrap subshell on existing volumes).
