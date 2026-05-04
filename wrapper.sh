@@ -98,21 +98,29 @@ fi
 #     REPO2 is unused (the fork's new timeline doesn't exist there) but
 #     stays configured — harmless, removing it would require a restart.
 if [ -n "${WAL_ARCHIVE_BUCKET:-}" ]; then
+  export PGBACKREST_REPO1_TYPE=s3
   export PGBACKREST_REPO1_S3_BUCKET="$WAL_ARCHIVE_BUCKET"
   export PGBACKREST_REPO1_S3_KEY="$WAL_ARCHIVE_KEY"
   export PGBACKREST_REPO1_S3_KEY_SECRET="$WAL_ARCHIVE_SECRET"
   export PGBACKREST_REPO1_S3_REGION="$WAL_ARCHIVE_REGION"
   export PGBACKREST_REPO1_S3_ENDPOINT="$WAL_ARCHIVE_ENDPOINT"
   export PGBACKREST_REPO1_PATH="${WAL_ARCHIVE_PATH:-/pgbackrest}"
+  # Default to path-style S3 URLs. AWS S3 accepts both, MinIO/local-S3 needs
+  # path, and modern S3-compatible providers (R2, etc.) work with path. Lets
+  # the customer override via WAL_ARCHIVE_S3_URI_STYLE if their endpoint is
+  # virtual-hosted-only.
+  export PGBACKREST_REPO1_S3_URI_STYLE="${WAL_ARCHIVE_S3_URI_STYLE:-path}"
 fi
 
 if [ -n "${WAL_RECOVER_FROM_BUCKET:-}" ]; then
+  export PGBACKREST_REPO2_TYPE=s3
   export PGBACKREST_REPO2_S3_BUCKET="$WAL_RECOVER_FROM_BUCKET"
   export PGBACKREST_REPO2_S3_KEY="$WAL_RECOVER_FROM_KEY"
   export PGBACKREST_REPO2_S3_KEY_SECRET="$WAL_RECOVER_FROM_SECRET"
   export PGBACKREST_REPO2_S3_REGION="$WAL_RECOVER_FROM_REGION"
   export PGBACKREST_REPO2_S3_ENDPOINT="$WAL_RECOVER_FROM_ENDPOINT"
   export PGBACKREST_REPO2_PATH="${WAL_RECOVER_FROM_PATH:-/pgbackrest}"
+  export PGBACKREST_REPO2_S3_URI_STYLE="${WAL_RECOVER_FROM_S3_URI_STYLE:-path}"
 fi
 
 # Helpers gate on whichever role is active. PGBACKREST_REPO1_S3_BUCKET acts
@@ -596,7 +604,12 @@ restore_from_pgbackrest_if_empty_volume() {
 
   install -d -m 0700 -o postgres -g postgres "$PGDATA"
 
-  if ! gosu postgres pgbackrest --stanza=main --repo=2 restore \
+  # --pg1-path is taken from $PGDATA so this works even in restore-only mode,
+  # where render_pgbackrest_conf early-returns and the [main] stanza section
+  # (which would otherwise carry pg1-path) is never written.
+  if ! gosu postgres pgbackrest --stanza=main --repo=2 \
+       --pg1-path="$PGDATA" \
+       restore \
        --type=time --target="$POSTGRES_RECOVERY_TARGET_TIME" \
        --target-action=promote; then
     echo "pgbackrest: restore from source bucket failed; fix env vars (WAL_RECOVER_FROM_*, POSTGRES_RECOVERY_TARGET_TIME) and redeploy" >&2
