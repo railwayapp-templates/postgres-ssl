@@ -51,3 +51,19 @@ EOF
 chmod 0640 "$PGDATA/conf.d/pgbackrest.conf"
 
 echo "pgbackrest: archive config written to ${PGDATA}/conf.d/pgbackrest.conf during initdb"
+
+# Write the per-cluster repo-path marker now that pg_control exists. Doing
+# it here (during initdb's post-initdb hook phase, BEFORE the real postmaster
+# launches) means the very first archive_command invocation reads the
+# correct PGBACKREST_REPO1_PATH from the marker — no race with the bootstrap
+# subshell in wrapper.sh, no archive-push fired against the wrong path.
+if [ ! -f "$PGDATA/.pgbackrest_repo_path" ] && [ -f "$PGDATA/global/pg_control" ]; then
+  sysid=$(pg_controldata "$PGDATA" 2>/dev/null \
+    | awk -F: '/Database system identifier/ { gsub(/[ \t]/,"",$2); print $2 }')
+  if [ -n "$sysid" ]; then
+    cluster_path="${WAL_ARCHIVE_PATH:-/pgbackrest}/cluster-${sysid}"
+    echo "$cluster_path" > "$PGDATA/.pgbackrest_repo_path"
+    chmod 0640 "$PGDATA/.pgbackrest_repo_path"
+    echo "pgbackrest: per-cluster repo path = ${cluster_path}"
+  fi
+fi

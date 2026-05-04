@@ -225,6 +225,40 @@ local file is a cache that survives restarts. A wiped volume re-derives
 from a single redundant initial full — pgBackRest's stanza locks
 prevent concurrent backups across cluster nodes.
 
+#### Per-cluster archive paths
+
+Each cluster archives under a sub-prefix derived from its
+`system_identifier`:
+`${WAL_ARCHIVE_PATH}/cluster-<system_identifier>`. The path is
+persisted in `$PGDATA/.pgbackrest_repo_path` so the archive-push
+wrapper, the backup watcher, and `pgbackrest stanza-create` all
+converge on the same value.
+
+Why per-cluster: a wipe-and-reuse-bucket cycle (operator drops the
+data volume, redeploys the service against the same `WAL_ARCHIVE_BUCKET`)
+produces a brand-new `system_identifier` from `initdb`. Without
+discrimination, pgBackRest's stanza-create would refuse the new
+cluster on system-id mismatch and the new cluster's WAL would never
+land — silent data loss for any operator who didn't notice. With
+per-cluster paths, the new cluster lands at
+`cluster-<new_sysid>`, the previous cluster's archive stays put at
+`cluster-<old_sysid>`, and both histories coexist. The bucket
+becomes a multi-history store: list its `cluster-*` sub-prefixes to
+enumerate every cluster that ever archived to it; pick a subprefix
+to restore from.
+
+Backward compat: if the legacy path (`${WAL_ARCHIVE_PATH}` directly,
+without a `cluster-*` sub-prefix) already holds an `archive.info`
+matching our `system_identifier`, the marker is written with the
+legacy path and we keep using it. Existing PITR-enabled services
+from before per-cluster pathing aren't asked to migrate.
+
+`WAL_RECOVER_FROM_PATH` on a restored service must point at the
+specific source-side `cluster-<sysid>` sub-prefix the user wants to
+restore from — `pgbackrest restore` reads from one path. Backboard
+discovers per-cluster sub-prefixes by listing the bucket and
+surfaces them as separate "histories" in the restore UI.
+
 In HA, every Postgres node runs the watcher and standbys exit early on
 `SELECT pg_is_in_recovery()` — only the leader performs backups. v1 of
 the watcher backs up from the primary; `--backup-standby` is a

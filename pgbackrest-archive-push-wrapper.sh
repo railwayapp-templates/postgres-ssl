@@ -54,6 +54,17 @@ PGDATA="${PGDATA:-/var/lib/postgresql/data}"
 PGWAL_THRESHOLD_MB="${WAL_DROP_THRESHOLD_MB:-500}"
 PGWAL_THRESHOLD_BYTES=$(( PGWAL_THRESHOLD_MB * 1024 * 1024 ))
 
+# Per-cluster repo-path: read the marker written by pgbackrest-init.sh /
+# wrapper.sh's bootstrap subshell. Without this, every archive-push would
+# go to the legacy ${WAL_ARCHIVE_PATH} root and a wipe-and-reuse-bucket
+# scenario would collide on stanza identity. With it, fresh clusters land
+# at ${WAL_ARCHIVE_PATH}/cluster-<sysid>; existing clusters whose marker
+# was written to the legacy path keep using it (backward compat).
+if [ -f "$PGDATA/.pgbackrest_repo_path" ]; then
+  PGBACKREST_REPO1_PATH=$(cat "$PGDATA/.pgbackrest_repo_path")
+  export PGBACKREST_REPO1_PATH
+fi
+
 # When two repos are configured (restored service: repo1=recover-from,
 # repo2=archive), pin archive-push to repo2 so post-promote WAL doesn't
 # spray into the source bucket. Standalone services have only repo1 set

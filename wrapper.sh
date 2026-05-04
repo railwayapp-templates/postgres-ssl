@@ -176,6 +176,16 @@ PITR_DONE_MARKER="$PGDATA/.pitr_configured"
 # our conf.d/pgbackrest-recovery.conf path would duplicate them.
 PGBACKREST_RESTORED_MARKER="$PGDATA/.pgbackrest_restored"
 
+# Per-cluster archive sub-path: the effective repo1-path, persisted inside
+# PGDATA so the watcher, archive-push wrapper, and stanza-create subshell
+# all converge on the same value. Per-cluster pathing means a wipe-and-
+# reuse-bucket cycle (volume wiped, container redeployed against the same
+# WAL_ARCHIVE_BUCKET) lets the new cluster's history coexist with the old
+# at distinct sub-prefixes — no system-id collision, no orphaned data, no
+# silent overwrite. Mono surfaces all sub-paths as separate "histories"
+# the user can browse and restore from.
+PGBACKREST_REPO_PATH_MARKER="$PGDATA/.pgbackrest_repo_path"
+
 # Add `include_dir = 'conf.d'` to postgresql.conf if not already present.
 # postgresql.conf is not rewritten by Postgres at runtime (only auto.conf is,
 # by ALTER SYSTEM), so this single line is durable. Called from both the
@@ -194,6 +204,75 @@ ensure_pg_includes_confd() {
   fi
   echo "include_dir = 'conf.d'" >> "$POSTGRES_CONF_FILE"
   echo "pgbackrest: enabled include_dir 'conf.d' in postgresql.conf"
+}
+
+# Read Postgres' system_identifier from pg_control. Empty when pg_control
+# isn't on disk yet (fresh volume, pre-initdb).
+read_postgres_sysid() {
+  [ ! -f "$PGDATA/global/pg_control" ] && return 0
+  pg_controldata "$PGDATA" 2>/dev/null \
+    | awk -F: '/Database system identifier/ { gsub(/[ \t]/,"",$2); print $2 }'
+}
+
+# Resolve the effective repo1-path for archiving. Three paths in priority order:
+#
+#   1. Marker file present → trust it (chosen on a previous boot, possibly
+#      via path 2 or 3 below). Idempotent across boots; survives container
+#      restarts; wiped along with the volume.
+#   2. pg_control exists, marker absent, legacy path (`${WAL_ARCHIVE_PATH}`
+#      directly) holds an archive.info matching our system_identifier →
+#      stick with the legacy path. Backward compat for clusters that
+#      enabled PITR before per-cluster pathing shipped; their data isn't
+#      stranded at a now-orphaned path.
+#   3. Marker absent and legacy path doesn't claim our system_identifier →
+#      use `${WAL_ARCHIVE_PATH}/cluster-<sysid>`. Fresh clusters always
+#      land here. Old/colliding stanza data at the legacy path stays put.
+#
+# The marker is written under PGDATA so a volume wipe drops it. That's the
+# point: after wipe-and-reuse-bucket, the new cluster (different sysid)
+# gets a fresh marker pointing at a fresh `cluster-<new_sysid>` path. The
+# previous cluster's data at `cluster-<old_sysid>` is untouched and
+# remains visible to the bucket lister (mono UI).
+derive_pgbackrest_repo_path() {
+  local user_path="${WAL_ARCHIVE_PATH:-/pgbackrest}"
+
+  if [ -f "$PGBACKREST_REPO_PATH_MARKER" ]; then
+    cat "$PGBACKREST_REPO_PATH_MARKER"
+    return 0
+  fi
+
+  local sysid
+  sysid=$(read_postgres_sysid)
+  if [ -z "$sysid" ]; then
+    # Pre-initdb: no system_identifier yet. Fall back to user_path; the marker
+    # gets written by pgbackrest-init.sh post-initdb (or by the bootstrap
+    # subshell once Postgres is up), so subsequent reads converge.
+    echo "$user_path"
+    return 0
+  fi
+
+  # Backward-compat probe: peek at the legacy path. If its archive.info
+  # records our system_identifier, this is an existing PITR-enabled service
+  # from before per-cluster pathing — keep using the legacy path so its
+  # accumulated backup history isn't stranded.
+  if PGBACKREST_REPO1_PATH="$user_path" \
+       pgbackrest --stanza=main info --output=json 2>/dev/null \
+       | grep -qE "\"system-id\":[[:space:]]*\"?${sysid}[\",}]"; then
+    write_pgbackrest_repo_path_marker "$user_path"
+    echo "$user_path"
+    return 0
+  fi
+
+  local cluster_path="${user_path%/}/cluster-${sysid}"
+  write_pgbackrest_repo_path_marker "$cluster_path"
+  echo "$cluster_path"
+}
+
+write_pgbackrest_repo_path_marker() {
+  local path="$1"
+  echo "$path" > "$PGBACKREST_REPO_PATH_MARKER"
+  chown postgres:postgres "$PGBACKREST_REPO_PATH_MARKER" 2>/dev/null || true
+  chmod 0640 "$PGBACKREST_REPO_PATH_MARKER" 2>/dev/null || true
 }
 
 # Detect the container's effective CPU allocation. Reads cgroup v2 cpu.max
@@ -443,6 +522,14 @@ bootstrap_pgbackrest_stanza() {
       fi
       sleep 2
     done
+
+    # Re-derive the repo path now that pg_control is on disk. This is the
+    # canonical first chance to do it on a fresh-cluster path: pgbackrest-init.sh
+    # may also have written the marker during initdb, in which case derive
+    # just reads it.
+    repo_path=$(derive_pgbackrest_repo_path)
+    export PGBACKREST_REPO1_PATH="$repo_path"
+    echo "pgbackrest: using repo1-path=${repo_path}"
 
     if gosu postgres pgbackrest --stanza=main stanza-create; then
       echo "pgbackrest: stanza-create completed"
