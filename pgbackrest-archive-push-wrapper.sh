@@ -65,12 +65,11 @@ if [ -f "$PGDATA/.pgbackrest_repo_path" ]; then
   export PGBACKREST_REPO1_PATH
 fi
 
-# Pin archive-push to repo1 unconditionally. REPO1 is always this service's
-# own destination bucket (invariant set in wrapper.sh's env translation).
-# On a fork, repo2 is the source's read-only bucket — pgBackRest's default
-# archive-push targets all configured repos, so without the pin the fork
-# would spray its post-promote WAL into source's bucket.
-pgbackrest --stanza=main --repo=1 archive-push "$WAL_FILE"
+# pgBackRest 2.58 rejects --repo on archive-push (it pushes to whatever
+# repos are configured). Multi-repo scoping for forks is enforced upstream
+# by ensuring repo2 is dropped from the rendered config post-promote, not
+# at the archive-push call site.
+pgbackrest --stanza=main archive-push "$WAL_FILE"
 PGB_RC=$?
 if [ "$PGB_RC" -eq 0 ]; then
   exit 0

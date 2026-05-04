@@ -332,13 +332,15 @@ render_pgbackrest_conf() {
 
   echo "pgbackrest: detected ${cpus} vCPU; process-max push=${push_max} get=${get_max} backup=${backup_max} restore=${restore_max}"
 
-  # Two-repo mode (PITR-restored fork): REPO1 = own bucket (writes from boot),
-  # REPO2 = source bucket (read-only during recovery). archive-push pins
-  # --repo=1 so post-promote WAL lands only in REPO1; restore_command pins
-  # --repo=2 so archive-get reads from source. Here we just declare repo2's
-  # type so pgBackRest reads the corresponding env vars.
+  # REPO2 (source bucket, read-only) is only needed while the fork is in
+  # recovery — restore_command pulls WAL via archive-get --repo=2. After
+  # promote (.pitr_configured marker), archive_command fires and pgBackRest
+  # 2.58's archive-push fans out to every configured repo with no way to
+  # scope; if repo2 stays in the config, every push tries source's read-only
+  # bucket and fails. Drop repo2 once recovery is done to keep push targeting
+  # only REPO1.
   local repo2_block=""
-  if [ -n "${PGBACKREST_REPO2_S3_BUCKET:-}" ]; then
+  if [ -n "${PGBACKREST_REPO2_S3_BUCKET:-}" ] && [ ! -f "$PGDATA/.pitr_configured" ]; then
     repo2_block="repo2-type=s3"$'\n'
   fi
 
@@ -469,9 +471,11 @@ clear_pgbackrest_state_if_disabled() {
 # real postmaster binds TCP. If we time out, first WAL push fails until
 # the next boot retries — recoverable, but louder than necessary.
 bootstrap_pgbackrest_stanza() {
-  # stanza-create runs against repo1 (this service's own bucket). On a fork
-  # repo2 is the source's bucket — already has a stanza, owned by source —
-  # so we explicitly scope to --repo=1 to avoid touching it.
+  # pgBackRest 2.58 rejects --repo on stanza-create. In single-repo mode
+  # there's nothing to scope; in dual-repo (fork) mode the source's repo2
+  # already has a stanza so stanza-create on it is a no-op-or-mismatch
+  # anyway — neither outcome wants this command to fan out, so we keep the
+  # call vanilla and rely on dual-repo configs being post-promote-only.
   [ -z "${WAL_ARCHIVE_BUCKET:-}" ] && return 0
 
   (
@@ -494,7 +498,7 @@ bootstrap_pgbackrest_stanza() {
     export PGBACKREST_REPO1_PATH="$repo_path"
     echo "pgbackrest: using repo1-path=${repo_path}"
 
-    if gosu postgres pgbackrest --stanza=main --repo=1 stanza-create; then
+    if gosu postgres pgbackrest --stanza=main stanza-create; then
       echo "pgbackrest: stanza-create completed"
     else
       echo "pgbackrest: stanza-create failed (will retry on next boot)" >&2
