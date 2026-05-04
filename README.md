@@ -183,7 +183,7 @@ target, restore from a fresh volume snapshot (or, advanced: remove
 `$PGDATA/.pitr_configured` before the next start).
 
 When `POSTGRES_RECOVERY_TARGET_TIME` is set on a brand-new container
-(no `$PGDATA/PG_VERSION`), the wrapper runs `pgbackrest --repo=1 restore
+(no `$PGDATA/PG_VERSION`), the wrapper runs `pgbackrest --repo=2 restore
 --type=time --target=<T> --target-action=promote` against the source
 bucket *before* `docker-entrypoint` initializes anything. pgBackRest
 pulls the most recent base backup ≤ T plus the WAL chain forward into
@@ -191,14 +191,6 @@ pulls the most recent base backup ≤ T plus the WAL chain forward into
 boots straight into archive recovery. A `.pgbackrest_restored` marker is
 written on success; `configure_pgbackrest_recovery` defers to the
 restore's own settings on subsequent starts of the same volume.
-
-If `$PGDATA` is already populated (the legacy snapshot-based restore
-flow), the conf.d-include path is used as before — `recovery_target_time`
-+ `restore_command` are written to `$PGDATA/conf.d/pgbackrest-recovery.conf`,
-`recovery.signal` is touched, and Postgres replays WAL from the source
-bucket via `archive-get`. The two paths share the same env contract
-(`WAL_RECOVER_FROM_*` + `POSTGRES_RECOVERY_TARGET_TIME`) and only differ
-on the initial-volume question.
 
 #### Image-owned base backups
 
@@ -250,12 +242,6 @@ per-cluster paths, the new cluster lands at
 becomes a multi-history store: list its `cluster-*` sub-prefixes to
 enumerate every cluster that ever archived to it; pick a subprefix
 to restore from.
-
-Backward compat: if the legacy path (`${WAL_ARCHIVE_PATH}` directly,
-without a `cluster-*` sub-prefix) already holds an `archive.info`
-matching our `system_identifier`, the marker is written with the
-legacy path and we keep using it. Existing PITR-enabled services
-from before per-cluster pathing aren't asked to migrate.
 
 `WAL_RECOVER_FROM_PATH` on a restored service must point at the
 specific source-side `cluster-<sysid>` sub-prefix the user wants to

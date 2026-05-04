@@ -56,10 +56,10 @@ PGWAL_THRESHOLD_BYTES=$(( PGWAL_THRESHOLD_MB * 1024 * 1024 ))
 
 # Per-cluster repo-path: read the marker written by pgbackrest-init.sh /
 # wrapper.sh's bootstrap subshell. Without this, every archive-push would
-# go to the legacy ${WAL_ARCHIVE_PATH} root and a wipe-and-reuse-bucket
-# scenario would collide on stanza identity. With it, fresh clusters land
-# at ${WAL_ARCHIVE_PATH}/cluster-<sysid>; existing clusters whose marker
-# was written to the legacy path keep using it (backward compat).
+# go to the ${WAL_ARCHIVE_PATH} root and a wipe-and-reuse-bucket scenario
+# would collide on stanza identity. With it, archive-push targets
+# ${WAL_ARCHIVE_PATH}/cluster-<sysid> and post-wipe clusters get their own
+# sub-prefix instead of trying to overwrite the predecessor's repo.
 if [ -f "$PGDATA/.pgbackrest_repo_path" ]; then
   PGBACKREST_REPO1_PATH=$(cat "$PGDATA/.pgbackrest_repo_path")
   export PGBACKREST_REPO1_PATH

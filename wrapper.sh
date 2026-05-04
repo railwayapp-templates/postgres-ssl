@@ -209,25 +209,21 @@ read_postgres_sysid() {
     | awk -F: '/Database system identifier/ { gsub(/[ \t]/,"",$2); print $2 }'
 }
 
-# Resolve the effective repo1-path for archiving. Three paths in priority order:
+# Resolve the effective repo1-path for archiving:
 #
-#   1. Marker file present → trust it (chosen on a previous boot, possibly
-#      via path 2 or 3 below). Idempotent across boots; survives container
-#      restarts; wiped along with the volume.
-#   2. pg_control exists, marker absent, legacy path (`${WAL_ARCHIVE_PATH}`
-#      directly) holds an archive.info matching our system_identifier →
-#      stick with the legacy path. Backward compat for clusters that
-#      enabled PITR before per-cluster pathing shipped; their data isn't
-#      stranded at a now-orphaned path.
-#   3. Marker absent and legacy path doesn't claim our system_identifier →
-#      use `${WAL_ARCHIVE_PATH}/cluster-<sysid>`. Fresh clusters always
-#      land here. Old/colliding stanza data at the legacy path stays put.
+#   1. Marker file present → trust it. Idempotent across boots; survives
+#      container restarts; wiped with the volume.
+#   2. pg_control exists, marker absent → derive
+#      `${WAL_ARCHIVE_PATH}/cluster-<sysid>`, write marker.
+#   3. Pre-initdb (no pg_control) → return `${WAL_ARCHIVE_PATH}` as a
+#      placeholder; the marker gets written by pgbackrest-init.sh's
+#      post-initdb hook or by the bootstrap subshell once Postgres is up,
+#      so subsequent reads converge.
 #
-# The marker is written under PGDATA so a volume wipe drops it. That's the
-# point: after wipe-and-reuse-bucket, the new cluster (different sysid)
-# gets a fresh marker pointing at a fresh `cluster-<new_sysid>` path. The
-# previous cluster's data at `cluster-<old_sysid>` is untouched and
-# remains visible to the bucket lister (mono UI).
+# After wipe-and-reuse-bucket, the new cluster (different sysid) gets a
+# fresh marker pointing at a fresh `cluster-<new_sysid>` path. The previous
+# cluster's data at `cluster-<old_sysid>` is untouched and remains visible
+# to the bucket lister (mono UI).
 derive_pgbackrest_repo_path() {
   local user_path="${WAL_ARCHIVE_PATH:-/pgbackrest}"
 
@@ -239,21 +235,6 @@ derive_pgbackrest_repo_path() {
   local sysid
   sysid=$(read_postgres_sysid)
   if [ -z "$sysid" ]; then
-    # Pre-initdb: no system_identifier yet. Fall back to user_path; the marker
-    # gets written by pgbackrest-init.sh post-initdb (or by the bootstrap
-    # subshell once Postgres is up), so subsequent reads converge.
-    echo "$user_path"
-    return 0
-  fi
-
-  # Backward-compat probe: peek at the legacy path. If its archive.info
-  # records our system_identifier, this is an existing PITR-enabled service
-  # from before per-cluster pathing — keep using the legacy path so its
-  # accumulated backup history isn't stranded.
-  if PGBACKREST_REPO1_PATH="$user_path" \
-       pgbackrest --stanza=main info --output=json 2>/dev/null \
-       | grep -qE "\"system-id\":[[:space:]]*\"?${sysid}[\",}]"; then
-    write_pgbackrest_repo_path_marker "$user_path"
     echo "$user_path"
     return 0
   fi
