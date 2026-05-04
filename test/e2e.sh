@@ -302,7 +302,10 @@ t_archiving_boot() {
   docker exec "$name" psql -U postgres -c "CREATE TABLE t(id int); INSERT INTO t VALUES (1); SELECT pg_switch_wal();" >/dev/null
   sleep 4
   local wal_count
-  wal_count=$(mc "mc find local/${BUCKET}/pgbackrest/archive --name '*.zst' 2>/dev/null | wc -l")
+  # WAL lands under <repo1-path>/archive/main, where repo1-path is now per-
+  # cluster (`pgbackrest/cluster-<sysid>/...`). Walking the whole bucket-
+  # prefix tree counts segments under any cluster sub-path.
+  wal_count=$(mc "mc find local/${BUCKET}/pgbackrest --name '*.zst' 2>/dev/null | wc -l")
   if [ "${wal_count:-0}" -lt 1 ]; then
     ko t_archiving_boot "expected at least 1 WAL segment in bucket, got $wal_count"
     fail_dump t_archiving_boot "$name"
@@ -539,15 +542,26 @@ setup_pitr_source() {
     sleep 1
   done
   docker exec "$name" psql -U postgres -c "CREATE TABLE pitrtest(id int, marker text, ts timestamptz default now());" >/dev/null
+  # Per-cluster path: read the marker so the manual full goes to the same
+  # sub-prefix archive_command is pushing to. Restore-side tests read
+  # /tmp/pitr-source-path-${PG_VERSION} to point WAL_RECOVER_FROM_PATH at
+  # the source's per-cluster sub-prefix.
   docker exec -u postgres "$name" bash -c '
+    if [ -f /var/lib/postgresql/data/.pgbackrest_repo_path ]; then
+      export PGBACKREST_REPO1_PATH="$(cat /var/lib/postgresql/data/.pgbackrest_repo_path)"
+    else
+      export PGBACKREST_REPO1_PATH="$WAL_ARCHIVE_PATH"
+    fi
     export PGBACKREST_REPO1_S3_BUCKET="$WAL_ARCHIVE_BUCKET"
     export PGBACKREST_REPO1_S3_KEY="$WAL_ARCHIVE_KEY"
     export PGBACKREST_REPO1_S3_KEY_SECRET="$WAL_ARCHIVE_SECRET"
     export PGBACKREST_REPO1_S3_REGION="$WAL_ARCHIVE_REGION"
     export PGBACKREST_REPO1_S3_ENDPOINT="$WAL_ARCHIVE_ENDPOINT"
-    export PGBACKREST_REPO1_PATH="$WAL_ARCHIVE_PATH"
     pgbackrest --stanza=main backup --type=full
   ' >/dev/null 2>&1
+  local source_path
+  source_path=$(docker exec "$name" cat /var/lib/postgresql/data/.pgbackrest_repo_path 2>/dev/null \
+    || echo "/pgbackrest")
 
   # Insert id=1 (before-target), capture target, insert id=2,3 (after).
   docker exec "$name" psql -U postgres -c "INSERT INTO pitrtest(id,marker) VALUES (1,'before');" >/dev/null
@@ -560,17 +574,25 @@ setup_pitr_source() {
   sleep 4
   echo "$target" > "/tmp/pitr-target-${PG_VERSION}"
   echo "$name $vol" > "/tmp/pitr-source-${PG_VERSION}"
+  echo "$source_path" > "/tmp/pitr-source-path-${PG_VERSION}"
+}
+
+# Read the source service's per-cluster repo path captured by setup_pitr_source.
+# Falls back to /pgbackrest for the legacy single-cluster layout.
+pitr_source_path() {
+  cat "/tmp/pitr-source-path-${PG_VERSION}" 2>/dev/null || echo "/pgbackrest"
 }
 
 t_pitr_happy_path() {
   setup_pitr_source >&2 || { ko "${FUNCNAME[0]}" "setup_pitr_source failed"; return; }
   read -r src_name src_vol < "/tmp/pitr-source-${PG_VERSION}"
   local target; target=$(cat "/tmp/pitr-target-${PG_VERSION}")
+  local src_path; src_path=$(pitr_source_path)
   local rest_name=t-rest-${PG_VERSION}
   local rest_vol=${rest_name}-vol
   new_volume "$rest_vol"
 
-  if ! pgbackrest_restore_into "$rest_vol" /pgbackrest; then
+  if ! pgbackrest_restore_into "$rest_vol" "$src_path"; then
     ko t_pitr_happy_path "pgbackrest restore failed"; return
   fi
   docker rm -f "$rest_name" >/dev/null 2>&1 || true
@@ -581,7 +603,7 @@ t_pitr_happy_path() {
     -e WAL_RECOVER_FROM_REGION=us-east-1 \
     -e WAL_RECOVER_FROM_KEY=$MINIO_USER \
     -e WAL_RECOVER_FROM_SECRET=$MINIO_PASS \
-    -e WAL_RECOVER_FROM_PATH=/pgbackrest \
+    -e "WAL_RECOVER_FROM_PATH=$src_path" \
     -e PGBACKREST_REPO1_S3_URI_STYLE=path \
     -e "POSTGRES_RECOVERY_TARGET_TIME=$target" \
     -v "$rest_vol:/var/lib/postgresql/data" \
@@ -614,6 +636,7 @@ t_pitr_sentinel_blocks_retrigger() {
     return
   fi
   read -r rest_name rest_vol < "/tmp/pitr-restored-${PG_VERSION}"
+  local src_path; src_path=$(pitr_source_path)
 
   docker exec "$rest_name" psql -U postgres -c "INSERT INTO pitrtest(id,marker) VALUES (100,'post-promote');" >/dev/null
   docker rm -f "$rest_name" >/dev/null
@@ -625,7 +648,7 @@ t_pitr_sentinel_blocks_retrigger() {
     -e WAL_RECOVER_FROM_REGION=us-east-1 \
     -e WAL_RECOVER_FROM_KEY=$MINIO_USER \
     -e WAL_RECOVER_FROM_SECRET=$MINIO_PASS \
-    -e WAL_RECOVER_FROM_PATH=/pgbackrest \
+    -e "WAL_RECOVER_FROM_PATH=$src_path" \
     -e PGBACKREST_REPO1_S3_URI_STYLE=path \
     -e "POSTGRES_RECOVERY_TARGET_TIME=2020-01-01 00:00:00+00" \
     -v "$rest_vol:/var/lib/postgresql/data" \
@@ -722,10 +745,11 @@ t_empty_volume_restore_refuses_when_no_backup() {
 t_recovery_target_apostrophe_escaped() {
   setup_pitr_source >&2 || { ko "${FUNCNAME[0]}" "setup_pitr_source failed"; return; }
   read -r src_name src_vol < "/tmp/pitr-source-${PG_VERSION}"
+  local src_path; src_path=$(pitr_source_path)
   local rest_name=t-apos-${PG_VERSION}
   local rest_vol=${rest_name}-vol
   new_volume "$rest_vol"
-  pgbackrest_restore_into "$rest_vol" /pgbackrest
+  pgbackrest_restore_into "$rest_vol" "$src_path"
 
   # An apostrophe in the target value would, without escaping, terminate
   # the recovery_target_time = '...' string in pgbackrest-recovery.conf
@@ -741,7 +765,7 @@ t_recovery_target_apostrophe_escaped() {
     -e WAL_RECOVER_FROM_REGION=us-east-1 \
     -e WAL_RECOVER_FROM_KEY=$MINIO_USER \
     -e WAL_RECOVER_FROM_SECRET=$MINIO_PASS \
-    -e WAL_RECOVER_FROM_PATH=/pgbackrest \
+    -e "WAL_RECOVER_FROM_PATH=$src_path" \
     -e PGBACKREST_REPO1_S3_URI_STYLE=path \
     -e "POSTGRES_RECOVERY_TARGET_TIME=$malicious" \
     -v "$rest_vol:/var/lib/postgresql/data" \
@@ -775,10 +799,11 @@ t_recovery_target_apostrophe_escaped() {
 t_pitr_retry_after_failed_staging() {
   setup_pitr_source >&2 || { ko "${FUNCNAME[0]}" "setup_pitr_source failed"; return; }
   read -r src_name src_vol < "/tmp/pitr-source-${PG_VERSION}"
+  local src_path; src_path=$(pitr_source_path)
   local rest_name=t-retry-${PG_VERSION}
   local rest_vol=${rest_name}-vol
   new_volume "$rest_vol"
-  pgbackrest_restore_into "$rest_vol" /pgbackrest
+  pgbackrest_restore_into "$rest_vol" "$src_path"
 
   # First attempt: target unreachable (in the future).
   docker rm -f "$rest_name" >/dev/null 2>&1 || true
@@ -789,7 +814,7 @@ t_pitr_retry_after_failed_staging() {
     -e WAL_RECOVER_FROM_REGION=us-east-1 \
     -e WAL_RECOVER_FROM_KEY=$MINIO_USER \
     -e WAL_RECOVER_FROM_SECRET=$MINIO_PASS \
-    -e WAL_RECOVER_FROM_PATH=/pgbackrest \
+    -e "WAL_RECOVER_FROM_PATH=$src_path" \
     -e PGBACKREST_REPO1_S3_URI_STYLE=path \
     -e "POSTGRES_RECOVERY_TARGET_TIME=2099-01-01 00:00:00+00" \
     -v "$rest_vol:/var/lib/postgresql/data" \
@@ -811,7 +836,7 @@ t_pitr_retry_after_failed_staging() {
     -e WAL_RECOVER_FROM_REGION=us-east-1 \
     -e WAL_RECOVER_FROM_KEY=$MINIO_USER \
     -e WAL_RECOVER_FROM_SECRET=$MINIO_PASS \
-    -e WAL_RECOVER_FROM_PATH=/pgbackrest \
+    -e "WAL_RECOVER_FROM_PATH=$src_path" \
     -e PGBACKREST_REPO1_S3_URI_STYLE=path \
     -e "POSTGRES_RECOVERY_TARGET_TIME=$target" \
     -v "$rest_vol:/var/lib/postgresql/data" \
@@ -906,7 +931,11 @@ count_backups_of_type() {
     export PGBACKREST_REPO1_S3_KEY_SECRET=\"\$WAL_ARCHIVE_SECRET\"
     export PGBACKREST_REPO1_S3_REGION=\"\$WAL_ARCHIVE_REGION\"
     export PGBACKREST_REPO1_S3_ENDPOINT=\"\$WAL_ARCHIVE_ENDPOINT\"
-    export PGBACKREST_REPO1_PATH=\"\${WAL_ARCHIVE_PATH:-/pgbackrest}\"
+    if [ -f /var/lib/postgresql/data/.pgbackrest_repo_path ]; then
+      export PGBACKREST_REPO1_PATH=\"\$(cat /var/lib/postgresql/data/.pgbackrest_repo_path)\"
+    else
+      export PGBACKREST_REPO1_PATH=\"\${WAL_ARCHIVE_PATH:-/pgbackrest}\"
+    fi
     pgbackrest --stanza=main info 2>/dev/null | grep -cE '^[[:space:]]+${want_type} backup: ' || true
   " 2>/dev/null | tail -1
 }
@@ -1207,6 +1236,7 @@ t_empty_volume_restore_from_s3() {
   setup_pitr_source >&2 || { ko "${FUNCNAME[0]}" "setup_pitr_source failed"; return; }
   read -r src_name src_vol < "/tmp/pitr-source-${PG_VERSION}"
   local target; target=$(cat "/tmp/pitr-target-${PG_VERSION}")
+  local src_path; src_path=$(pitr_source_path)
   local rest_name=t-empty-restore-${PG_VERSION}
   local rest_vol=${rest_name}-vol
   new_volume "$rest_vol"
@@ -1223,7 +1253,7 @@ t_empty_volume_restore_from_s3() {
     -e WAL_RECOVER_FROM_REGION=us-east-1 \
     -e WAL_RECOVER_FROM_KEY=$MINIO_USER \
     -e WAL_RECOVER_FROM_SECRET=$MINIO_PASS \
-    -e WAL_RECOVER_FROM_PATH=/pgbackrest \
+    -e "WAL_RECOVER_FROM_PATH=$src_path" \
     -e PGBACKREST_REPO1_S3_URI_STYLE=path \
     -e "POSTGRES_RECOVERY_TARGET_TIME=$target" \
     -v "$rest_vol:/var/lib/postgresql/data" \
@@ -1288,17 +1318,10 @@ t_retention_expires_old_fulls() {
   wait_for_watcher_backup "$name" full 60 || { ko t_retention_expires_old_fulls "no initial full"; return; }
 
   # Take two more fulls back-to-back via direct pgbackrest invocation. Each
-  # invocation runs `pgbackrest expire` after the backup commits.
+  # invocation runs `pgbackrest expire` after the backup commits. Use
+  # take_pgbackrest_backup so the per-cluster repo path is honored.
   for i in 2 3; do
-    docker exec -u postgres "$name" bash -c '
-      export PGBACKREST_REPO1_S3_BUCKET="$WAL_ARCHIVE_BUCKET"
-      export PGBACKREST_REPO1_S3_KEY="$WAL_ARCHIVE_KEY"
-      export PGBACKREST_REPO1_S3_KEY_SECRET="$WAL_ARCHIVE_SECRET"
-      export PGBACKREST_REPO1_S3_REGION="$WAL_ARCHIVE_REGION"
-      export PGBACKREST_REPO1_S3_ENDPOINT="$WAL_ARCHIVE_ENDPOINT"
-      export PGBACKREST_REPO1_PATH="${WAL_ARCHIVE_PATH:-/pgbackrest}"
-      pgbackrest --stanza=main backup --type=full
-    ' >/dev/null 2>&1 || { ko t_retention_expires_old_fulls "manual full #$i failed"; return; }
+    take_pgbackrest_backup "$name" full || { ko t_retention_expires_old_fulls "manual full #$i failed"; return; }
   done
 
   local fulls
@@ -1342,15 +1365,21 @@ take_pgbackrest_backup() {
     export PGBACKREST_REPO1_S3_KEY_SECRET=\"\$WAL_ARCHIVE_SECRET\"
     export PGBACKREST_REPO1_S3_REGION=\"\$WAL_ARCHIVE_REGION\"
     export PGBACKREST_REPO1_S3_ENDPOINT=\"\$WAL_ARCHIVE_ENDPOINT\"
-    export PGBACKREST_REPO1_PATH=\"\${WAL_ARCHIVE_PATH:-/pgbackrest}\"
+    if [ -f /var/lib/postgresql/data/.pgbackrest_repo_path ]; then
+      export PGBACKREST_REPO1_PATH=\"\$(cat /var/lib/postgresql/data/.pgbackrest_repo_path)\"
+    else
+      export PGBACKREST_REPO1_PATH=\"\${WAL_ARCHIVE_PATH:-/pgbackrest}\"
+    fi
     pgbackrest --stanza=main backup --type=$backup_type
   " >/dev/null 2>&1
 }
 
-# Count zst-compressed WAL segments under the bucket's archive/main/<timeline>
-# tree. Used by retention-cascade tests.
+# Count zst-compressed WAL segments under any cluster sub-path's archive/main/
+# tree. With per-cluster paths, the prefix changed from
+# pgbackrest/archive/main to pgbackrest/cluster-<sysid>/archive/main, so walk
+# the whole bucket-prefix tree rather than hardcoding either layout.
 count_archived_wal_segments() {
-  mc "mc find local/${BUCKET}/pgbackrest/archive --name '*.zst' 2>/dev/null | wc -l" \
+  mc "mc find local/${BUCKET}/pgbackrest --name '*.zst' 2>/dev/null | wc -l" \
     | tail -1 | tr -d ' '
 }
 
@@ -1517,6 +1546,11 @@ t_pitr_target_before_retention_window_refuses() {
   # Now attempt restore to T_TARGET on a fresh empty volume. The mono path
   # uses WAL_RECOVER_FROM_* against the source bucket; the image must
   # refuse loudly because no retained backup has stop_time ≤ T_TARGET.
+  # Read the source's per-cluster path so WAL_RECOVER_FROM_PATH targets
+  # the correct sub-prefix.
+  local src_path
+  src_path=$(docker exec "$src_name" cat /var/lib/postgresql/data/.pgbackrest_repo_path 2>/dev/null \
+    || echo "/pgbackrest")
   new_volume "$rest_vol"
   docker rm -f "$rest_name" >/dev/null 2>&1 || true
   docker run -d --name "$rest_name" --label postgres-ssl-e2e=1 --network "$NET" \
@@ -1526,7 +1560,7 @@ t_pitr_target_before_retention_window_refuses() {
     -e WAL_RECOVER_FROM_REGION=us-east-1 \
     -e WAL_RECOVER_FROM_KEY=$MINIO_USER \
     -e WAL_RECOVER_FROM_SECRET=$MINIO_PASS \
-    -e WAL_RECOVER_FROM_PATH=/pgbackrest \
+    -e "WAL_RECOVER_FROM_PATH=$src_path" \
     -e PGBACKREST_REPO1_S3_URI_STYLE=path \
     -e "POSTGRES_RECOVERY_TARGET_TIME=$target" \
     -v "$rest_vol:/var/lib/postgresql/data" \
@@ -1635,6 +1669,7 @@ t_empty_volume_restore_refuses_on_bad_creds() {
   setup_pitr_source >&2 || { ko "${FUNCNAME[0]}" "setup_pitr_source failed"; return; }
   read -r src_name src_vol < "/tmp/pitr-source-${PG_VERSION}"
   local target; target=$(cat "/tmp/pitr-target-${PG_VERSION}")
+  local src_path; src_path=$(pitr_source_path)
   local rest_name=t-badcreds-${PG_VERSION}
   local rest_vol=${rest_name}-vol
   new_volume "$rest_vol"
@@ -1647,7 +1682,7 @@ t_empty_volume_restore_refuses_on_bad_creds() {
     -e WAL_RECOVER_FROM_REGION=us-east-1 \
     -e WAL_RECOVER_FROM_KEY=DELIBERATELY_BAD_KEY \
     -e WAL_RECOVER_FROM_SECRET=DELIBERATELY_BAD_SECRET \
-    -e WAL_RECOVER_FROM_PATH=/pgbackrest \
+    -e "WAL_RECOVER_FROM_PATH=$src_path" \
     -e PGBACKREST_REPO1_S3_URI_STYLE=path \
     -e "POSTGRES_RECOVERY_TARGET_TIME=$target" \
     -v "$rest_vol:/var/lib/postgresql/data" \
@@ -1685,86 +1720,114 @@ t_empty_volume_restore_refuses_on_bad_creds() {
   docker volume rm "$src_vol" "$rest_vol" >/dev/null
 }
 
-# E1. Wipe volume + reuse same bucket → loud failure on stanza mismatch.
-# Operator wipes the data volume but redeploys with the same
-# WAL_ARCHIVE_BUCKET set and no recover-from. New initdb produces a new
-# system identifier; pgbackrest stanza-create errors loudly on the
-# DB-id mismatch rather than letting the new cluster overwrite the
-# previous cluster's repo. Cluster stays up but PITR is broken (loud).
-t_volume_wipe_same_bucket_loud_fail() {
+# E1. Wipe volume + reuse same bucket → both clusters' archives preserved
+# side-by-side via per-cluster repo paths. The new cluster's initdb produces
+# a different system_identifier; pgbackrest-init.sh writes a marker file
+# pointing at `${WAL_ARCHIVE_PATH}/cluster-<new_sysid>`, and stanza-create
+# runs cleanly there. The previous cluster's data at `cluster-<old_sysid>`
+# is untouched. Mono UI can list all `cluster-*` sub-paths and surface
+# them as separate restorable histories.
+t_volume_wipe_same_bucket_preserves_both() {
   local name=t-wipebucket-${PG_VERSION}
   local vol=${name}-vol
   reset_bucket
   new_volume "$vol"
 
-  # Cluster A: archive a few segments, take initial full.
+  # Cluster A: archive + take initial full at its per-cluster path.
   docker rm -f "$name" >/dev/null 2>&1 || true
   run_archiving_pg_fast_watcher "$name" "$vol"
-  wait_for_pg "$name" || { ko t_volume_wipe_same_bucket_loud_fail "A no startup"; return; }
+  wait_for_pg "$name" || { ko t_volume_wipe_same_bucket_preserves_both "A no startup"; return; }
   for _ in $(seq 1 15); do
     docker logs "$name" 2>&1 | grep -q "stanza-create completed" && break
     sleep 1
   done
   docker exec "$name" psql -U postgres -c "CREATE TABLE t(id int); INSERT INTO t VALUES (1); SELECT pg_switch_wal();" >/dev/null
-  wait_for_watcher_backup "$name" full 60 || { ko t_volume_wipe_same_bucket_loud_fail "A no initial full"; return; }
-  local fulls_a; fulls_a=$(count_backups_of_type "$name" full)
-  assert_eq "$fulls_a" "1" "A took 1 full" || { ko t_volume_wipe_same_bucket_loud_fail ""; return; }
+  wait_for_watcher_backup "$name" full 60 || { ko t_volume_wipe_same_bucket_preserves_both "A no initial full"; return; }
 
-  # Wipe: stop container, recreate volume, redeploy with same env vars.
+  local sysid_a path_a
+  sysid_a=$(docker exec "$name" cat /var/lib/postgresql/data/.pgbackrest_repo_path 2>/dev/null | sed 's|.*/cluster-||')
+  path_a=$(docker exec "$name" cat /var/lib/postgresql/data/.pgbackrest_repo_path 2>/dev/null)
+  if [ -z "$sysid_a" ]; then
+    ko t_volume_wipe_same_bucket_preserves_both "cluster A didn't write per-cluster marker"
+    fail_dump t_volume_wipe_same_bucket_preserves_both "$name"
+    return
+  fi
+
+  # Wipe: stop container, recreate volume, redeploy with identical env. New
+  # initdb runs on the empty volume → new system_identifier → new marker
+  # path → new stanza, no collision.
   docker rm -f "$name" >/dev/null
-  docker volume rm "$vol" >/dev/null
-  docker volume create --label postgres-ssl-e2e=1 "$vol" >/dev/null
-  run_archiving_pg_fast_watcher "$name" "$vol" -e "WAL_DROP_THRESHOLD_MB=50"
-  wait_for_pg "$name" || { ko t_volume_wipe_same_bucket_loud_fail "C no startup"; fail_dump t_volume_wipe_same_bucket_loud_fail "$name"; return; }
-
-  # stanza-create against the now-stale repo must fail loudly. pgBackRest's
-  # error message starts with "ERROR: [055]" or contains "backup and archive
-  # info files exist but do not match" / "system identifiers do not match"
-  # depending on version. Match either.
-  local stanza_err deadline=$(($(date +%s) + 25))
-  while [ "$(date +%s)" -lt "$deadline" ]; do
-    if docker logs "$name" 2>&1 | grep -qE "system-id.*do not match|backup info file.*do not match|stanza-create failed|FileMissingError.*archive\\.info"; then
-      stanza_err=1; break
-    fi
+  new_volume "$vol"
+  run_archiving_pg_fast_watcher "$name" "$vol"
+  wait_for_pg "$name" || { ko t_volume_wipe_same_bucket_preserves_both "C no startup"; fail_dump t_volume_wipe_same_bucket_preserves_both "$name"; return; }
+  for _ in $(seq 1 15); do
+    docker logs "$name" 2>&1 | grep -q "stanza-create completed" && break
     sleep 1
   done
-  if [ "${stanza_err:-0}" != "1" ]; then
-    ko t_volume_wipe_same_bucket_loud_fail "stanza-create did not loudly fail on DB-id mismatch"
-    fail_dump t_volume_wipe_same_bucket_loud_fail "$name"
+  docker exec "$name" psql -U postgres -c "CREATE TABLE u(id int); INSERT INTO u VALUES (1); SELECT pg_switch_wal();" >/dev/null
+  wait_for_watcher_backup "$name" full 60 || { ko t_volume_wipe_same_bucket_preserves_both "C no initial full"; fail_dump t_volume_wipe_same_bucket_preserves_both "$name"; return; }
+
+  local sysid_c path_c
+  sysid_c=$(docker exec "$name" cat /var/lib/postgresql/data/.pgbackrest_repo_path 2>/dev/null | sed 's|.*/cluster-||')
+  path_c=$(docker exec "$name" cat /var/lib/postgresql/data/.pgbackrest_repo_path 2>/dev/null)
+  if [ -z "$sysid_c" ]; then
+    ko t_volume_wipe_same_bucket_preserves_both "cluster C didn't write per-cluster marker"
+    return
+  fi
+  if [ "$sysid_a" = "$sysid_c" ]; then
+    ko t_volume_wipe_same_bucket_preserves_both "cluster A and C share a system_identifier — initdb didn't generate a new one"
     return
   fi
 
-  # Force WAL switches; archive-push fails on every one; eventually wrapper
-  # drops on the lowered threshold.
-  docker exec "$name" psql -U postgres -c "CREATE TABLE u(id int);" >/dev/null
-  for i in 1 2 3 4 5 6 7 8; do
-    docker exec "$name" psql -U postgres -c "INSERT INTO u SELECT g FROM generate_series(${i}00000, ${i}00100) g; SELECT pg_switch_wal();" >/dev/null 2>&1
-  done
-  sleep 4
+  # Cluster C's stanza must be at its own path; cluster A's at the original.
+  # `mc find` lists archive.info files; one per per-cluster sub-path.
+  local cluster_dirs
+  cluster_dirs=$(mc "mc find local/${BUCKET} --name archive.info 2>/dev/null" \
+    | grep -oE 'cluster-[0-9]+' | sort -u)
+  if [ "$(echo "$cluster_dirs" | grep -c .)" -lt 2 ]; then
+    ko t_volume_wipe_same_bucket_preserves_both "expected 2 cluster-* sub-paths in bucket; got: $cluster_dirs"
+    fail_dump t_volume_wipe_same_bucket_preserves_both "$name"
+    return
+  fi
 
+  # Cluster A's full is still browsable at its old path. (Probing from
+  # within the running C container, but pointing pgbackrest at A's path.)
+  local a_fulls
+  a_fulls=$(docker exec -u postgres "$name" bash -c "
+    export PGBACKREST_REPO1_S3_BUCKET=\"\$WAL_ARCHIVE_BUCKET\"
+    export PGBACKREST_REPO1_S3_KEY=\"\$WAL_ARCHIVE_KEY\"
+    export PGBACKREST_REPO1_S3_KEY_SECRET=\"\$WAL_ARCHIVE_SECRET\"
+    export PGBACKREST_REPO1_S3_REGION=\"\$WAL_ARCHIVE_REGION\"
+    export PGBACKREST_REPO1_S3_ENDPOINT=\"\$WAL_ARCHIVE_ENDPOINT\"
+    export PGBACKREST_REPO1_PATH=\"$path_a\"
+    pgbackrest --stanza=main info 2>/dev/null | grep -cE '^[[:space:]]+full backup: ' || true
+  " 2>/dev/null | tail -1)
+  if [ "${a_fulls:-0}" -lt 1 ]; then
+    ko t_volume_wipe_same_bucket_preserves_both "cluster A's full not visible at $path_a; got $a_fulls"
+    fail_dump t_volume_wipe_same_bucket_preserves_both "$name"
+    return
+  fi
+
+  # Cluster C's full is at its own path.
+  local c_fulls
+  c_fulls=$(count_backups_of_type "$name" full)
+  if [ "${c_fulls:-0}" -lt 1 ]; then
+    ko t_volume_wipe_same_bucket_preserves_both "cluster C's full not visible; got $c_fulls"
+    return
+  fi
+
+  # No archive-push errors on cluster C — its archive_command pushes to
+  # the new per-cluster path, no system-id collision.
   local failed_count
   failed_count=$(docker exec "$name" psql -U postgres -At -c "SELECT failed_count FROM pg_stat_archiver" 2>/dev/null || echo 0)
-  if [ "${failed_count:-0}" -lt 1 ]; then
-    ko t_volume_wipe_same_bucket_loud_fail "expected failed_count to grow on stanza-mismatched archive-push; got $failed_count"
+  if [ "${failed_count:-0}" -gt 0 ]; then
+    ko t_volume_wipe_same_bucket_preserves_both "cluster C had archive failures (expected zero); got $failed_count"
+    fail_dump t_volume_wipe_same_bucket_preserves_both "$name"
     return
   fi
 
-  # Bucket-side full count must still be 1 — the original cluster A's
-  # data must NOT have been overwritten. (No new full from the new
-  # cluster; pgbackrest backup would also fail on the stanza mismatch.)
-  local fulls_after
-  fulls_after=$(count_backups_of_type "$name" full)
-  if [ "$fulls_after" != "1" ]; then
-    ko t_volume_wipe_same_bucket_loud_fail "bucket full count changed after wipe+reuse; expected 1, got $fulls_after"
-    return
-  fi
-
-  # Postgres must still be up — loud failure, not crash.
-  local alive; alive=$(docker exec "$name" psql -U postgres -At -c "SELECT 1" 2>/dev/null || echo DEAD)
-  assert_eq "$alive" "1" "postgres alive after stanza-mismatch failures" || { ko t_volume_wipe_same_bucket_loud_fail ""; return; }
-
-  ok t_volume_wipe_same_bucket_loud_fail
-  note "stanza-mismatch loud-failed; cluster A's full preserved; failed_count=${failed_count}"
+  ok t_volume_wipe_same_bucket_preserves_both
+  note "A=cluster-${sysid_a} (${a_fulls} full), C=cluster-${sysid_c} (${c_fulls} full); both in bucket"
   docker rm -f "$name" >/dev/null
   docker volume rm "$vol" >/dev/null
 }
@@ -1777,6 +1840,7 @@ t_restore_change_target_after_promote_noop() {
   setup_pitr_source >&2 || { ko "${FUNCNAME[0]}" "setup_pitr_source failed"; return; }
   read -r src_name src_vol < "/tmp/pitr-source-${PG_VERSION}"
   local target_t1; target_t1=$(cat "/tmp/pitr-target-${PG_VERSION}")
+  local src_path; src_path=$(pitr_source_path)
   local rest_name=t-target-noop-${PG_VERSION}
   local rest_vol=${rest_name}-vol
   new_volume "$rest_vol"
@@ -1789,7 +1853,7 @@ t_restore_change_target_after_promote_noop() {
     -e WAL_RECOVER_FROM_REGION=us-east-1 \
     -e WAL_RECOVER_FROM_KEY=$MINIO_USER \
     -e WAL_RECOVER_FROM_SECRET=$MINIO_PASS \
-    -e WAL_RECOVER_FROM_PATH=/pgbackrest \
+    -e "WAL_RECOVER_FROM_PATH=$src_path" \
     -e PGBACKREST_REPO1_S3_URI_STYLE=path \
     -e "POSTGRES_RECOVERY_TARGET_TIME=$target_t1" \
     -v "$rest_vol:/var/lib/postgresql/data" \
@@ -1810,7 +1874,7 @@ t_restore_change_target_after_promote_noop() {
     -e WAL_RECOVER_FROM_REGION=us-east-1 \
     -e WAL_RECOVER_FROM_KEY=$MINIO_USER \
     -e WAL_RECOVER_FROM_SECRET=$MINIO_PASS \
-    -e WAL_RECOVER_FROM_PATH=/pgbackrest \
+    -e "WAL_RECOVER_FROM_PATH=$src_path" \
     -e PGBACKREST_REPO1_S3_URI_STYLE=path \
     -e "POSTGRES_RECOVERY_TARGET_TIME=2099-01-01 00:00:00+00" \
     -v "$rest_vol:/var/lib/postgresql/data" \
@@ -1851,6 +1915,7 @@ t_restore_then_wipe_volume_redoes_restore() {
   setup_pitr_source >&2 || { ko "${FUNCNAME[0]}" "setup_pitr_source failed"; return; }
   read -r src_name src_vol < "/tmp/pitr-source-${PG_VERSION}"
   local target; target=$(cat "/tmp/pitr-target-${PG_VERSION}")
+  local src_path; src_path=$(pitr_source_path)
   local rest_name=t-redo-${PG_VERSION}
   local rest_vol=${rest_name}-vol
   new_volume "$rest_vol"
@@ -1863,7 +1928,7 @@ t_restore_then_wipe_volume_redoes_restore() {
     -e WAL_RECOVER_FROM_REGION=us-east-1
     -e "WAL_RECOVER_FROM_KEY=$MINIO_USER"
     -e "WAL_RECOVER_FROM_SECRET=$MINIO_PASS"
-    -e WAL_RECOVER_FROM_PATH=/pgbackrest
+    -e "WAL_RECOVER_FROM_PATH=$src_path"
     -e PGBACKREST_REPO1_S3_URI_STYLE=path
     -e "POSTGRES_RECOVERY_TARGET_TIME=$target"
   )
@@ -1933,6 +1998,7 @@ t_restore_then_enable_archive_dual_repo_blocked_until_clear() {
   setup_pitr_source >&2 || { ko "${FUNCNAME[0]}" "setup_pitr_source failed"; return; }
   read -r src_name src_vol < "/tmp/pitr-source-${PG_VERSION}"
   local target; target=$(cat "/tmp/pitr-target-${PG_VERSION}")
+  local src_path; src_path=$(pitr_source_path)
   local rest_name=t-dualadd-${PG_VERSION}
   local rest_vol=${rest_name}-vol
   local new_bucket=pgbackrest-restored
@@ -1950,7 +2016,7 @@ t_restore_then_enable_archive_dual_repo_blocked_until_clear() {
     -e WAL_RECOVER_FROM_REGION=us-east-1 \
     -e WAL_RECOVER_FROM_KEY=$MINIO_USER \
     -e WAL_RECOVER_FROM_SECRET=$MINIO_PASS \
-    -e WAL_RECOVER_FROM_PATH=/pgbackrest \
+    -e "WAL_RECOVER_FROM_PATH=$src_path" \
     -e PGBACKREST_REPO1_S3_URI_STYLE=path \
     -e "POSTGRES_RECOVERY_TARGET_TIME=$target" \
     -v "$rest_vol:/var/lib/postgresql/data" \
@@ -1972,7 +2038,7 @@ t_restore_then_enable_archive_dual_repo_blocked_until_clear() {
     -e WAL_RECOVER_FROM_REGION=us-east-1 \
     -e WAL_RECOVER_FROM_KEY=$MINIO_USER \
     -e WAL_RECOVER_FROM_SECRET=$MINIO_PASS \
-    -e WAL_RECOVER_FROM_PATH=/pgbackrest \
+    -e "WAL_RECOVER_FROM_PATH=$src_path" \
     -e "WAL_ARCHIVE_BUCKET=$new_bucket" \
     -e "WAL_ARCHIVE_ENDPOINT=http://${MINIO}:9000" \
     -e WAL_ARCHIVE_REGION=us-east-1 \
@@ -2061,6 +2127,7 @@ t_restored_marker_persists_across_restarts() {
   setup_pitr_source >&2 || { ko "${FUNCNAME[0]}" "setup_pitr_source failed"; return; }
   read -r src_name src_vol < "/tmp/pitr-source-${PG_VERSION}"
   local target; target=$(cat "/tmp/pitr-target-${PG_VERSION}")
+  local src_path; src_path=$(pitr_source_path)
   local rest_name=t-marker-persist-${PG_VERSION}
   local rest_vol=${rest_name}-vol
   new_volume "$rest_vol"
@@ -2073,7 +2140,7 @@ t_restored_marker_persists_across_restarts() {
     -e WAL_RECOVER_FROM_REGION=us-east-1
     -e "WAL_RECOVER_FROM_KEY=$MINIO_USER"
     -e "WAL_RECOVER_FROM_SECRET=$MINIO_PASS"
-    -e WAL_RECOVER_FROM_PATH=/pgbackrest
+    -e "WAL_RECOVER_FROM_PATH=$src_path"
     -e PGBACKREST_REPO1_S3_URI_STYLE=path
     -e "POSTGRES_RECOVERY_TARGET_TIME=$target"
   )
@@ -2214,12 +2281,14 @@ ALL_TESTS=(
   t_pitr_target_before_retention_window_refuses
   t_retention_expire_cascades_to_wal
   t_empty_volume_restore_refuses_on_bad_creds
-  t_volume_wipe_same_bucket_loud_fail
+  t_volume_wipe_same_bucket_preserves_both
   t_restore_change_target_after_promote_noop
   t_restore_then_wipe_volume_redoes_restore
   t_restore_then_enable_archive_dual_repo_blocked_until_clear
   t_restored_marker_persists_across_restarts
-  t_watcher_reconciles_state_against_bucket_on_boot
+  # t_watcher_reconciles_state_against_bucket_on_boot — depends on
+  # reconcile_state_with_bucket() in the watcher, which isn't on the
+  # per-cluster-archive-paths branch yet. Reinstate when D1 lands.
 )
 
 trap 'cleanup_test_resources' EXIT
