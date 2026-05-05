@@ -536,6 +536,32 @@ configure_pgbackrest_recovery() {
   [ -z "$POSTGRES_RECOVERY_TARGET_TIME" ] && return 0
   [ ! -f "$POSTGRES_CONF_FILE" ] && return 0
 
+  # /etc/pgbackrest is rebuilt on every boot, so always re-render the
+  # recovery conf when WAL_RECOVER_FROM_* is set — postgres' restore_command
+  # references it whether the auto.conf was written by the wrapper's own
+  # pgbackrest restore or by an external one (e.g. test pgbackrest_restore_into).
+  install -d -m 0750 -o postgres -g postgres /etc/pgbackrest
+  cat > "$PGBACKREST_RECOVERY_S3_CONF" <<EOF
+[global]
+log-level-console=info
+log-level-file=off
+spool-path=${PGBACKREST_SPOOL_DIR}
+repo1-type=s3
+repo1-s3-bucket=${WAL_RECOVER_FROM_BUCKET}
+repo1-s3-key=${WAL_RECOVER_FROM_KEY}
+repo1-s3-key-secret=${WAL_RECOVER_FROM_SECRET}
+repo1-s3-region=${WAL_RECOVER_FROM_REGION}
+repo1-s3-endpoint=${WAL_RECOVER_FROM_ENDPOINT}
+repo1-s3-uri-style=${WAL_RECOVER_FROM_S3_URI_STYLE:-path}
+repo1-path=${WAL_RECOVER_FROM_PATH:-/pgbackrest}
+
+[main]
+pg1-path=${PGDATA}
+pg1-port=5432
+EOF
+  chown postgres:postgres "$PGBACKREST_RECOVERY_S3_CONF"
+  chmod 0640 "$PGBACKREST_RECOVERY_S3_CONF"
+
   # The pgbackrest-restore path (empty-volume restore) handles recovery
   # staging itself — recovery.signal + recovery params come out of
   # `pgbackrest restore`, not our conf.d include. Skip the include-write
@@ -558,34 +584,6 @@ configure_pgbackrest_recovery() {
 
   ensure_pg_includes_confd
   install -d -m 0750 -o postgres -g postgres "$PGBACKREST_CONFD_DIR"
-
-  # Pre-populated-volume PITR (e.g. snapshot-restored or copied-in volume):
-  # we still need archive-get to pull WAL from source's bucket. Write the
-  # dedicated recovery conf if it doesn't exist, then point restore_command
-  # at it. Same isolation as the empty-volume restore path: the default
-  # /etc/pgbackrest/pgbackrest.conf stays repo1-only, source's bucket is
-  # only reachable via the recovery conf.
-  install -d -m 0750 -o postgres -g postgres /etc/pgbackrest
-  cat > "$PGBACKREST_RECOVERY_S3_CONF" <<EOF
-[global]
-log-level-console=info
-log-level-file=off
-spool-path=${PGBACKREST_SPOOL_DIR}
-repo1-type=s3
-repo1-s3-bucket=${WAL_RECOVER_FROM_BUCKET}
-repo1-s3-key=${WAL_RECOVER_FROM_KEY}
-repo1-s3-key-secret=${WAL_RECOVER_FROM_SECRET}
-repo1-s3-region=${WAL_RECOVER_FROM_REGION}
-repo1-s3-endpoint=${WAL_RECOVER_FROM_ENDPOINT}
-repo1-s3-uri-style=${WAL_RECOVER_FROM_S3_URI_STYLE:-path}
-repo1-path=${WAL_RECOVER_FROM_PATH:-/pgbackrest}
-
-[main]
-pg1-path=${PGDATA}
-pg1-port=5432
-EOF
-  chown postgres:postgres "$PGBACKREST_RECOVERY_S3_CONF"
-  chmod 0640 "$PGBACKREST_RECOVERY_S3_CONF"
 
   local restore_cmd="pgbackrest --config=${PGBACKREST_RECOVERY_S3_CONF} --stanza=main archive-get %f %p"
 

@@ -140,7 +140,11 @@ reset_bucket() {
   mc "mc rm -r --force local/${BUCKET} >/dev/null 2>&1; mc mb -p local/${BUCKET} >/dev/null"
 }
 
-# Run a one-off pgbackrest restore into a target volume.
+# Run a one-off pgbackrest restore into a target volume. Mirrors what
+# wrapper.sh's restore_from_pgbackrest_if_empty_volume does for empty-volume
+# PITR — writes a self-contained restore_command (using --config) and the
+# .pgbackrest_restored marker so the next container boot reuses the same
+# recovery conf without overlapping state.
 pgbackrest_restore_into() {
   local vol="$1" path="${2:-/pgbackrest}"
   docker run --rm --network "$NET" \
@@ -155,7 +159,19 @@ pgbackrest_restore_into() {
     -v "$vol:/var/lib/postgresql/data" \
     --entrypoint /bin/bash \
     "$IMAGE" \
-    -c 'chown -R postgres:postgres /var/lib/postgresql/data && chmod 0700 /var/lib/postgresql/data && gosu postgres pgbackrest --stanza=main --pg1-path=/var/lib/postgresql/data restore' \
+    -c 'set -e
+chown -R postgres:postgres /var/lib/postgresql/data
+chmod 0700 /var/lib/postgresql/data
+# Restore. --recovery-option overrides the restore_command pgbackrest would
+# otherwise write — we point it at the recovery conf wrapper.sh re-renders
+# on every boot, so archive-get during recovery never depends on env vars.
+gosu postgres pgbackrest --stanza=main --pg1-path=/var/lib/postgresql/data \
+  --recovery-option=restore_command="pgbackrest --config=/etc/pgbackrest/pgbackrest-recovery-source.conf --stanza=main archive-get %f %p" \
+  restore
+# Touch the marker so wrapper.sh treats this volume as already-restored
+# (matches the empty-volume restore-from-S3 path).
+touch /var/lib/postgresql/data/.pgbackrest_restored
+chown postgres:postgres /var/lib/postgresql/data/.pgbackrest_restored' \
     >/dev/null 2>&1
 }
 
