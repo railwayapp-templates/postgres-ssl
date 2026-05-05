@@ -497,6 +497,17 @@ bootstrap_pgbackrest_stanza() {
     # just reads it.
     repo_path=$(derive_pgbackrest_repo_path)
     export PGBACKREST_REPO1_PATH="$repo_path"
+
+    # Update the rendered pgbackrest.conf so SSH-driven pgbackrest invocations
+    # (mono's probePgbackrestInfo runs `gosu postgres pgbackrest info` over
+    # SSH and inherits no shell env from this subshell) see the per-cluster
+    # path. Without this rewrite the probe would read the conf's bootstrap
+    # path (=$WAL_ARCHIVE_PATH), find no backups under it, and fail the
+    # restore mutation with "No base backup has been taken yet".
+    if [ -f "$PGBACKREST_CONF_FILE" ]; then
+      sed -i "s|^repo1-path=.*|repo1-path=${repo_path}|" "$PGBACKREST_CONF_FILE"
+    fi
+
     echo "pgbackrest: using repo1-path=${repo_path}"
 
     if gosu postgres pgbackrest --stanza=main stanza-create; then
