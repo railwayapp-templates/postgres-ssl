@@ -404,10 +404,19 @@ apply_pgbackrest_archive_conf() {
   install -d -m 0750 -o postgres -g postgres "$PGBACKREST_CONFD_DIR"
 
   local archive_timeout="${POSTGRES_ARCHIVE_TIMEOUT:-60}"
+  # track_commit_timestamp lets pg_last_committed_xact() return the wall-clock
+  # time of the last commit. The PITR picker uses that as its upper bound:
+  # `recovery_target_time` only matches commit record timestamps, so on an
+  # idle DB the archive head keeps ticking with empty WAL while the latest
+  # reachable target stays pinned at the last commit. Without this GUC the
+  # picker falls back to lastArchivedAt and the user can pick an
+  # unreachable target. Requires a restart to take effect; the entrypoint
+  # rewrites this file on every boot, so first archive-enable picks it up.
   cat > "$PGBACKREST_ARCHIVE_CONF" <<EOF
 archive_mode = 'on'
 archive_command = '/usr/local/bin/pgbackrest-archive-push-wrapper.sh %p'
 archive_timeout = '${archive_timeout}'
+track_commit_timestamp = 'on'
 EOF
   chown postgres:postgres "$PGBACKREST_ARCHIVE_CONF"
   chmod 0640 "$PGBACKREST_ARCHIVE_CONF"
