@@ -82,45 +82,40 @@ fi
 # Backboard / frontend / template speak `WAL_ARCHIVE_*` (this service's own
 # destination bucket — write-only for this service) and `WAL_RECOVER_FROM_*`
 # (only on PITR-restored forks, points at source's bucket for read-during-
-# recovery). The translation below maps that contract onto pgBackRest's
-# native `PGBACKREST_REPO{1,2}_S3_*` so the rest of this script can stay
-# pgBackRest-shaped.
+# recovery). Neither is exported as PGBACKREST_REPO*_*: pgBackRest's option
+# resolution is command-line > env vars > config file > defaults, so a global
+# REPO1_* export silently overrides any --config we pass during recovery.
 #
-# Invariant: REPO1 = "where this service writes its WAL", always its own
-# bucket. REPO2, when present, = "read-only recovery source" only. No two
-# services ever share a destination bucket.
+# Instead, we materialise two non-overlapping config files and route every
+# pgbackrest invocation through one of them via --config:
 #
-# Two modes:
-#   - WAL_ARCHIVE_* only → standalone archiving service. REPO1 = own bucket.
-#   - WAL_ARCHIVE_* + WAL_RECOVER_FROM_* → PITR-restored fork, archives from
-#     boot to its own fresh bucket. REPO1 = own bucket (write), REPO2 =
-#     source bucket (read for archive-get during recovery). After promote
-#     REPO2 is unused (the fork's new timeline doesn't exist there) but
-#     stays configured — harmless, removing it would require a restart.
-if [ -n "${WAL_ARCHIVE_BUCKET:-}" ]; then
-  export PGBACKREST_REPO1_S3_BUCKET="$WAL_ARCHIVE_BUCKET"
-  export PGBACKREST_REPO1_S3_KEY="$WAL_ARCHIVE_KEY"
-  export PGBACKREST_REPO1_S3_KEY_SECRET="$WAL_ARCHIVE_SECRET"
-  export PGBACKREST_REPO1_S3_REGION="$WAL_ARCHIVE_REGION"
-  export PGBACKREST_REPO1_S3_ENDPOINT="$WAL_ARCHIVE_ENDPOINT"
-  export PGBACKREST_REPO1_PATH="${WAL_ARCHIVE_PATH:-/pgbackrest}"
-fi
+#   /etc/pgbackrest/pgbackrest.conf — rendered by render_pgbackrest_conf.
+#     Has the service's own archive bucket as repo1. archive_command,
+#     stanza-create, and the watcher's backup all read this and only this.
+#
+#   /etc/pgbackrest/pgbackrest-recovery-source.conf — written by
+#     restore_from_pgbackrest_if_empty_volume and re-rendered by
+#     configure_pgbackrest_recovery on every boot when WAL_RECOVER_FROM_*
+#     is set. Has source's read-only bucket as repo1 (numbering is per-
+#     config). The persisted restore_command in postgresql.auto.conf
+#     references this file via --config, so archive-get during recovery
+#     reads source's bucket without leaking into archive_command.
+#
+# This isolation is load-bearing: pgBackRest 2.58's archive-push fans out
+# to every configured repo with no per-call scoping. A fork that has both
+# its own bucket and source's bucket configured in the same pgbackrest
+# would push every WAL to source's read-only bucket, fail with 403, and
+# silently degrade the new service's PITR window.
+#
+# The watcher and archive-push wrapper set PGBACKREST_REPO1_PATH locally
+# from the .pgbackrest_repo_path marker — that's a per-call override of
+# the path within the service's own repo1, not a cross-repo conflict.
 
-if [ -n "${WAL_RECOVER_FROM_BUCKET:-}" ]; then
-  export PGBACKREST_REPO2_S3_BUCKET="$WAL_RECOVER_FROM_BUCKET"
-  export PGBACKREST_REPO2_S3_KEY="$WAL_RECOVER_FROM_KEY"
-  export PGBACKREST_REPO2_S3_KEY_SECRET="$WAL_RECOVER_FROM_SECRET"
-  export PGBACKREST_REPO2_S3_REGION="$WAL_RECOVER_FROM_REGION"
-  export PGBACKREST_REPO2_S3_ENDPOINT="$WAL_RECOVER_FROM_ENDPOINT"
-  export PGBACKREST_REPO2_PATH="${WAL_RECOVER_FROM_PATH:-/pgbackrest}"
-fi
-
-# Helpers gate on whichever role is active. PGBACKREST_REPO1_S3_BUCKET acts
-# as the "any pgBackRest at all" gate (rendering pgbackrest.conf, running
-# stanza-create); WAL_ARCHIVE_BUCKET specifically gates writing
-# archive_mode=on / archive_command (this service archives outgoing WAL);
-# WAL_RECOVER_FROM_BUCKET + POSTGRES_RECOVERY_TARGET_TIME together gate
-# arming archive recovery on first boot.
+# Helpers gate on whichever role is active. WAL_ARCHIVE_BUCKET gates the
+# archiving path (rendering /etc/pgbackrest/pgbackrest.conf, archive_mode=on,
+# archive_command, the watcher, stanza-create); WAL_RECOVER_FROM_BUCKET +
+# POSTGRES_RECOVERY_TARGET_TIME together gate arming archive recovery on
+# first boot.
 #
 # Postgres config is delivered via a managed include directory (conf.d/)
 # rather than postgresql.auto.conf. ALTER SYSTEM rewrites auto.conf and
@@ -150,6 +145,11 @@ fi
 # -----------------------------------------------------------------------------
 
 PGBACKREST_CONF_FILE="/etc/pgbackrest/pgbackrest.conf"
+# Dedicated config holding repo2 (= source bucket) settings for archive-get
+# during recovery only. Lives under /etc/pgbackrest so the default conf
+# never has repo2 — archive_command + stanza-create read only the default
+# and can't fan out to source's read-only bucket.
+PGBACKREST_RECOVERY_S3_CONF="/etc/pgbackrest/pgbackrest-recovery-source.conf"
 PGBACKREST_CONFD_DIR="$PGDATA/conf.d"
 PGBACKREST_ARCHIVE_CONF="$PGBACKREST_CONFD_DIR/pgbackrest.conf"
 PGBACKREST_RECOVERY_CONF="$PGBACKREST_CONFD_DIR/pgbackrest-recovery.conf"
@@ -302,13 +302,14 @@ clamp() {
   echo "$v"
 }
 
-# Render /etc/pgbackrest/pgbackrest.conf with operator-policy defaults +
-# stanza definition (pg1-path, pg1-port). User-supplied options (S3 bucket,
-# region, key, secret, endpoint, repo path) are read by pgBackRest natively
-# from PGBACKREST_* env vars, so they don't need to be in the conf file.
-# Idempotent: rewritten on every boot when the gate var is set.
+# Render /etc/pgbackrest/pgbackrest.conf with the service's own archive
+# bucket as repo1 + operator-policy defaults + stanza definition. Recovery
+# (when needed) lives in a separate file written by
+# restore_from_pgbackrest_if_empty_volume / configure_pgbackrest_recovery,
+# never touching this file. Idempotent: rewritten on every boot when the
+# gate var is set.
 render_pgbackrest_conf() {
-  [ -z "$PGBACKREST_REPO1_S3_BUCKET" ] && return 0
+  [ -z "${WAL_ARCHIVE_BUCKET:-}" ] && return 0
 
   mkdir -p /etc/pgbackrest
   # Only create the spool dir once $PGDATA is initialized; before initdb,
@@ -332,17 +333,10 @@ render_pgbackrest_conf() {
 
   echo "pgbackrest: detected ${cpus} vCPU; process-max push=${push_max} get=${get_max} backup=${backup_max} restore=${restore_max}"
 
-  # REPO2 (source bucket, read-only) is only needed while the fork is in
-  # recovery — restore_command pulls WAL via archive-get --repo=2. After
-  # promote (.pitr_configured marker), archive_command fires and pgBackRest
-  # 2.58's archive-push fans out to every configured repo with no way to
-  # scope; if repo2 stays in the config, every push tries source's read-only
-  # bucket and fails. Drop repo2 once recovery is done to keep push targeting
-  # only REPO1.
-  local repo2_block=""
-  if [ -n "${PGBACKREST_REPO2_S3_BUCKET:-}" ] && [ ! -f "$PGDATA/.pitr_configured" ]; then
-    repo2_block="repo2-type=s3"$'\n'
-  fi
+  # The default pgbackrest.conf only ever has repo1. Recovery (which needs
+  # repo2 to read source's bucket) uses a separate /etc/pgbackrest/pgbackrest-recovery.conf
+  # written by restore_from_pgbackrest_if_empty_volume, referenced via the
+  # restore_command's --config flag.
 
   # Retention is always scoped to REPO1 — every service writes only to its
   # own bucket. REPO2 (source bucket on a fork) is read-only for this
@@ -359,7 +353,14 @@ render_pgbackrest_conf() {
   cat > "$PGBACKREST_CONF_FILE" <<EOF
 [global]
 repo1-type=s3
-${repo2_block}log-level-console=info
+repo1-s3-bucket=${WAL_ARCHIVE_BUCKET}
+repo1-s3-key=${WAL_ARCHIVE_KEY}
+repo1-s3-key-secret=${WAL_ARCHIVE_SECRET}
+repo1-s3-region=${WAL_ARCHIVE_REGION}
+repo1-s3-endpoint=${WAL_ARCHIVE_ENDPOINT}
+repo1-s3-uri-style=${WAL_ARCHIVE_S3_URI_STYLE:-path}
+repo1-path=${WAL_ARCHIVE_PATH:-/pgbackrest}
+log-level-console=info
 log-level-file=off
 archive-async=y
 archive-push-queue-max=5GiB
@@ -532,6 +533,32 @@ configure_pgbackrest_recovery() {
   [ -z "$POSTGRES_RECOVERY_TARGET_TIME" ] && return 0
   [ ! -f "$POSTGRES_CONF_FILE" ] && return 0
 
+  # /etc/pgbackrest is rebuilt on every boot, so always re-render the
+  # recovery conf when WAL_RECOVER_FROM_* is set — postgres' restore_command
+  # references it whether the auto.conf was written by the wrapper's own
+  # pgbackrest restore or by an external one (e.g. test pgbackrest_restore_into).
+  install -d -m 0750 -o postgres -g postgres /etc/pgbackrest
+  cat > "$PGBACKREST_RECOVERY_S3_CONF" <<EOF
+[global]
+log-level-console=info
+log-level-file=off
+spool-path=${PGBACKREST_SPOOL_DIR}
+repo1-type=s3
+repo1-s3-bucket=${WAL_RECOVER_FROM_BUCKET}
+repo1-s3-key=${WAL_RECOVER_FROM_KEY}
+repo1-s3-key-secret=${WAL_RECOVER_FROM_SECRET}
+repo1-s3-region=${WAL_RECOVER_FROM_REGION}
+repo1-s3-endpoint=${WAL_RECOVER_FROM_ENDPOINT}
+repo1-s3-uri-style=${WAL_RECOVER_FROM_S3_URI_STYLE:-path}
+repo1-path=${WAL_RECOVER_FROM_PATH:-/pgbackrest}
+
+[main]
+pg1-path=${PGDATA}
+pg1-port=5432
+EOF
+  chown postgres:postgres "$PGBACKREST_RECOVERY_S3_CONF"
+  chmod 0640 "$PGBACKREST_RECOVERY_S3_CONF"
+
   # The pgbackrest-restore path (empty-volume restore) handles recovery
   # staging itself — recovery.signal + recovery params come out of
   # `pgbackrest restore`, not our conf.d include. Skip the include-write
@@ -555,7 +582,7 @@ configure_pgbackrest_recovery() {
   ensure_pg_includes_confd
   install -d -m 0750 -o postgres -g postgres "$PGBACKREST_CONFD_DIR"
 
-  local restore_cmd="pgbackrest --stanza=main --repo=2 archive-get %f %p"
+  local restore_cmd="pgbackrest --config=${PGBACKREST_RECOVERY_S3_CONF} --stanza=main archive-get %f %p"
 
   # Escape single quotes per postgresql.conf rules (' -> '') so a value with
   # an embedded apostrophe can't break the conf file or smuggle a setting.
@@ -596,7 +623,47 @@ restore_from_pgbackrest_if_empty_volume() {
 
   install -d -m 0700 -o postgres -g postgres "$PGDATA"
 
-  if ! gosu postgres pgbackrest --stanza=main --repo=2 restore \
+  # Recovery uses a dedicated config that has only the source bucket as its
+  # one and only repo (named repo1 *within this file* — pgBackRest numbers
+  # repos per-config). The default /etc/pgbackrest/pgbackrest.conf is
+  # untouched and has only the service's own bucket, so archive_command
+  # (post-promote) and stanza-create can never fan out to source's bucket.
+  # The recovery conf is referenced by --config in both this restore call
+  # and in the restore_command pgBackRest writes into postgresql.auto.conf.
+  install -d -m 0750 -o postgres -g postgres /etc/pgbackrest
+  cat > "$PGBACKREST_RECOVERY_S3_CONF" <<EOF
+[global]
+log-level-console=info
+log-level-file=off
+spool-path=${PGBACKREST_SPOOL_DIR}
+repo1-type=s3
+repo1-s3-bucket=${WAL_RECOVER_FROM_BUCKET}
+repo1-s3-key=${WAL_RECOVER_FROM_KEY}
+repo1-s3-key-secret=${WAL_RECOVER_FROM_SECRET}
+repo1-s3-region=${WAL_RECOVER_FROM_REGION}
+repo1-s3-endpoint=${WAL_RECOVER_FROM_ENDPOINT}
+repo1-s3-uri-style=${WAL_RECOVER_FROM_S3_URI_STYLE:-path}
+repo1-path=${WAL_RECOVER_FROM_PATH:-/pgbackrest}
+
+[main]
+pg1-path=${PGDATA}
+pg1-port=5432
+EOF
+  chown postgres:postgres "$PGBACKREST_RECOVERY_S3_CONF"
+  chmod 0640 "$PGBACKREST_RECOVERY_S3_CONF"
+
+  # restore_command persisted in postgresql.auto.conf — references the
+  # recovery conf so archive-get during replay reads from the source
+  # bucket without touching the default config.
+  local recovery_restore_cmd="pgbackrest --config=${PGBACKREST_RECOVERY_S3_CONF} --stanza=main archive-get %f %p"
+
+  # --pg1-path is taken from $PGDATA so this works in restore-only mode too,
+  # where render_pgbackrest_conf has been called but didn't include repo2.
+  if ! gosu postgres pgbackrest --config="$PGBACKREST_RECOVERY_S3_CONF" \
+       --stanza=main \
+       --pg1-path="$PGDATA" \
+       --recovery-option=restore_command="$recovery_restore_cmd" \
+       restore \
        --type=time --target="$POSTGRES_RECOVERY_TARGET_TIME" \
        --target-action=promote; then
     echo "pgbackrest: restore from source bucket failed; fix env vars (WAL_RECOVER_FROM_*, POSTGRES_RECOVERY_TARGET_TIME) and redeploy" >&2
@@ -605,6 +672,7 @@ restore_from_pgbackrest_if_empty_volume() {
 
   touch "$PGBACKREST_RESTORED_MARKER"
   chown postgres:postgres "$PGBACKREST_RESTORED_MARKER" 2>/dev/null || true
+
   echo "pgbackrest: restore complete; postgres will replay forward to ${POSTGRES_RECOVERY_TARGET_TIME} and promote on first start"
 }
 
