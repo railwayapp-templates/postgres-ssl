@@ -702,19 +702,19 @@ restore_from_pgbackrest_if_empty_volume
 clear_pgbackrest_state_if_disabled
 apply_pgbackrest_archive_conf
 configure_pgbackrest_recovery
+
+# Unset PG* libpq env vars BEFORE forking pgbackrest's stanza-create / watcher
+# subshells. Customer-set PGHOST=${{ Postgres.RAILWAY_PRIVATE_DOMAIN }} (a
+# common app-side pattern) leaks into pgbackrest's libpq calls — pgbackrest
+# then tries to connect to itself via the privnet domain and times out
+# (`unable to find primary cluster`). A local-only connection is what we want
+# from inside the container; clearing PGHOST/PGPORT lets libpq fall back to
+# the Unix socket.
+unset PGHOST
+unset PGPORT
+
 bootstrap_pgbackrest_stanza
 fork_pgbackrest_backup_watcher
-
-# unset PGHOST to force psql to use Unix socket path
-# this is specific to Railway and allows
-# us to use PGHOST after the init
-unset PGHOST
-
-## unset PGPORT also specific to Railway
-## since postgres checks for validity of
-## the value in PGPORT we unset it in case
-## it ends up being empty
-unset PGPORT
 
 # Call the entrypoint script with the
 # appropriate PGHOST & PGPORT and redirect
