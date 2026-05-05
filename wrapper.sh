@@ -82,43 +82,40 @@ fi
 # Backboard / frontend / template speak `WAL_ARCHIVE_*` (this service's own
 # destination bucket — write-only for this service) and `WAL_RECOVER_FROM_*`
 # (only on PITR-restored forks, points at source's bucket for read-during-
-# recovery). The translation below maps that contract onto pgBackRest's
-# native `PGBACKREST_REPO{1,2}_S3_*` so the rest of this script can stay
-# pgBackRest-shaped.
+# recovery). Neither is exported as PGBACKREST_REPO*_*: pgBackRest's option
+# resolution is command-line > env vars > config file > defaults, so a global
+# REPO1_* export silently overrides any --config we pass during recovery.
 #
-# Invariant: REPO1 = "where this service writes its WAL", always its own
-# bucket. REPO2, when present, = "read-only recovery source" only. No two
-# services ever share a destination bucket.
+# Instead, we materialise two non-overlapping config files and route every
+# pgbackrest invocation through one of them via --config:
 #
-# Two modes:
-#   - WAL_ARCHIVE_* only → standalone archiving service. REPO1 = own bucket.
-#   - WAL_ARCHIVE_* + WAL_RECOVER_FROM_* → PITR-restored fork, archives from
-#     boot to its own fresh bucket. REPO1 = own bucket (write), REPO2 =
-#     source bucket (read for archive-get during recovery). After promote
-#     REPO2 is unused (the fork's new timeline doesn't exist there) but
-#     stays configured — harmless, removing it would require a restart.
-# Neither WAL_ARCHIVE_* nor WAL_RECOVER_FROM_* is exported as
-# PGBACKREST_REPO*_*. pgBackRest's option resolution order is
-# command-line > env vars > config file > defaults; exporting REPO1_*
-# globally would override the recovery conf's repo1 settings (which point at
-# source's bucket) when pgbackrest restore reads env vars during the
-# restore-from-S3 path. Recovery's repo1 settings live in the dedicated
-# /etc/pgbackrest/pgbackrest-recovery-source.conf (referenced by --config),
-# and the service's own-bucket repo1 settings live in the rendered default
-# /etc/pgbackrest/pgbackrest.conf. Each pgbackrest invocation reads exactly
-# one of those files via its --config (or default) and gets a single,
-# coherent repo1.
+#   /etc/pgbackrest/pgbackrest.conf — rendered by render_pgbackrest_conf.
+#     Has the service's own archive bucket as repo1. archive_command,
+#     stanza-create, and the watcher's backup all read this and only this.
 #
-# The watcher and archive-push wrapper still set PGBACKREST_REPO1_PATH
-# locally from the .pgbackrest_repo_path marker — that's a per-call override
-# of the path within the service's own repo1, not a cross-repo conflict.
+#   /etc/pgbackrest/pgbackrest-recovery-source.conf — written by
+#     restore_from_pgbackrest_if_empty_volume and re-rendered by
+#     configure_pgbackrest_recovery on every boot when WAL_RECOVER_FROM_*
+#     is set. Has source's read-only bucket as repo1 (numbering is per-
+#     config). The persisted restore_command in postgresql.auto.conf
+#     references this file via --config, so archive-get during recovery
+#     reads source's bucket without leaking into archive_command.
+#
+# This isolation is load-bearing: pgBackRest 2.58's archive-push fans out
+# to every configured repo with no per-call scoping. A fork that has both
+# its own bucket and source's bucket configured in the same pgbackrest
+# would push every WAL to source's read-only bucket, fail with 403, and
+# silently degrade the new service's PITR window.
+#
+# The watcher and archive-push wrapper set PGBACKREST_REPO1_PATH locally
+# from the .pgbackrest_repo_path marker — that's a per-call override of
+# the path within the service's own repo1, not a cross-repo conflict.
 
-# Helpers gate on whichever role is active. PGBACKREST_REPO1_S3_BUCKET acts
-# as the "any pgBackRest at all" gate (rendering pgbackrest.conf, running
-# stanza-create); WAL_ARCHIVE_BUCKET specifically gates writing
-# archive_mode=on / archive_command (this service archives outgoing WAL);
-# WAL_RECOVER_FROM_BUCKET + POSTGRES_RECOVERY_TARGET_TIME together gate
-# arming archive recovery on first boot.
+# Helpers gate on whichever role is active. WAL_ARCHIVE_BUCKET gates the
+# archiving path (rendering /etc/pgbackrest/pgbackrest.conf, archive_mode=on,
+# archive_command, the watcher, stanza-create); WAL_RECOVER_FROM_BUCKET +
+# POSTGRES_RECOVERY_TARGET_TIME together gate arming archive recovery on
+# first boot.
 #
 # Postgres config is delivered via a managed include directory (conf.d/)
 # rather than postgresql.auto.conf. ALTER SYSTEM rewrites auto.conf and
