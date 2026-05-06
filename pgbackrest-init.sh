@@ -43,10 +43,28 @@ mkdir -p "$PGDATA/conf.d"
 chmod 0750 "$PGDATA/conf.d"
 
 archive_timeout="${POSTGRES_ARCHIVE_TIMEOUT:-60}"
+# track_commit_timestamp lets pg_last_committed_xact() return the wall-clock
+# time of the last commit. The PITR picker uses that as its upper bound:
+# `recovery_target_time` only matches commit record timestamps, so on an idle
+# DB the archive head keeps ticking with empty WAL while the latest reachable
+# target stays pinned at the last commit. Without this GUC the picker falls
+# back to the last full backup's stop time and the user gets a window pinned
+# 24+ hours behind real time on the default diff cadence.
+#
+# Mirrors wrapper.sh's apply_pgbackrest_archive_conf — that function returns
+# early when postgresql.conf doesn't exist yet (fresh-init pre-postmaster),
+# so this initdb-phase write is the first chance to seed the GUC for the
+# very first postmaster start. Without this, fresh PITR-enabled clusters
+# would boot once with track_commit_timestamp=off, take the first base
+# backup with no commit-ts data, and only pick up the GUC on the second
+# boot when wrapper.sh's idempotent rewrite runs against an existing
+# postgresql.conf — leaving a window where the picker can't compute a
+# tight ceiling.
 cat > "$PGDATA/conf.d/pgbackrest.conf" <<EOF
 archive_mode = 'on'
 archive_command = '/usr/local/bin/pgbackrest-archive-push-wrapper.sh %p'
 archive_timeout = '${archive_timeout}'
+track_commit_timestamp = 'on'
 EOF
 chmod 0640 "$PGDATA/conf.d/pgbackrest.conf"
 
