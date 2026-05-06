@@ -55,6 +55,11 @@ GAP_MARKER="$PGDATA/.pgbackrest_gap_pending"
 # defaults are conservative; nothing user-facing advertises these knobs.
 POLL_INTERVAL_SECONDS="${WAL_BACKUP_POLL_INTERVAL_SECONDS:-60}"
 
+# Until the first full lands the loop polls on a tighter cadence so a race
+# with wrapper.sh's bootstrap stanza-create (or a slow first postmaster
+# bind) doesn't cost a full minute per retry. After that, normal cadence.
+INITIAL_POLL_SECONDS="${WAL_BACKUP_INITIAL_POLL_SECONDS:-5}"
+
 # Failures must have been quiescent for this long before a gap-recovery backup
 # fires. Hard failures often resolve and re-fail (intermittent S3, half-rotated
 # creds); without the grace the watcher burns one full per flap.
@@ -165,11 +170,15 @@ decide_action() {
   last_full_failed=$(read_state last_full_failed_count)
   : "${last_full_failed:=0}"
 
-  # NEEDS_INITIAL_BACKUP — archiving has produced any segments, no full on record.
-  if [ -z "$last_full" ] && [ "$ARCHIVED_COUNT" -gt 0 ]; then
+  # NEEDS_INITIAL_BACKUP — no full on record, take it now. pgbackrest backup
+  # brackets pg_backup_start/stop and waits for the closing WAL to archive
+  # before declaring success, so a broken archive_command fails the backup
+  # loudly instead of producing an unrestorable base — no need to gate on
+  # "archive-push has worked once". Earlier the gate cost 60-120s of dead
+  # time on idle DBs (heartbeat → archive_timeout → archive-push cycle).
+  if [ -z "$last_full" ]; then
     echo "full"; return 0
   fi
-  [ -z "$last_full" ] && return 0  # archiving hasn't started, wait
 
   # Gap recovery — explicit drop marker OR failed_count grew since last full.
   # Either signal indicates archive-push had problems since the last
@@ -246,10 +255,14 @@ sync_repo_path_from_marker() {
 
 sync_repo_path_from_marker
 
-log "starting (poll=${POLL_INTERVAL_SECONDS}s, full=${FULL_INTERVAL_HOURS}h, diff=${DIFF_INTERVAL_HOURS}h, gap_grace=${GAP_RESOLVED_GRACE_SECONDS}s, repo1-path=${PGBACKREST_REPO1_PATH:-unset})"
+log "starting (poll=${POLL_INTERVAL_SECONDS}s, initial_poll=${INITIAL_POLL_SECONDS}s, full=${FULL_INTERVAL_HOURS}h, diff=${DIFF_INTERVAL_HOURS}h, gap_grace=${GAP_RESOLVED_GRACE_SECONDS}s, repo1-path=${PGBACKREST_REPO1_PATH:-unset})"
 
 while true; do
   sync_repo_path_from_marker
   watcher_iteration
-  sleep "$POLL_INTERVAL_SECONDS"
+  if [ -z "$(read_state last_full_at)" ]; then
+    sleep "$INITIAL_POLL_SECONDS"
+  else
+    sleep "$POLL_INTERVAL_SECONDS"
+  fi
 done
