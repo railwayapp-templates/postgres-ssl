@@ -347,7 +347,10 @@ render_pgbackrest_conf() {
   # service; source owns its own retention. pgbackrest expire runs after
   # every backup. repo1-retention-archive is left to pgBackRest's default
   # (= retention-full), which keeps WAL needed for the most recent N fulls.
-  local retention_full="${WAL_BACKUP_RETENTION_FULL:-4}"
+  # Default retention: 7 daily fulls = 7-day PITR window, matching the
+  # default WAL retention. retention-diff stays at 14 in case an operator
+  # enables diff cadence; the value is harmless when DIFF_INTERVAL_HOURS=0.
+  local retention_full="${WAL_BACKUP_RETENTION_FULL:-7}"
   local retention_diff="${WAL_BACKUP_RETENTION_DIFF:-14}"
   local retention_block=""
   if [ -n "${WAL_ARCHIVE_BUCKET:-}" ]; then
