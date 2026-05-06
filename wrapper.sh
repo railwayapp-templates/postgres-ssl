@@ -716,6 +716,41 @@ clear_pgbackrest_state_if_disabled
 apply_pgbackrest_archive_conf
 configure_pgbackrest_recovery
 
+# After a pgbackrest restore the volume's certs/ dir is empty: pgbackrest only
+# backs up PGDATA (`/var/lib/postgresql/data/pgdata`), and certs live one
+# directory up at `/var/lib/postgresql/data/certs`. The cert-generation block
+# at the top of this script ran before restore — at that point PGDATA was
+# empty, so its "postgresql.conf exists AND cert missing → regenerate" branch
+# didn't fire. Re-check now that the volume is in its final state. We only
+# regenerate cert files; postgresql.conf is already restored from source and
+# already references these paths, so we don't re-run init-ssl.sh (which would
+# append duplicate ssl_*_file lines and clobber any custom
+# shared_preload_libraries with `'pg_stat_statements'`).
+if [ -f "$POSTGRES_CONF_FILE" ] && [ ! -f "$SSL_DIR/server.crt" ]; then
+  echo "Generating SSL certs after restore (cert files were not in pgbackrest backup)..."
+  sudo mkdir -p "$SSL_DIR"
+  sudo chown postgres:postgres "$SSL_DIR"
+  openssl req -new -x509 -days "${SSL_CERT_DAYS:-820}" -nodes -text \
+    -out "$SSL_DIR/root.crt" -keyout "$SSL_DIR/root.key" -subj "/CN=root-ca"
+  chmod og-rwx "$SSL_DIR/root.key"
+  openssl req -new -nodes -text \
+    -out "$SSL_DIR/server.csr" -keyout "$SSL_DIR/server.key" -subj "/CN=localhost"
+  chown postgres:postgres "$SSL_DIR/server.key"
+  chmod og-rwx "$SSL_DIR/server.key"
+  cat >| "$SSL_DIR/v3.ext" <<EOF
+[v3_req]
+authorityKeyIdentifier = keyid, issuer
+basicConstraints = critical, CA:TRUE
+keyUsage = digitalSignature, nonRepudiation, keyEncipherment, dataEncipherment
+subjectAltName = DNS:localhost
+EOF
+  openssl x509 -req -in "$SSL_DIR/server.csr" -extfile "$SSL_DIR/v3.ext" \
+    -extensions v3_req -text -days "${SSL_CERT_DAYS:-820}" \
+    -CA "$SSL_DIR/root.crt" -CAkey "$SSL_DIR/root.key" -CAcreateserial \
+    -out "$SSL_DIR/server.crt"
+  chown postgres:postgres "$SSL_DIR/server.crt"
+fi
+
 # Unset PG* libpq env vars BEFORE forking pgbackrest's stanza-create / watcher
 # subshells. Customer-set PGHOST=${{ Postgres.RAILWAY_PRIVATE_DOMAIN }} (a
 # common app-side pattern) leaks into pgbackrest's libpq calls — pgbackrest
