@@ -111,6 +111,28 @@ fi
 # from the .pgbackrest_repo_path marker — that's a per-call override of
 # the path within the service's own repo1, not a cross-repo conflict.
 
+# Accept ISO 8601 with T/Z (the format JavaScript's Date.toISOString()
+# emits) for POSTGRES_RECOVERY_TARGET_TIME and rewrite to the form
+# pgbackrest 2.x and Postgres recovery_target_time accept:
+# `YYYY-MM-DD HH:MM:SS[.msec][±HH[MM|:MM]]`. pgbackrest emits
+# `[029]: automatic backup set selection cannot be performed with
+# provided time '<...T...Z>'` on the T/Z form, so a customer or test
+# harness setting the var directly hits a confusing failure. Backboard's
+# createServiceFromPITR mutation already normalizes via
+# toPgbackrestTargetTime, but env-var-only paths bypass that.
+if [ -n "${POSTGRES_RECOVERY_TARGET_TIME:-}" ]; then
+  case "$POSTGRES_RECOVERY_TARGET_TIME" in
+    *T*Z|*T*z)
+      _orig="$POSTGRES_RECOVERY_TARGET_TIME"
+      POSTGRES_RECOVERY_TARGET_TIME="${POSTGRES_RECOVERY_TARGET_TIME//T/ }"
+      POSTGRES_RECOVERY_TARGET_TIME="${POSTGRES_RECOVERY_TARGET_TIME%[Zz]}+00"
+      export POSTGRES_RECOVERY_TARGET_TIME
+      echo "pgbackrest: normalized POSTGRES_RECOVERY_TARGET_TIME from ISO ('${_orig}') to pgbackrest format ('${POSTGRES_RECOVERY_TARGET_TIME}')"
+      unset _orig
+      ;;
+  esac
+fi
+
 # Helpers gate on whichever role is active. WAL_ARCHIVE_BUCKET gates the
 # archiving path (rendering /etc/pgbackrest/pgbackrest.conf, archive_mode=on,
 # archive_command, the watcher, stanza-create); WAL_RECOVER_FROM_BUCKET +
@@ -634,6 +656,10 @@ EOF
 # Container restart on an already-restored volume: $PGDATA is populated, so
 # the empty-PGDATA gate fails and we skip — Postgres starts normally.
 restore_from_pgbackrest_if_empty_volume() {
+  # Log gate state up front so post-mortems on "why did pgbackrest restore
+  # run a second time" don't require guessing. Cheap; one boot only.
+  echo "pgbackrest: restore-gate WAL_RECOVER_FROM_BUCKET=${WAL_RECOVER_FROM_BUCKET:+set} POSTGRES_RECOVERY_TARGET_TIME=${POSTGRES_RECOVERY_TARGET_TIME:+set} PG_VERSION=$([ -f "$PGDATA/PG_VERSION" ] && echo present || echo missing) RESTORED_MARKER=$([ -f "$PGBACKREST_RESTORED_MARKER" ] && echo present || echo missing) PGDATA=$PGDATA"
+
   [ -z "${WAL_RECOVER_FROM_BUCKET:-}" ] && return 0
   [ -z "${POSTGRES_RECOVERY_TARGET_TIME:-}" ] && return 0
   [ -f "$PGDATA/PG_VERSION" ] && return 0
