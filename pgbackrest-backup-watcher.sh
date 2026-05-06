@@ -200,14 +200,25 @@ decide_action() {
   fi
 }
 
-# Emits a few bytes of WAL with no table side-effects so archive_timeout=60
-# has something to flush on idle DBs. transactional=false bypasses txn
-# context — non-blocking, cheap. Failure is non-fatal: a temporarily blocked
-# emit just postpones the next segment switch by one tick.
+# Emits a tiny COMMIT record into WAL on each tick so:
+#   1. archive_timeout=60 has something to flush on idle DBs (the original
+#      reason for this heartbeat — keeps lastArchivedAt fresh).
+#   2. recovery_target_time has a stop point at most ~60s behind on idle
+#      DBs. recovery_target_time only matches commit/abort record
+#      timestamps; without a steady stream of commits, "restore to now"
+#      on an idle DB is unreachable and aborts recovery. A transactional
+#      heartbeat creates one commit per tick, so the latest reachable
+#      target stays within ~60s of wall-clock.
+#
+# `pg_logical_emit_message(transactional=true, ...)` runs the emit inside
+# an implicit transaction, producing a commit record with a real
+# timestamp. ~24 bytes of WAL per tick, ~1440 xids/day at the 60s default
+# — negligible against the 2B-xid wraparound budget. Failure is non-fatal:
+# a blocked emit just postpones the next stop point by one tick.
 emit_wal_heartbeat() {
   [ "${WAL_HEARTBEAT_DISABLED:-0}" = "1" ] && return 0
   psql -U postgres -tAXq -c \
-    "SELECT pg_logical_emit_message(false, 'rwy_pitr_heartbeat', '')" \
+    "SELECT pg_logical_emit_message(true, 'rwy_pitr_heartbeat', '')" \
     >/dev/null 2>&1 || true
 }
 
