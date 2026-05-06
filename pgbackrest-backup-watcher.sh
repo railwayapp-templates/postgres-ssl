@@ -200,14 +200,34 @@ decide_action() {
   fi
 }
 
-# Emits a few bytes of WAL with no table side-effects so archive_timeout=60
-# has something to flush on idle DBs. transactional=false bypasses txn
-# context — non-blocking, cheap. Failure is non-fatal: a temporarily blocked
-# emit just postpones the next segment switch by one tick.
+# Emits a tiny COMMIT record into WAL on each tick. Two purposes:
+#   1. archive_timeout=60 has something to flush → lastArchivedAt fresh
+#      (the original purpose of this heartbeat).
+#   2. recovery_target_time has a stop point at most ~60s behind. Postgres
+#      `recovery_target_time` only matches commit/abort record timestamps,
+#      never empty-segment switches or non-transactional WAL emits — so on
+#      an idle DB without commits, "restore to now" has nothing to stop on
+#      and recovery FATALs at end-of-WAL. Each heartbeat being a real
+#      commit creates a steady stream of stop points; the latest reachable
+#      target stays within ~60s of wall-clock no matter how quiet the DB.
+#
+# Equally important: `pg_last_committed_xact()` returns NULL until at
+# least one commit has happened since track_commit_timestamp was enabled.
+# On a fresh deploy of an idle DB the function stays null forever — the
+# backend's clamp then falls back to lastArchivedAt, which keeps
+# advancing with empty WAL and offers unreachable targets. Commit-
+# bearing heartbeats seed pg_last_committed_xact() within one tick of
+# cluster start.
+#
+# `pg_logical_emit_message(transactional=true, ...)` runs inside an
+# implicit transaction → real commit record with a wall-clock timestamp.
+# ~24 bytes of WAL per tick, ~1440 xids/day at the 60s default —
+# negligible against the 2B-xid wraparound budget. Failure is non-fatal:
+# a blocked emit postpones the next stop point by one tick.
 emit_wal_heartbeat() {
   [ "${WAL_HEARTBEAT_DISABLED:-0}" = "1" ] && return 0
   psql -U postgres -tAXq -c \
-    "SELECT pg_logical_emit_message(false, 'rwy_pitr_heartbeat', '')" \
+    "SELECT pg_logical_emit_message(true, 'rwy_pitr_heartbeat', '')" \
     >/dev/null 2>&1 || true
 }
 
