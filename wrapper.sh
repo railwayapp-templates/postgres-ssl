@@ -635,11 +635,28 @@ EOF
 # the empty-PGDATA gate fails and we skip — Postgres starts normally.
 restore_from_pgbackrest_if_empty_volume() {
   [ -z "${WAL_RECOVER_FROM_BUCKET:-}" ] && return 0
-  [ -z "${POSTGRES_RECOVERY_TARGET_TIME:-}" ] && return 0
   [ -f "$PGDATA/PG_VERSION" ] && return 0
   [ -f "$PGBACKREST_RESTORED_MARKER" ] && return 0
 
-  echo "pgbackrest: empty PGDATA + recovery target — restoring from source bucket (target=${POSTGRES_RECOVERY_TARGET_TIME})"
+  # POSTGRES_RECOVERY_TARGET_TIME may be empty when the backend dropped
+  # the target because no commit-time stop point exists past base backup
+  # (idle DB, no commits since track_commit_timestamp was enabled).
+  # In that case we use --type=immediate, which stops recovery as soon as
+  # the database is consistent (i.e. at the base backup's stop time) and
+  # replays no WAL beyond what's needed for that consistency. Why not
+  # --type=default (replay all available WAL)? Because end-of-WAL might
+  # contain commits we couldn't see at probe time — e.g. commits made
+  # before track_commit_timestamp was enabled would be visible in WAL
+  # but not via pg_last_committed_xact(). Replaying them would overshoot
+  # the user's selected target. Stopping at base backup is conservative:
+  # state ≤ base backup stop time ≤ user's target (we already validated
+  # earliestBackupAt ≤ target above), so we never give the user data they
+  # didn't ask for.
+  if [ -n "${POSTGRES_RECOVERY_TARGET_TIME:-}" ]; then
+    echo "pgbackrest: empty PGDATA + recovery target — restoring from source bucket (target=${POSTGRES_RECOVERY_TARGET_TIME})"
+  else
+    echo "pgbackrest: empty PGDATA + no target — restoring base backup from source bucket (immediate, no WAL replay)"
+  fi
 
   install -d -m 0700 -o postgres -g postgres "$PGDATA"
 
@@ -679,13 +696,22 @@ EOF
 
   # --pg1-path is taken from $PGDATA so this works in restore-only mode too,
   # where render_pgbackrest_conf has been called but didn't include repo2.
-  if ! gosu postgres pgbackrest --config="$PGBACKREST_RECOVERY_S3_CONF" \
-       --stanza=main \
-       --pg1-path="$PGDATA" \
-       --recovery-option=restore_command="$recovery_restore_cmd" \
-       restore \
-       --type=time --target="$POSTGRES_RECOVERY_TARGET_TIME" \
-       --target-action=promote; then
+  # Target set: --type=time + the user's target. Target empty: --type=immediate
+  # (consistent state at base backup stop, no WAL replay, never overshoots).
+  local restore_args=(
+    --config="$PGBACKREST_RECOVERY_S3_CONF"
+    --stanza=main
+    --pg1-path="$PGDATA"
+    --recovery-option=restore_command="$recovery_restore_cmd"
+    restore
+    --target-action=promote
+  )
+  if [ -n "${POSTGRES_RECOVERY_TARGET_TIME:-}" ]; then
+    restore_args+=(--type=time --target="$POSTGRES_RECOVERY_TARGET_TIME")
+  else
+    restore_args+=(--type=immediate)
+  fi
+  if ! gosu postgres pgbackrest "${restore_args[@]}"; then
     echo "pgbackrest: restore from source bucket failed; fix env vars (WAL_RECOVER_FROM_*, POSTGRES_RECOVERY_TARGET_TIME) and redeploy" >&2
     exit 1
   fi
@@ -693,7 +719,11 @@ EOF
   touch "$PGBACKREST_RESTORED_MARKER"
   chown postgres:postgres "$PGBACKREST_RESTORED_MARKER" 2>/dev/null || true
 
-  echo "pgbackrest: restore complete; postgres will replay forward to ${POSTGRES_RECOVERY_TARGET_TIME} and promote on first start"
+  if [ -n "${POSTGRES_RECOVERY_TARGET_TIME:-}" ]; then
+    echo "pgbackrest: restore complete; postgres will replay forward to ${POSTGRES_RECOVERY_TARGET_TIME} and promote on first start"
+  else
+    echo "pgbackrest: restore complete; postgres will promote at base backup consistency (no WAL replay)"
+  fi
 }
 
 # Fork the backup watcher. Subshell pattern matches bootstrap_pgbackrest_stanza
