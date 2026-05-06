@@ -634,6 +634,10 @@ EOF
 # Container restart on an already-restored volume: $PGDATA is populated, so
 # the empty-PGDATA gate fails and we skip — Postgres starts normally.
 restore_from_pgbackrest_if_empty_volume() {
+  # Log gate state up front so post-mortems on "why did pgbackrest restore
+  # run when I expected it to be skipped" don't require guessing.
+  echo "pgbackrest: restore-gate WAL_RECOVER_FROM_BUCKET=${WAL_RECOVER_FROM_BUCKET:+set} POSTGRES_RECOVERY_TARGET_TIME=${POSTGRES_RECOVERY_TARGET_TIME:+set} PG_VERSION=$([ -f "$PGDATA/PG_VERSION" ] && echo present || echo missing) RESTORED_MARKER=$([ -f "$PGBACKREST_RESTORED_MARKER" ] && echo present || echo missing) PGDATA=$PGDATA"
+
   [ -z "${WAL_RECOVER_FROM_BUCKET:-}" ] && return 0
   [ -z "${POSTGRES_RECOVERY_TARGET_TIME:-}" ] && return 0
   [ -f "$PGDATA/PG_VERSION" ] && return 0
