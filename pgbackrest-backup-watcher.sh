@@ -68,6 +68,16 @@ GAP_RESOLVED_GRACE_SECONDS="${WAL_BACKUP_GAP_RESOLVED_GRACE_SECONDS:-300}"
 FULL_INTERVAL_HOURS="${WAL_BACKUP_FULL_INTERVAL_HOURS:-168}"
 DIFF_INTERVAL_HOURS="${WAL_BACKUP_DIFF_INTERVAL_HOURS:-24}"
 
+# Resolved cadence in seconds. WAL_BACKUP_FULL_INTERVAL_SECONDS overrides
+# the hours setting — bash arithmetic precludes fractional hours, so the
+# e2e harness needs a second-level knob to exercise retention rollover
+# inside a single test cycle. 0 means "no periodic full" (gap-recovery
+# and NEEDS_INITIAL_BACKUP still fire); any positive value sets the
+# cadence. Defaults to FULL_INTERVAL_HOURS * 3600 when unset, preserving
+# existing prod behavior.
+FULL_INTERVAL_SECONDS="${WAL_BACKUP_FULL_INTERVAL_SECONDS:-$((FULL_INTERVAL_HOURS * 3600))}"
+DIFF_INTERVAL_SECONDS="${WAL_BACKUP_DIFF_INTERVAL_SECONDS:-$((DIFF_INTERVAL_HOURS * 3600))}"
+
 log() { echo "pgbackrest-watcher: $*"; }
 
 # State file is `key=value\n`-shaped: trivially read/written by bash without
@@ -159,16 +169,22 @@ run_backup() {
   return 1
 }
 
-# Returns the type to run on stdout, or empty if no action.
+# Sets DECIDED_ACTION to "full"|"diff"|"" (no action). Runs in the caller's
+# shell — not a subshell — so the diagnostic globals (LAST_FULL_DIAG,
+# GAP_MARKER_DIAG, LAST_FULL_FAILED_DIAG) survive for watcher_iteration to
+# log. Without these, a misbehaving cluster looks indistinguishable from a
+# correctly-idle one in production logs.
 decide_action() {
-  refresh_archiver_stats || return 0
-
+  DECIDED_ACTION=""
   local now; now=$(date +%s)
   local last_full last_diff last_full_failed
   last_full=$(read_state last_full_at)
   last_diff=$(read_state last_diff_at)
   last_full_failed=$(read_state last_full_failed_count)
   : "${last_full_failed:=0}"
+  LAST_FULL_DIAG="${last_full:-empty}"
+  LAST_FULL_FAILED_DIAG="$last_full_failed"
+  GAP_MARKER_DIAG=$([ -f "$GAP_MARKER" ] && echo "present" || echo "absent")
 
   # NEEDS_INITIAL_BACKUP — no full on record, take it now. pgbackrest backup
   # brackets pg_backup_start/stop and waits for the closing WAL to archive
@@ -177,7 +193,7 @@ decide_action() {
   # "archive-push has worked once". Earlier the gate cost 60-120s of dead
   # time on idle DBs (heartbeat → archive_timeout → archive-push cycle).
   if [ -z "$last_full" ]; then
-    echo "full"; return 0
+    DECIDED_ACTION="full"; return 0
   fi
 
   # Gap recovery — explicit drop marker OR failed_count grew since last full.
@@ -189,22 +205,23 @@ decide_action() {
 
   if [ "$has_gap" -eq 1 ]; then
     if gap_recovered "$now" "$LAST_FAILED_EPOCH"; then
-      echo "full"; return 0
+      DECIDED_ACTION="full"; return 0
     fi
     return 0  # gap still open, waiting for grace
   fi
 
-  # Periodic full.
-  if [ "$FULL_INTERVAL_HOURS" -gt 0 ] \
-     && [ "$now" -ge $((last_full + FULL_INTERVAL_HOURS * 3600)) ]; then
-    echo "full"; return 0
+  # Periodic full. FULL_INTERVAL_SECONDS=0 disables the periodic full while
+  # still allowing NEEDS_INITIAL_BACKUP (above) and gap-recovery to fire.
+  if [ "$FULL_INTERVAL_SECONDS" -gt 0 ] \
+     && [ "$now" -ge $((last_full + FULL_INTERVAL_SECONDS)) ]; then
+    DECIDED_ACTION="full"; return 0
   fi
 
   # Periodic diff.
-  if [ "$DIFF_INTERVAL_HOURS" -gt 0 ]; then
+  if [ "$DIFF_INTERVAL_SECONDS" -gt 0 ]; then
     local diff_anchor="${last_diff:-$last_full}"
-    if [ "$now" -ge $((diff_anchor + DIFF_INTERVAL_HOURS * 3600)) ]; then
-      echo "diff"; return 0
+    if [ "$now" -ge $((diff_anchor + DIFF_INTERVAL_SECONDS)) ]; then
+      DECIDED_ACTION="diff"; return 0
     fi
   fi
 }
@@ -221,16 +238,31 @@ emit_wal_heartbeat() {
 }
 
 watcher_iteration() {
-  pg_isready -h 127.0.0.1 -p 5432 -U postgres -q 2>/dev/null || return 0
-  is_standby && return 0
+  if ! pg_isready -h 127.0.0.1 -p 5432 -U postgres -q 2>/dev/null; then
+    log "iteration skipped: pg_isready=fail (postgres not yet listening on TCP)"
+    return 0
+  fi
+  if is_standby; then
+    log "iteration skipped: standby"
+    return 0
+  fi
 
   emit_wal_heartbeat
 
-  local action
-  action=$(decide_action)
-  [ -z "$action" ] && return 0
+  if ! refresh_archiver_stats; then
+    log "iteration skipped: pg_stat_archiver query failed (transient psql error)"
+    return 0
+  fi
 
-  run_backup "$action" || true
+  decide_action
+  if [ -z "$DECIDED_ACTION" ]; then
+    # Surface why decide_action stayed silent so post-mortems on "watcher
+    # ran for N minutes and never took a backup" don't require guessing.
+    log "iteration: no action (last_full=${LAST_FULL_DIAG:-?}, archived=${ARCHIVED_COUNT:-?}, failed=${FAILED_COUNT:-?}, gap_marker=${GAP_MARKER_DIAG:-?}, last_full_failed=${LAST_FULL_FAILED_DIAG:-?})"
+    return 0
+  fi
+
+  run_backup "$DECIDED_ACTION" || true
 }
 
 # wrapper.sh forks us unconditionally; bail silently if archiving isn't on.
@@ -255,7 +287,7 @@ sync_repo_path_from_marker() {
 
 sync_repo_path_from_marker
 
-log "starting (poll=${POLL_INTERVAL_SECONDS}s, initial_poll=${INITIAL_POLL_SECONDS}s, full=${FULL_INTERVAL_HOURS}h, diff=${DIFF_INTERVAL_HOURS}h, gap_grace=${GAP_RESOLVED_GRACE_SECONDS}s, repo1-path=${PGBACKREST_REPO1_PATH:-unset})"
+log "starting (poll=${POLL_INTERVAL_SECONDS}s, initial_poll=${INITIAL_POLL_SECONDS}s, full=${FULL_INTERVAL_SECONDS}s, diff=${DIFF_INTERVAL_SECONDS}s, gap_grace=${GAP_RESOLVED_GRACE_SECONDS}s, repo1-path=${PGBACKREST_REPO1_PATH:-unset})"
 
 while true; do
   sync_repo_path_from_marker
