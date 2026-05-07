@@ -681,6 +681,27 @@ EOF
   # bucket without touching the default config.
   local recovery_restore_cmd="pgbackrest --config=${PGBACKREST_RECOVERY_S3_CONF} --stanza=main archive-get %f %p"
 
+  # Pick the recovery target type. POSTGRES_RECOVERY_TARGET_XID, when set,
+  # wins over _TIME because it's the only target type postgres can match
+  # exactly on an idle source. recovery_target_time requires postgres to
+  # observe a WAL record with timestamp > target before declaring "target
+  # reached" and firing recovery_target_action=promote; on an idle DB no
+  # such record exists, so recovery FATALs with "recovery ended before
+  # configured recovery target was reached" and the cluster either loops
+  # the FATAL or hangs in hot_standby read-only mode. recovery_target_xid
+  # matches an exact transaction ID — applying the target xid's commit
+  # is unambiguously "target reached." The picker (mono's
+  # createServiceFromPITR mutation) sets _XID when it clamped target
+  # down to lastCommittedTxnAt, leaves it unset for arbitrary
+  # historical times.
+  local restore_type="time"
+  local restore_target="$POSTGRES_RECOVERY_TARGET_TIME"
+  if [ -n "${POSTGRES_RECOVERY_TARGET_XID:-}" ]; then
+    restore_type="xid"
+    restore_target="$POSTGRES_RECOVERY_TARGET_XID"
+    echo "pgbackrest: using recovery_target_xid=${POSTGRES_RECOVERY_TARGET_XID} (idle-source-safe; target-time fallback would FATAL on no-record-after-target)"
+  fi
+
   # --pg1-path is taken from $PGDATA so this works in restore-only mode too,
   # where render_pgbackrest_conf has been called but didn't include repo2.
   if ! gosu postgres pgbackrest --config="$PGBACKREST_RECOVERY_S3_CONF" \
@@ -688,9 +709,9 @@ EOF
        --pg1-path="$PGDATA" \
        --recovery-option=restore_command="$recovery_restore_cmd" \
        restore \
-       --type=time --target="$POSTGRES_RECOVERY_TARGET_TIME" \
+       --type="$restore_type" --target="$restore_target" \
        --target-action=promote; then
-    echo "pgbackrest: restore from source bucket failed; fix env vars (WAL_RECOVER_FROM_*, POSTGRES_RECOVERY_TARGET_TIME) and redeploy" >&2
+    echo "pgbackrest: restore from source bucket failed; fix env vars (WAL_RECOVER_FROM_*, POSTGRES_RECOVERY_TARGET_TIME, POSTGRES_RECOVERY_TARGET_XID) and redeploy" >&2
     exit 1
   fi
 
