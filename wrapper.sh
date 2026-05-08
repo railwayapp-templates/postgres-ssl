@@ -524,6 +524,33 @@ bootstrap_pgbackrest_stanza() {
     else
       echo "pgbackrest: stanza-create failed (will retry on next boot)" >&2
     fi
+
+    # Emit one tiny committed transaction so pg_last_committed_xact() returns
+    # a real timestamp from the very first probe. Without this, a freshly
+    # (re)booted primary with no user activity reports lastCommittedTxnAt=NULL
+    # and the PITR picker has no commit-time ceiling at all — track_commit_timestamp
+    # only records timestamps for commits observed after it was enabled, and a
+    # cluster that boots and sits idle has no such commits. The picker is
+    # contractually forbidden from inferring a ceiling from archive-head times
+    # (those advance with empty heartbeat segments and are not reachable by
+    # recovery_target_time), so without a warmup the picker would fall back to
+    # latestBackupAt, which on default cadence (WAL_BACKUP_DIFF_INTERVAL_HOURS=24)
+    # can lag real time by up to a day even though WAL is being archived and
+    # fully restorable second-by-second. pg_logical_emit_message(transactional=true,
+    # ...) writes a LOGICAL_MESSAGE record inside an autocommitted txn — one
+    # XACT_COMMIT in WAL, recorded by track_commit_timestamp, no schema impact,
+    # idempotent across reboots. Skipped during recovery: PITR-restored clusters
+    # replay XACT_COMMIT records as part of recovery, so post-promote
+    # pg_last_committed_xact() already returns the source's last commit time.
+    if [ "$(gosu postgres psql -h 127.0.0.1 -U postgres -d postgres -tAc 'SELECT pg_is_in_recovery()' 2>/dev/null)" = "f" ]; then
+      if gosu postgres psql -h 127.0.0.1 -U postgres -d postgres -tAc \
+           "SELECT pg_logical_emit_message(true, 'railway-pitr-warmup', now()::text)" \
+           >/dev/null 2>&1; then
+        echo "pgbackrest: PITR warmup commit emitted (pg_last_committed_xact populated)"
+      else
+        echo "pgbackrest: PITR warmup commit failed; picker ceiling will stay null until first user commit" >&2
+      fi
+    fi
   ) &
 }
 
