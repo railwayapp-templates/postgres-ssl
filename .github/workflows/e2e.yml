@@ -41,10 +41,12 @@ jobs:
           cache-to: type=gha,scope=pg${{ matrix.pg_version }},mode=max
 
       - name: Run e2e harness
+        shell: bash
         env:
           PG_VERSION: ${{ matrix.pg_version }}
         run: |
           ./test/e2e.sh 2>&1 | tee "e2e-pg${PG_VERSION}.log"
+          exit "${PIPESTATUS[0]}"
 
       - name: Collect failure diagnostics
         if: failure()
