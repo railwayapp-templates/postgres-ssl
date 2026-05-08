@@ -708,23 +708,55 @@ t_pitr_happy_path() {
   fi
 
   ok t_pitr_happy_path
-  # leave restored container/volume around for the next sentinel test
-  echo "$rest_name $rest_vol" > "/tmp/pitr-restored-${PG_VERSION}"
-  docker rm -f "$src_name" >/dev/null
-  docker volume rm "$src_vol" >/dev/null
+  docker rm -f "$src_name" "$rest_name" >/dev/null
+  docker volume rm "$src_vol" "$rest_vol" >/dev/null
 }
 
 t_pitr_sentinel_blocks_retrigger() {
-  if [ ! -f "/tmp/pitr-restored-${PG_VERSION}" ]; then
-    note "skipping (run t_pitr_happy_path first)"
-    return
-  fi
-  read -r rest_name rest_vol < "/tmp/pitr-restored-${PG_VERSION}"
+  # Self-contained: own source, own first-restore, own restart-with-different-
+  # target. Previous version inherited /tmp/pitr-restored-${PG_VERSION} from
+  # t_pitr_happy_path and silently no-op'd if the file was missing — that
+  # phantom-pass is no longer possible (and the runner now ko's anything that
+  # exits without recording PASS/FAIL anyway), but rebuilding state in-test
+  # also makes this runnable in isolation, in any order.
+  setup_pitr_source >&2 \
+    || { ko t_pitr_sentinel_blocks_retrigger "setup_pitr_source failed"; return; }
+  read -r src_name src_vol < "/tmp/pitr-source-${PG_VERSION}"
+  local target; target=$(cat "/tmp/pitr-target-${PG_VERSION}")
   local src_path; src_path=$(pitr_source_path)
+  local rest_name=t-sentinel-${PG_VERSION}
+  local rest_vol=${rest_name}-vol
+  new_volume "$rest_vol"
 
-  docker exec "$rest_name" psql -U postgres -c "INSERT INTO pitrtest(id,marker) VALUES (100,'post-promote');" >/dev/null
+  if ! pgbackrest_restore_into "$rest_vol" "$src_path"; then
+    ko t_pitr_sentinel_blocks_retrigger "pgbackrest restore failed"; return
+  fi
+  docker rm -f "$rest_name" >/dev/null 2>&1 || true
+  # Boot 1: original target, recover + promote, insert a post-promote row.
+  docker run -d --name "$rest_name" --label postgres-ssl-e2e=1 --network "$NET" \
+    -e POSTGRES_PASSWORD=test \
+    -e "WAL_RECOVER_FROM_BUCKET=$BUCKET" \
+    -e "WAL_RECOVER_FROM_ENDPOINT=http://${MINIO}:9000" \
+    -e WAL_RECOVER_FROM_REGION=us-east-1 \
+    -e WAL_RECOVER_FROM_KEY=$MINIO_USER \
+    -e WAL_RECOVER_FROM_SECRET=$MINIO_PASS \
+    -e "WAL_RECOVER_FROM_PATH=$src_path" \
+    -e PGBACKREST_REPO1_S3_URI_STYLE=path \
+    -e "POSTGRES_RECOVERY_TARGET_TIME=$target" \
+    -v "$rest_vol:/var/lib/postgresql/data" \
+    "$IMAGE" >/dev/null
+  wait_for_pg "$rest_name" \
+    || { ko t_pitr_sentinel_blocks_retrigger "boot 1: restored pg did not start"; fail_dump t_pitr_sentinel_blocks_retrigger "$rest_name"; return; }
+  wait_for_promoted "$rest_name" \
+    || { ko t_pitr_sentinel_blocks_retrigger "boot 1: did not promote"; fail_dump t_pitr_sentinel_blocks_retrigger "$rest_name"; return; }
+  docker exec "$rest_name" psql -U postgres -c "INSERT INTO pitrtest(id,marker) VALUES (100,'post-promote');" >/dev/null \
+    || { ko t_pitr_sentinel_blocks_retrigger "post-promote insert failed"; return; }
   docker rm -f "$rest_name" >/dev/null
 
+  # Boot 2: change target to a far-past time. The .pitr_configured /
+  # .pgbackrest_restored markers must keep the wrapper from re-staging
+  # recovery — replaying again on a promoted timeline would corrupt the
+  # cluster. Verify by asserting the post-promote row survives.
   docker run -d --name "$rest_name" --label postgres-ssl-e2e=1 --network "$NET" \
     -e POSTGRES_PASSWORD=test \
     -e "WAL_RECOVER_FROM_BUCKET=$BUCKET" \
@@ -737,22 +769,29 @@ t_pitr_sentinel_blocks_retrigger() {
     -e "POSTGRES_RECOVERY_TARGET_TIME=2020-01-01 00:00:00+00" \
     -v "$rest_vol:/var/lib/postgresql/data" \
     "$IMAGE" >/dev/null
-  wait_for_pg "$rest_name" || { ko t_pitr_sentinel_blocks_retrigger "restart"; return; }
+  wait_for_pg "$rest_name" \
+    || { ko t_pitr_sentinel_blocks_retrigger "boot 2: pg did not start"; fail_dump t_pitr_sentinel_blocks_retrigger "$rest_name"; return; }
 
-  if ! docker exec "$rest_name" test -f /var/lib/postgresql/data/.pitr_configured; then
-    ko t_pitr_sentinel_blocks_retrigger ".pitr_configured marker not written"
+  # The sentinel marker is written by configure_pgbackrest_recovery's
+  # "previous PITR replay completed" branch. Either marker (.pitr_configured
+  # or .pgbackrest_restored) is enough to gate retrigger; the older
+  # configure_pgbackrest_recovery path uses .pitr_configured.
+  if ! docker exec "$rest_name" bash -c 'test -f /var/lib/postgresql/data/.pitr_configured || test -f /var/lib/postgresql/data/.pgbackrest_restored'; then
+    ko t_pitr_sentinel_blocks_retrigger "neither .pitr_configured nor .pgbackrest_restored marker present after boot 2"
+    fail_dump t_pitr_sentinel_blocks_retrigger "$rest_name"
     return
   fi
   local rows
   rows=$(docker exec "$rest_name" psql -U postgres -At -c "SELECT count(*) FROM pitrtest WHERE id=100")
-  if [ "$rows" -ne 1 ]; then
-    ko t_pitr_sentinel_blocks_retrigger "post-promote row should be preserved on restart; got $rows"
+  if [ "$rows" != "1" ]; then
+    ko t_pitr_sentinel_blocks_retrigger "post-promote row should be preserved on restart with different target; got $rows"
+    fail_dump t_pitr_sentinel_blocks_retrigger "$rest_name"
     return
   fi
+
   ok t_pitr_sentinel_blocks_retrigger
-  docker rm -f "$rest_name" >/dev/null
-  docker volume rm "$rest_vol" >/dev/null
-  rm -f "/tmp/pitr-restored-${PG_VERSION}"
+  docker rm -f "$rest_name" "$src_name" >/dev/null
+  docker volume rm "$rest_vol" "$src_vol" >/dev/null
 }
 
 t_empty_volume_restore_refuses_when_no_backup() {
@@ -3151,7 +3190,15 @@ for t in "${TESTS[@]}"; do
     ko "$t" "no such test"
     continue
   fi
+  before_pass=$PASS
+  before_fail=$FAIL
   "$t"
+  # Every test must end via ok() or ko(); a return without recording
+  # either is a phantom-pass landmine (e.g. silent skip on a missing
+  # state-file dependency). Convert to a hard failure so it can't hide.
+  if [ "$PASS" -eq "$before_pass" ] && [ "$FAIL" -eq "$before_fail" ]; then
+    ko "$t" "test exited without recording PASS or FAIL — likely a silent skip"
+  fi
 done
 
 echo
