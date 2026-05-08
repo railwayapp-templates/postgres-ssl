@@ -49,8 +49,12 @@ fail_dump() {
   echo "${R}--- failure detail (${label}) ---${N}" >&2
   for c in "$@"; do
     if docker ps -a --format '{{.Names}}' | grep -q "^${c}$"; then
-      echo "${R}--- docker logs ${c} (last 40) ---${N}" >&2
-      docker logs --tail 40 "$c" 2>&1 | sed 's/^/    /' >&2
+      local cstate
+      cstate=$(docker inspect -f 'status={{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}}' "$c" 2>/dev/null)
+      echo "${R}--- docker logs ${c} ($cstate) (last 60) ---${N}" >&2
+      docker logs --tail 60 "$c" 2>&1 | sed 's/^/    /' >&2
+    else
+      echo "${R}--- container ${c} not found in 'docker ps -a' (already removed?) ---${N}" >&2
     fi
   done
 }
