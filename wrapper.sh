@@ -606,11 +606,24 @@ EOF
 
   # Escape single quotes per postgresql.conf rules (' -> '') so a value with
   # an embedded apostrophe can't break the conf file or smuggle a setting.
-  local escaped_target="${POSTGRES_RECOVERY_TARGET_TIME//\'/\'\'}"
   local escaped_restore="${restore_cmd//\'/\'\'}"
+
+  # POSTGRES_RECOVERY_TARGET_XID, when set, wins over _TIME — same idle-
+  # source-safe rationale as restore_from_pgbackrest_if_empty_volume:
+  # recovery_target_time hangs/FATALs when no commit record exists past
+  # target on an idle DB, recovery_target_xid matches an exact commit.
+  # The picker emits _XID when it clamped to lastCommittedTxnAt.
+  local recovery_param
+  if [ -n "${POSTGRES_RECOVERY_TARGET_XID:-}" ]; then
+    local escaped_xid="${POSTGRES_RECOVERY_TARGET_XID//\'/\'\'}"
+    recovery_param="recovery_target_xid = '${escaped_xid}'"
+  else
+    local escaped_target="${POSTGRES_RECOVERY_TARGET_TIME//\'/\'\'}"
+    recovery_param="recovery_target_time = '${escaped_target}'"
+  fi
   cat > "$PGBACKREST_RECOVERY_CONF" <<EOF
 restore_command = '${escaped_restore}'
-recovery_target_time = '${escaped_target}'
+${recovery_param}
 recovery_target_action = 'promote'
 EOF
   chown postgres:postgres "$PGBACKREST_RECOVERY_CONF"
