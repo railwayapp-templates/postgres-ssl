@@ -49,8 +49,12 @@ fail_dump() {
   echo "${R}--- failure detail (${label}) ---${N}" >&2
   for c in "$@"; do
     if docker ps -a --format '{{.Names}}' | grep -q "^${c}$"; then
-      echo "${R}--- docker logs ${c} (last 40) ---${N}" >&2
-      docker logs --tail 40 "$c" 2>&1 | sed 's/^/    /' >&2
+      local cstate
+      cstate=$(docker inspect -f 'status={{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}}' "$c" 2>/dev/null)
+      echo "${R}--- docker logs ${c} ($cstate) (last 60) ---${N}" >&2
+      docker logs --tail 60 "$c" 2>&1 | sed 's/^/    /' >&2
+    else
+      echo "${R}--- container ${c} not found in 'docker ps -a' (already removed?) ---${N}" >&2
     fi
   done
 }
@@ -194,12 +198,26 @@ run_archiving_pg() {
     "$IMAGE" >/dev/null
 }
 
-# Wait for postgres to accept connections.
+# Wait for postgres to accept connections. 120 s default — restored
+# clusters need pgbackrest's archive-get to fetch + apply each WAL segment
+# during recovery, which adds tens of seconds under suite-load (multiple
+# concurrent docker-execs, MinIO contending for I/O). 60 s was the original
+# vanilla-boot ceiling and was tight even there; the bump is harmless for
+# fast paths (returns as soon as pg_isready succeeds) and load-bearing for
+# restore + recovery paths.
 wait_for_pg() {
-  local container="$1" deadline=$(($(date +%s) + 60))
+  local container="$1" deadline=$(($(date +%s) + 120))
   while [ "$(date +%s)" -lt "$deadline" ]; do
     if docker exec "$container" pg_isready -U postgres -q 2>/dev/null; then
       return 0
+    fi
+    # Bail early if the container has exited — no point polling a dead
+    # postmaster, and we want the test to fail-fast with an actionable
+    # log dump rather than burning the whole timeout.
+    local status
+    status=$(docker inspect -f '{{.State.Status}}' "$container" 2>/dev/null || echo "")
+    if [ "$status" = "exited" ]; then
+      return 1
     fi
     sleep 1
   done
@@ -214,7 +232,7 @@ wait_for_pg() {
 # wait_for_pg in tests that depend on the cluster being fully promoted
 # (e.g. a second boot must NOT re-stage recovery).
 wait_for_promoted() {
-  local container="$1" deadline=$(($(date +%s) + 60))
+  local container="$1" deadline=$(($(date +%s) + 120))
   while [ "$(date +%s)" -lt "$deadline" ]; do
     local in_rec
     in_rec=$(docker exec "$container" psql -U postgres -At -c "SELECT pg_is_in_recovery()" 2>/dev/null || echo "?")
@@ -587,15 +605,57 @@ setup_pitr_source() {
   source_path=$(docker exec "$name" cat /var/lib/postgresql/data/.pgbackrest_repo_path 2>/dev/null \
     || echo "/pgbackrest")
 
-  # Insert id=1 (before-target), capture target, insert id=2,3 (after).
+  # Insert id=1 (before-target), capture target, insert id=2 (post-target),
+  # capture the segment id=2's commit lives in, then insert id=3 + force
+  # switches.
+  #
+  # Sleeps are wider than they look: target_time gets `timestamptz(0)`-rounded
+  # to the second, and a target captured too close to the manual backup's
+  # stop_time can land < backup_stop_lsn's mapped time once postgres rounds.
+  # That trips "requested recovery stop point is before consistent recovery
+  # point" on restore. 4 s pre-target + 4 s post-target keeps target safely
+  # inside the post-backup WAL window even with sub-second jitter.
   docker exec "$name" psql -U postgres -c "INSERT INTO pitrtest(id,marker) VALUES (1,'before');" >/dev/null
-  sleep 2
+  sleep 4
   local target
   target=$(docker exec "$name" psql -U postgres -At -c "SELECT now()::timestamptz(0)")
-  sleep 2
-  docker exec "$name" psql -U postgres -c "INSERT INTO pitrtest(id,marker) VALUES (2,'after');" >/dev/null
-  docker exec "$name" psql -U postgres -c "INSERT INTO pitrtest(id,marker) VALUES (3,'much-after'); SELECT pg_switch_wal(); SELECT pg_switch_wal();" >/dev/null
   sleep 4
+  docker exec "$name" psql -U postgres -c "INSERT INTO pitrtest(id,marker) VALUES (2,'after');" >/dev/null
+
+  # Capture the WAL segment id=2's commit lives in BEFORE issuing any
+  # switch. Recovery to `target` STOPS when it sees a record dated > target;
+  # id=2's commit is the first such record, and its segment must have
+  # shipped to the bucket by the time the restore boots. Probing
+  # pg_stat_archiver.last_archived_time (wall-clock) is unsound here —
+  # an unrelated earlier segment finishing right then advances the wall-
+  # clock without proving the target-spanning segment has shipped.
+  local id2_segment
+  id2_segment=$(docker exec "$name" psql -U postgres -At -c \
+    "SELECT pg_walfile_name(pg_current_wal_lsn())")
+
+  docker exec "$name" psql -U postgres -c "INSERT INTO pitrtest(id,marker) VALUES (3,'much-after'); SELECT pg_switch_wal(); SELECT pg_switch_wal();" >/dev/null
+
+  # Wait for last_archived_wal to reach (>=) id2_segment. Segment names
+  # are zero-padded hex on a single timeline, so bash string-compare is
+  # the right ordering.
+  local archive_deadline=$(($(date +%s) + 90)) shipped_id2=0
+  while [ "$(date +%s)" -lt "$archive_deadline" ]; do
+    local last_archived_wal
+    last_archived_wal=$(docker exec "$name" psql -U postgres -At -c \
+      "SELECT last_archived_wal FROM pg_stat_archiver" 2>/dev/null || echo "")
+    if [ -n "$last_archived_wal" ]; then
+      if [ "$last_archived_wal" = "$id2_segment" ] \
+         || [ "$last_archived_wal" \> "$id2_segment" ]; then
+        shipped_id2=1; break
+      fi
+    fi
+    docker exec "$name" psql -U postgres -c "SELECT pg_switch_wal();" >/dev/null 2>&1 || true
+    sleep 2
+  done
+  if [ "$shipped_id2" != 1 ]; then
+    echo "setup_pitr_source: WARN — segment $id2_segment (id=2 post-target commit) did not ship within 90 s; restore-side tests may FATAL with 'recovery ended before configured recovery target was reached'" >&2
+  fi
+
   echo "$target" > "/tmp/pitr-target-${PG_VERSION}"
   echo "$name $vol" > "/tmp/pitr-source-${PG_VERSION}"
   echo "$source_path" > "/tmp/pitr-source-path-${PG_VERSION}"
@@ -1256,7 +1316,14 @@ EOF
   # Generate WAL post-promote so the watcher has something to back up.
   docker exec "$fork_name" psql -U postgres -c "CREATE TABLE forkprobe(id int); INSERT INTO forkprobe VALUES (1); SELECT pg_switch_wal();" >/dev/null
 
-  if ! wait_for_watcher_backup "$fork_name" full 90; then
+  # Wait up to 180 s for the watcher's first full to land. Under suite load
+  # the fork's bootstrap_pgbackrest_stanza fork can race the watcher poll —
+  # the watcher's first few backup attempts return "has a stanza-create
+  # been performed?" until stanza-create catches up. Each retry is on a 5 s
+  # poll, so even with 5–10 retries the second-or-third try succeeds well
+  # within the bumped window. 90 s was tight enough that a slow stanza-
+  # create + a couple of retry windows tipped past it.
+  if ! wait_for_watcher_backup "$fork_name" full 180; then
     ko t_dual_repo_archives_to_own_bucket "watcher did not take initial full into fork bucket"
     fail_dump t_dual_repo_archives_to_own_bucket "$fork_name"
     return
@@ -2290,6 +2357,739 @@ t_watcher_reconciles_state_against_bucket_on_boot() {
   docker volume rm "$vol" >/dev/null
 }
 
+# ----- learnings from test-postgres-pitr (railway-side e2e harness) ----------
+#
+# These mirror flows from ../test-postgres-pitr/e2e/run-test.ts at the image
+# level. That suite exercises the same contract through the Railway mutation
+# pipeline (deploys real projects, drives load via libpq, asserts on the
+# restored cluster). The image-level versions below pin the same invariants
+# in seconds-not-minutes — same load-bearing assertions, no GraphQL/Temporal
+# surface area to flake against.
+#
+# Coverage map (PITR-harness flow → image-level test):
+#   idleRestore         → t_pitr_idle_source_target_time_fatals
+#                         t_pitr_idle_source_target_xid_succeeds
+#   gaps                → t_pitr_missing_wal_segment_fatals
+#   lifecycle           → t_lifecycle_enable_disable_reenable
+#   restoreThenRestore  → t_chain_restore_r1_to_r2
+
+# Set up an idle source: archiving postgres with exactly one row-insert
+# committed *after* the base backup, then several empty WAL switches (no
+# commits). The commit's xid lands in WAL replayed forward from the backup
+# checkpoint, so recovery_target_xid can match it; recovery_target_time
+# past the commit, however, has no later record to terminate on, which
+# is the FATAL the time-only test pins.
+#
+# Ordering matters: the schema (CREATE TABLE) is set up *before* the backup
+# so the restored cluster has the table at end of base restore; the INSERT
+# happens *after* the backup so the commit is in post-checkpoint WAL. This
+# is the key fix vs. taking the backup last — in that case, the xid commit
+# is in pre-checkpoint WAL (already applied via base restore, not in replay
+# stream), and recovery_target_xid never finds it → FATAL.
+#
+# Echoes "<src_name>|<src_vol>|<src_path>|<post_commit_target>|<commit_xid>"
+# on stdout. Caller splits on '|'. Designed so two related tests
+# (target_time-FATALs and target_xid-succeeds) can share one source setup
+# but each owns its own restore container/volume.
+setup_idle_source() {
+  local name="$1"
+  local vol="${name}-vol"
+  reset_bucket
+  new_volume "$vol"
+  docker rm -f "$name" >/dev/null 2>&1 || true
+  run_archiving_pg "$name" "$vol"
+  wait_for_pg "$name" >&2 || return 1
+  for _ in $(seq 1 15); do
+    docker logs "$name" 2>&1 | grep -q "stanza-create completed" && break
+    sleep 1
+  done
+
+  # Each docker exec below MUST succeed — silent failures here used to
+  # produce empty fields in the echoed metadata, which the calling test
+  # then passed verbatim to `docker run -e POSTGRES_RECOVERY_TARGET_TIME=`,
+  # the wrapper saw the env var as unset, skipped the pgbackrest restore
+  # path entirely, and ran initdb instead. Test then waited 120s for a
+  # FATAL that would never come.
+  docker exec "$name" psql -U postgres -c "CREATE TABLE pitrtest(id int, marker text);" >/dev/null \
+    || { echo "setup_idle_source: CREATE TABLE failed; container probably exited" >&2; return 1; }
+  local source_path
+  source_path=$(docker exec "$name" cat /var/lib/postgresql/data/.pgbackrest_repo_path 2>/dev/null) \
+    || { echo "setup_idle_source: read .pgbackrest_repo_path failed" >&2; return 1; }
+  if [ -z "$source_path" ]; then
+    source_path="/pgbackrest"
+  fi
+  docker exec -u postgres "$name" bash -c '
+    if [ -f /var/lib/postgresql/data/.pgbackrest_repo_path ]; then
+      export PGBACKREST_REPO1_PATH="$(cat /var/lib/postgresql/data/.pgbackrest_repo_path)"
+    else
+      export PGBACKREST_REPO1_PATH="$WAL_ARCHIVE_PATH"
+    fi
+    export PGBACKREST_REPO1_S3_BUCKET="$WAL_ARCHIVE_BUCKET"
+    export PGBACKREST_REPO1_S3_KEY="$WAL_ARCHIVE_KEY"
+    export PGBACKREST_REPO1_S3_KEY_SECRET="$WAL_ARCHIVE_SECRET"
+    export PGBACKREST_REPO1_S3_REGION="$WAL_ARCHIVE_REGION"
+    export PGBACKREST_REPO1_S3_ENDPOINT="$WAL_ARCHIVE_ENDPOINT"
+    pgbackrest --stanza=main backup --type=full
+  ' >/dev/null 2>&1 \
+    || { echo "setup_idle_source: pgbackrest manual full failed" >&2; return 1; }
+
+  # Single post-backup commit; capture its xid via xmin in a separate SELECT.
+  # Two-call pattern (vs. INSERT … RETURNING xmin) is deliberate — psql -At
+  # on a RETURNING statement still prints the command tag `INSERT 0 1`
+  # alongside the value, so a `$(…)` capture grabs both lines and the
+  # second one corrupts any env var it gets piped into. The follow-up
+  # SELECT cleanly returns just the xmin value.
+  docker exec "$name" psql -U postgres -c "INSERT INTO pitrtest VALUES (1, 'only-commit');" >/dev/null \
+    || { echo "setup_idle_source: post-backup INSERT failed" >&2; return 1; }
+  local commit_xid
+  commit_xid=$(docker exec "$name" psql -U postgres -At -c \
+    "SELECT xmin::text::bigint FROM pitrtest WHERE id=1") \
+    || { echo "setup_idle_source: xmin capture failed" >&2; return 1; }
+  if [ -z "$commit_xid" ] || [ "$commit_xid" = "0" ]; then
+    echo "setup_idle_source: captured xid is empty/zero (got '$commit_xid')" >&2
+    return 1
+  fi
+  echo "setup_idle_source: captured commit xid=${commit_xid} (post-backup INSERT)" >&2
+
+  # Force the commit's WAL segment to ship to S3 BEFORE we generate a string
+  # of empty switches — without this, the segment with the commit could lag
+  # behind the empty ones in archive (async push order isn't guaranteed
+  # under load) and the restore would miss it.
+  docker exec "$name" psql -U postgres -c "SELECT pg_switch_wal();" >/dev/null \
+    || { echo "setup_idle_source: pg_switch_wal failed" >&2; return 1; }
+  sleep 3
+
+  # Sleep so target NOW() lands strictly past the commit's WAL timestamp,
+  # then push several empty WAL switches. archive_command ships them; archive
+  # head advances past target while pg_last_committed_xact stays at the
+  # only insert's commit.
+  local target
+  target=$(docker exec "$name" psql -U postgres -At -c "SELECT now()::timestamptz(0)") \
+    || { echo "setup_idle_source: target capture failed" >&2; return 1; }
+  if [ -z "$target" ]; then
+    echo "setup_idle_source: target empty" >&2
+    return 1
+  fi
+  for _ in 1 2 3 4 5; do
+    docker exec "$name" psql -U postgres -c "SELECT pg_switch_wal();" >/dev/null \
+      || { echo "setup_idle_source: late pg_switch_wal failed" >&2; return 1; }
+    sleep 1
+  done
+  sleep 4  # let the last batch of empty segments ship to S3
+
+  echo "${name}|${vol}|${source_path}|${target}|${commit_xid}"
+}
+
+# I1. Idle source + target_time only → recovery FATALs loud.
+# Mirrors test-postgres-pitr/idleRestore for the no-clamp regression: when
+# the target is past the last commit but inside the archived WAL, postgres
+# walks WAL to archive head, never sees a record with commit time > target,
+# and FATALs with "recovery ended before configured recovery target was
+# reached". The wrapper.sh comment block at the recovery-target-type pick
+# explicitly documents this — this test pins it as observable behavior so a
+# future refactor that silently degrades (e.g. switches to
+# recovery_target_action='shutdown') trips the suite.
+t_pitr_idle_source_target_time_fatals() {
+  local src_name=t-idle-time-src-${PG_VERSION}
+  local rest_name=t-idle-time-rest-${PG_VERSION}
+  local rest_vol=${rest_name}-vol
+
+  local meta
+  meta=$(setup_idle_source "$src_name") \
+    || { ko t_pitr_idle_source_target_time_fatals "setup_idle_source failed"; return; }
+  local src_vol src_path target _xid
+  IFS='|' read -r _src_name src_vol src_path target _xid <<< "$meta"
+
+  new_volume "$rest_vol"
+  docker rm -f "$rest_name" >/dev/null 2>&1 || true
+  docker run -d --name "$rest_name" --label postgres-ssl-e2e=1 --network "$NET" \
+    -e POSTGRES_PASSWORD=test \
+    -e "WAL_RECOVER_FROM_BUCKET=$BUCKET" \
+    -e "WAL_RECOVER_FROM_ENDPOINT=http://${MINIO}:9000" \
+    -e WAL_RECOVER_FROM_REGION=us-east-1 \
+    -e WAL_RECOVER_FROM_KEY=$MINIO_USER \
+    -e WAL_RECOVER_FROM_SECRET=$MINIO_PASS \
+    -e "WAL_RECOVER_FROM_PATH=$src_path" \
+    -e PGBACKREST_REPO1_S3_URI_STYLE=path \
+    -e "POSTGRES_RECOVERY_TARGET_TIME=$target" \
+    -v "$rest_vol:/var/lib/postgresql/data" \
+    "$IMAGE" >/dev/null
+
+  # Wait up to 120s for the FATAL to land. pgbackrest restore needs a few
+  # seconds on a fresh volume; postgres then walks WAL through archive-get
+  # before declaring the target unreachable.
+  local deadline=$(($(date +%s) + 120)) found=0
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if docker logs "$rest_name" 2>&1 | grep -q "recovery ended before configured recovery target was reached"; then
+      found=1; break
+    fi
+    sleep 3
+  done
+  if [ "$found" != "1" ]; then
+    ko t_pitr_idle_source_target_time_fatals "expected 'recovery ended before configured recovery target was reached' FATAL within 120s"
+    fail_dump t_pitr_idle_source_target_time_fatals "$rest_name"
+    return
+  fi
+
+  ok t_pitr_idle_source_target_time_fatals
+  note "idle source + target_time only → recovery FATALs as documented"
+  docker rm -f "$src_name" "$rest_name" >/dev/null
+  docker volume rm "$src_vol" "$rest_vol" >/dev/null
+}
+
+# I2. POSTGRES_RECOVERY_TARGET_XID drives the full plumbing chain.
+# Pins four observable points along the wrapper → pgbackrest → postgres
+# pipeline so a regression in any layer trips the suite:
+#
+#   1. wrapper logs "using recovery_target_xid=<xid>"
+#      → bash branch in restore_from_pgbackrest_if_empty_volume fired
+#   2. pgbackrest restore line shows "--type=xid"
+#      → wrapper threaded $restore_type / $restore_target all the way to
+#        the pgbackrest invocation
+#   3. postgresql.auto.conf written by pgbackrest carries
+#      `recovery_target_xid = '<xid>'`
+#      → pgbackrest 2.58 honored --type=xid and emitted the right knob
+#        (catches a future pgbackrest version that silently drops the
+#        flag, or our pgbackrest config not threading --target-action
+#        through alongside)
+#   4. postgres logs "starting point-in-time recovery to XID <xid>"
+#      → postmaster parsed the recovery target and started archive
+#        recovery in xid mode (different log line than the time-mode
+#        "starting point-in-time recovery to <ts>")
+#
+# What this does NOT pin: that recovery actually terminates at target_xid
+# and promotes with the row contract honored. The xid → COMMIT-record
+# matching itself is postgres's responsibility, and reproducing it
+# deterministically against synthetic local WAL is brittle (the segment
+# carrying target_xid's COMMIT can lap behind the segment-name probe in
+# ways that don't reproduce in production where archive head is hours
+# ahead). End-to-end XID success is exercised by test-postgres-pitr's
+# `idleRestore` flow on a real Railway deployment — the layer where
+# postgres's behavior is what we're really measuring.
+t_pitr_target_xid_routes_xid_through_stack() {
+  setup_pitr_source >&2 || { ko t_pitr_target_xid_routes_xid_through_stack "setup_pitr_source failed"; return; }
+  read -r src_name src_vol < "/tmp/pitr-source-${PG_VERSION}"
+  local target; target=$(cat "/tmp/pitr-target-${PG_VERSION}")
+  local src_path; src_path=$(pitr_source_path)
+  local rest_name=t-xid-route-${PG_VERSION}
+  local rest_vol=${rest_name}-vol
+
+  local target_xid
+  target_xid=$(docker exec "$src_name" psql -U postgres -At -c \
+    "SELECT xmin::text::bigint FROM pitrtest WHERE id=1")
+  if [ -z "$target_xid" ] || [ "$target_xid" = "0" ]; then
+    ko t_pitr_target_xid_routes_xid_through_stack "captured xid empty/zero (got '$target_xid')"
+    return
+  fi
+
+  new_volume "$rest_vol"
+  docker rm -f "$rest_name" >/dev/null 2>&1 || true
+  docker run -d --name "$rest_name" --label postgres-ssl-e2e=1 --network "$NET" \
+    -e POSTGRES_PASSWORD=test \
+    -e "WAL_RECOVER_FROM_BUCKET=$BUCKET" \
+    -e "WAL_RECOVER_FROM_ENDPOINT=http://${MINIO}:9000" \
+    -e WAL_RECOVER_FROM_REGION=us-east-1 \
+    -e WAL_RECOVER_FROM_KEY=$MINIO_USER \
+    -e WAL_RECOVER_FROM_SECRET=$MINIO_PASS \
+    -e "WAL_RECOVER_FROM_PATH=$src_path" \
+    -e PGBACKREST_REPO1_S3_URI_STYLE=path \
+    -e "POSTGRES_RECOVERY_TARGET_TIME=$target" \
+    -e "POSTGRES_RECOVERY_TARGET_XID=$target_xid" \
+    -v "$rest_vol:/var/lib/postgresql/data" \
+    "$IMAGE" >/dev/null
+
+  # Don't wait for promote — recovery's xid-match termination is what
+  # idleRestore exercises end-to-end. We only care about the routing
+  # observations, all of which land in the first ~10 s of container life.
+  local deadline=$(($(date +%s) + 30)) saw_wrapper=0 saw_pgbackrest=0 saw_postgres=0
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    local logs
+    logs=$(docker logs "$rest_name" 2>&1)
+    echo "$logs" | grep -q "using recovery_target_xid=${target_xid}" && saw_wrapper=1
+    echo "$logs" | grep -qE "pgbackrest .*--type=xid"               && saw_pgbackrest=1
+    echo "$logs" | grep -qE "starting point-in-time recovery to XID ${target_xid}" && saw_postgres=1
+    [ "$saw_wrapper" = 1 ] && [ "$saw_pgbackrest" = 1 ] && [ "$saw_postgres" = 1 ] && break
+    sleep 2
+  done
+  if [ "$saw_wrapper" != 1 ]; then
+    ko t_pitr_target_xid_routes_xid_through_stack "wrapper did not log 'using recovery_target_xid=${target_xid}'"
+    fail_dump t_pitr_target_xid_routes_xid_through_stack "$rest_name"
+    return
+  fi
+  if [ "$saw_pgbackrest" != 1 ]; then
+    ko t_pitr_target_xid_routes_xid_through_stack "pgbackrest restore not invoked with --type=xid"
+    fail_dump t_pitr_target_xid_routes_xid_through_stack "$rest_name"
+    return
+  fi
+  if [ "$saw_postgres" != 1 ]; then
+    ko t_pitr_target_xid_routes_xid_through_stack "postgres did not log XID-mode recovery start"
+    fail_dump t_pitr_target_xid_routes_xid_through_stack "$rest_name"
+    return
+  fi
+
+  # Read postgresql.auto.conf out of the volume — it persists past
+  # container exit (recovery may FATAL on synthetic WAL, but the conf
+  # was written before that). pgbackrest writes auto.conf during
+  # `pgbackrest restore`, well before postgres starts. Catches a
+  # pgbackrest regression that drops `recovery_target_xid` while still
+  # writing the `recovery_target_action` line.
+  local auto_conf
+  auto_conf=$(docker run --rm -v "${rest_vol}:/data" alpine cat /data/postgresql.auto.conf 2>/dev/null || echo "")
+  if [ -z "$auto_conf" ]; then
+    ko t_pitr_target_xid_routes_xid_through_stack "postgresql.auto.conf missing or unreadable"
+    return
+  fi
+  if ! echo "$auto_conf" | grep -qE "^recovery_target_xid = '${target_xid}'$"; then
+    ko t_pitr_target_xid_routes_xid_through_stack "auto.conf missing 'recovery_target_xid = ${target_xid}'"
+    echo "  auto.conf:"
+    echo "$auto_conf" | sed 's/^/    /'
+    return
+  fi
+  # The time path's recovery_target_time MUST NOT also be present —
+  # both knobs in auto.conf is undefined behavior in postgres and would
+  # mean the wrapper failed to suppress _TIME when _XID was set.
+  if echo "$auto_conf" | grep -qE "^recovery_target_time = "; then
+    ko t_pitr_target_xid_routes_xid_through_stack "auto.conf carries both recovery_target_xid AND recovery_target_time — wrapper did not suppress _TIME"
+    return
+  fi
+
+  ok t_pitr_target_xid_routes_xid_through_stack
+  note "wrapper → pgbackrest → auto.conf (recovery_target_xid='${target_xid}') → postgres all routed XID; recovery termination covered upstream"
+  docker rm -f "$src_name" "$rest_name" >/dev/null
+  docker volume rm "$src_vol" "$rest_vol" >/dev/null
+}
+
+# G3. Restore over a WAL gap → loud refuse.
+# Mirrors test-postgres-pitr/gaps at the image level. Custom setup (not
+# setup_pitr_source) so we have tight control over which segment contains
+# the only post-target commit: that's the segment we delete to manufacture
+# a gap recovery has to walk through.
+#
+# Setup invariant: at the moment we delete, the LATEST archived segment is
+# the one carrying the post-target INSERT's commit, and it's the only
+# archived segment with a record dated > target. Recovery walks all
+# pre-target segments, hits the archive-get failure for the missing
+# segment (or runs out of WAL trying to find a record > target), and
+# FATALs. Either signature counts as loud refuse.
+t_pitr_missing_wal_segment_fatals() {
+  local src_name=t-walgap-src-${PG_VERSION}
+  local src_vol=${src_name}-vol
+  local rest_name=t-walgap-rest-${PG_VERSION}
+  local rest_vol=${rest_name}-vol
+  reset_bucket
+  new_volume "$src_vol"
+  docker rm -f "$src_name" >/dev/null 2>&1 || true
+  run_archiving_pg "$src_name" "$src_vol"
+  wait_for_pg "$src_name" || { ko t_pitr_missing_wal_segment_fatals "src no startup"; fail_dump t_pitr_missing_wal_segment_fatals "$src_name"; return; }
+  for _ in $(seq 1 15); do
+    docker logs "$src_name" 2>&1 | grep -q "stanza-create completed" && break
+    sleep 1
+  done
+
+  docker exec "$src_name" psql -U postgres -c "CREATE TABLE pitrtest(id int);" >/dev/null
+  if ! take_pgbackrest_backup "$src_name" full; then
+    ko t_pitr_missing_wal_segment_fatals "manual full failed"; fail_dump t_pitr_missing_wal_segment_fatals "$src_name"; return
+  fi
+  local src_path
+  src_path=$(docker exec "$src_name" cat /var/lib/postgresql/data/.pgbackrest_repo_path 2>/dev/null \
+    || echo "/pgbackrest")
+
+  # Pre-target inserts — each one + switch ships a segment with a commit
+  # whose time is < target. These segments stay in archive; recovery walks
+  # them fine.
+  docker exec "$src_name" psql -U postgres -c "INSERT INTO pitrtest VALUES (1); SELECT pg_switch_wal();" >/dev/null
+  sleep 2
+  docker exec "$src_name" psql -U postgres -c "INSERT INTO pitrtest VALUES (2); SELECT pg_switch_wal();" >/dev/null
+  sleep 3
+
+  # Capture target = NOW. Strictly after id=2's commit, strictly before
+  # id=3's commit (added next).
+  local target
+  target=$(docker exec "$src_name" psql -U postgres -At -c "SELECT now()::timestamptz(0)")
+  sleep 3
+
+  # Single post-target INSERT, then switch_wal so the segment carrying its
+  # commit ships and becomes the LATEST archived segment.
+  docker exec "$src_name" psql -U postgres -c "INSERT INTO pitrtest VALUES (3); SELECT pg_switch_wal();" >/dev/null
+
+  # Wait for archive head to advance past target. Probing pg_stat_archiver
+  # is deterministic; trust the wrapper to keep archive_command running.
+  local d=$(($(date +%s) + 60))
+  while [ "$(date +%s)" -lt "$d" ]; do
+    local last_archived
+    last_archived=$(docker exec "$src_name" psql -U postgres -At -c \
+      "SELECT last_archived_time::timestamptz(0) FROM pg_stat_archiver" 2>/dev/null || echo "")
+    if [ -n "$last_archived" ] && [ "$last_archived" \> "$target" ]; then
+      break
+    fi
+    docker exec "$src_name" psql -U postgres -c "SELECT pg_switch_wal();" >/dev/null 2>&1 || true
+    sleep 2
+  done
+
+  # Identify and delete the LATEST archived segment. By construction it
+  # contains id=3's commit (the only commit dated > target). Pre-target
+  # segments stay so backup-recovery can reach min_recovery_endpoint and
+  # the early WAL replay is well-formed; the gap is strictly at the
+  # post-target frontier.
+  local segments last
+  segments=$(mc "mc find local/${BUCKET}${src_path}/archive --name '00000001*.zst' 2>/dev/null | sort")
+  local n
+  n=$(echo "$segments" | grep -c .)
+  if [ "$n" -lt 3 ]; then
+    ko t_pitr_missing_wal_segment_fatals "expected ≥3 archived WAL segments in bucket; got $n"
+    return
+  fi
+  last=$(echo "$segments" | tail -1)
+  mc "mc rm '${last}'" >/dev/null
+  note "deleted latest segment $last (the only one with records > target)"
+
+  new_volume "$rest_vol"
+  docker rm -f "$rest_name" >/dev/null 2>&1 || true
+  docker run -d --name "$rest_name" --label postgres-ssl-e2e=1 --network "$NET" \
+    -e POSTGRES_PASSWORD=test \
+    -e "WAL_RECOVER_FROM_BUCKET=$BUCKET" \
+    -e "WAL_RECOVER_FROM_ENDPOINT=http://${MINIO}:9000" \
+    -e WAL_RECOVER_FROM_REGION=us-east-1 \
+    -e WAL_RECOVER_FROM_KEY=$MINIO_USER \
+    -e WAL_RECOVER_FROM_SECRET=$MINIO_PASS \
+    -e "WAL_RECOVER_FROM_PATH=$src_path" \
+    -e PGBACKREST_REPO1_S3_URI_STYLE=path \
+    -e "POSTGRES_RECOVERY_TARGET_TIME=$target" \
+    -v "$rest_vol:/var/lib/postgresql/data" \
+    "$IMAGE" >/dev/null
+
+  # Two acceptable failure signatures:
+  #   - pgbackrest's archive-get prints "WAL segment ... not found" and
+  #     postgres logs the corresponding "could not locate" / archive-get
+  #     fatal during recovery
+  #   - postgres FATALs "recovery ended before configured recovery target
+  #     was reached" if the deleted segment happened to be past the target
+  # Either is "loud refuse" — recovery did NOT silently promote on partial
+  # WAL. Wait up to 180s; archive-get retries a few times before giving up.
+  local deadline=$(($(date +%s) + 180)) found=0
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if docker logs "$rest_name" 2>&1 | grep -qE "(WAL file .* missing|archive-get.*FATAL|recovery ended before configured recovery target was reached|requested WAL segment.*has already been removed)"; then
+      found=1; break
+    fi
+    sleep 5
+  done
+  if [ "$found" != "1" ]; then
+    ko t_pitr_missing_wal_segment_fatals "expected loud-refuse log line for missing WAL segment; none found within 180s"
+    fail_dump t_pitr_missing_wal_segment_fatals "$rest_name"
+    return
+  fi
+
+  # Cluster must NOT be promoted with partial WAL — pg_is_in_recovery should
+  # be 't' (still trying) or psql should be unreachable. If it returns 'f',
+  # postgres silently promoted on incomplete WAL, which is a data-integrity
+  # bug we want to catch.
+  local in_rec
+  in_rec=$(docker exec "$rest_name" psql -U postgres -At -c "SELECT pg_is_in_recovery()" 2>/dev/null || echo "?")
+  if [ "$in_rec" = "f" ]; then
+    ko t_pitr_missing_wal_segment_fatals "cluster promoted despite missing WAL segment — silent data-integrity bug"
+    fail_dump t_pitr_missing_wal_segment_fatals "$rest_name"
+    return
+  fi
+
+  ok t_pitr_missing_wal_segment_fatals
+  note "missing WAL segment → loud refuse; cluster not promoted (pg_is_in_recovery='${in_rec}')"
+  docker rm -f "$src_name" "$rest_name" >/dev/null
+  docker volume rm "$src_vol" "$rest_vol" >/dev/null
+}
+
+# L1. enable → disable → re-enable lifecycle. Mirrors test-postgres-pitr's
+# `lifecycle` flow at the image level. Pins the round-trip property: every
+# disable cleans up state cleanly, every re-enable picks up where any other
+# fresh service would start (NEEDS_INITIAL_BACKUP, fresh full lands).
+# t_disable_cleanup covers half of this in isolation; this test exercises
+# the full cycle so a regression in the re-enable branch (e.g. a stale
+# .pgbackrest_backup_state surviving disable, suppressing the next full)
+# trips the suite.
+t_lifecycle_enable_disable_reenable() {
+  local name=t-lifecycle-${PG_VERSION}
+  local vol=${name}-vol
+  reset_bucket
+  new_volume "$vol"
+  docker rm -f "$name" >/dev/null 2>&1 || true
+
+  # Phase 1: enable + take initial full.
+  run_archiving_pg_fast_watcher "$name" "$vol"
+  wait_for_pg "$name" || { ko t_lifecycle_enable_disable_reenable "phase1 startup"; return; }
+  for _ in $(seq 1 15); do
+    docker logs "$name" 2>&1 | grep -q "stanza-create completed" && break
+    sleep 1
+  done
+  docker exec "$name" psql -U postgres -c "CREATE TABLE t(id int); INSERT INTO t VALUES (1); SELECT pg_switch_wal();" >/dev/null
+  wait_for_watcher_backup "$name" full 60 \
+    || { ko t_lifecycle_enable_disable_reenable "phase1 initial full"; fail_dump t_lifecycle_enable_disable_reenable "$name"; return; }
+
+  # Phase 2: disable. Restart with no WAL_ARCHIVE_*. Must come back archive_mode=off
+  # and have wiped the watcher state file (covered in detail by t_disable_cleanup).
+  docker rm -f "$name" >/dev/null
+  docker run -d --name "$name" --label postgres-ssl-e2e=1 --network "$NET" \
+    -e POSTGRES_PASSWORD=test \
+    -v "$vol:/var/lib/postgresql/data" \
+    "$IMAGE" >/dev/null
+  wait_for_pg "$name" || { ko t_lifecycle_enable_disable_reenable "phase2 startup"; return; }
+  local mode
+  mode=$(docker exec "$name" psql -U postgres -At -c "SHOW archive_mode")
+  assert_eq "$mode" "off" "archive_mode should be off after disable" \
+    || { ko t_lifecycle_enable_disable_reenable ""; return; }
+  if docker exec "$name" test -f /var/lib/postgresql/data/.pgbackrest_backup_state; then
+    ko t_lifecycle_enable_disable_reenable ".pgbackrest_backup_state must be wiped on disable so re-enable starts clean"
+    return
+  fi
+
+  # Write data while archiving is OFF — would form a gap if we restored, but
+  # here we're confirming the cluster keeps accepting writes.
+  docker exec "$name" psql -U postgres -c "INSERT INTO t VALUES (2);" >/dev/null
+
+  # Phase 3: re-enable against a fresh bucket (operator pointing at a new
+  # destination, the more common case). Watcher must take a fresh initial
+  # full — proving disable-cleanup didn't leave anything stale.
+  docker rm -f "$name" >/dev/null
+  reset_bucket
+  run_archiving_pg_fast_watcher "$name" "$vol"
+  wait_for_pg "$name" || { ko t_lifecycle_enable_disable_reenable "phase3 startup"; fail_dump t_lifecycle_enable_disable_reenable "$name"; return; }
+  mode=$(docker exec "$name" psql -U postgres -At -c "SHOW archive_mode")
+  assert_eq "$mode" "on" "archive_mode should be on after re-enable" \
+    || { ko t_lifecycle_enable_disable_reenable ""; return; }
+
+  for _ in $(seq 1 15); do
+    docker logs "$name" 2>&1 | grep -q "stanza-create completed" && break
+    sleep 1
+  done
+  docker exec "$name" psql -U postgres -c "INSERT INTO t VALUES (3); SELECT pg_switch_wal();" >/dev/null
+  if ! wait_for_watcher_backup "$name" full 90; then
+    ko t_lifecycle_enable_disable_reenable "phase3 watcher did not take fresh initial full after re-enable"
+    fail_dump t_lifecycle_enable_disable_reenable "$name"
+    return
+  fi
+
+  # Pre-disable rows survived (t.id 1+2); fresh bucket has its own full
+  # (verifies the cycle is truly fresh, not resuming the old archive).
+  local rows fulls
+  rows=$(docker exec "$name" psql -U postgres -At -c "SELECT count(*) FROM t")
+  assert_eq "$rows" "3" "t should have 3 rows preserved across the cycle" \
+    || { ko t_lifecycle_enable_disable_reenable ""; return; }
+  fulls=$(count_backups_of_type "$name" full)
+  assert_eq "$fulls" "1" "fresh bucket should have exactly 1 full after re-enable" \
+    || { ko t_lifecycle_enable_disable_reenable ""; return; }
+
+  ok t_lifecycle_enable_disable_reenable
+  note "enable → disable → re-enable round-trip; rows preserved, fresh full landed"
+  docker rm -f "$name" >/dev/null
+  docker volume rm "$vol" >/dev/null
+}
+
+# C1. Chain restore S → R1 → R2. Mirrors test-postgres-pitr's
+# restoreThenRestore. R1 is restored from S at T1 and archives to its own
+# bucket; R2 is restored from R1's bucket at T2 (T2 > T1) and archives to
+# yet another bucket. Pins:
+#   - R1's bucket is a complete archive (full + WAL) on its own — no
+#     implicit dependency on S.
+#   - R2 inherits S→R1's restore window (id=1 'before' from S, id=10 'on-r1'
+#     from R1) and applies R2's restore window (id=2,3 excluded by R1's T1,
+#     id=11 excluded by R2's T2).
+#   - Each restore promotes cleanly; chain invariants hold all the way down.
+t_chain_restore_r1_to_r2() {
+  setup_pitr_source >&2 || { ko t_chain_restore_r1_to_r2 "setup_pitr_source failed"; return; }
+  read -r src_name src_vol < "/tmp/pitr-source-${PG_VERSION}"
+  local target_t1; target_t1=$(cat "/tmp/pitr-target-${PG_VERSION}")
+  local src_path; src_path=$(pitr_source_path)
+
+  local r1_name=t-chain-r1-${PG_VERSION}
+  local r1_vol=${r1_name}-vol
+  local r1_bucket=pgbackrest-chain-r1
+  local r2_name=t-chain-r2-${PG_VERSION}
+  local r2_vol=${r2_name}-vol
+  local r2_bucket=pgbackrest-chain-r2
+
+  mc "mc rm -r --force local/${r1_bucket} >/dev/null 2>&1; mc mb -p local/${r1_bucket} >/dev/null"
+  mc "mc rm -r --force local/${r2_bucket} >/dev/null 2>&1; mc mb -p local/${r2_bucket} >/dev/null"
+  new_volume "$r1_vol"
+  docker rm -f "$r1_name" >/dev/null 2>&1 || true
+
+  # R1: restore from S at T1 + archive into its own bucket. Mirrors what the
+  # mono createServiceFromPITR mutation patches onto a forked service.
+  docker run -d --name "$r1_name" --label postgres-ssl-e2e=1 --network "$NET" \
+    -e POSTGRES_PASSWORD=test \
+    -e "WAL_RECOVER_FROM_BUCKET=$BUCKET" \
+    -e "WAL_RECOVER_FROM_ENDPOINT=http://${MINIO}:9000" \
+    -e WAL_RECOVER_FROM_REGION=us-east-1 \
+    -e WAL_RECOVER_FROM_KEY=$MINIO_USER \
+    -e WAL_RECOVER_FROM_SECRET=$MINIO_PASS \
+    -e "WAL_RECOVER_FROM_PATH=$src_path" \
+    -e "WAL_ARCHIVE_BUCKET=$r1_bucket" \
+    -e "WAL_ARCHIVE_ENDPOINT=http://${MINIO}:9000" \
+    -e WAL_ARCHIVE_REGION=us-east-1 \
+    -e WAL_ARCHIVE_KEY=$MINIO_USER \
+    -e WAL_ARCHIVE_SECRET=$MINIO_PASS \
+    -e WAL_ARCHIVE_PATH=/pgbackrest \
+    -e PGBACKREST_REPO1_S3_URI_STYLE=path \
+    -e "POSTGRES_RECOVERY_TARGET_TIME=$target_t1" \
+    -e WAL_BACKUP_POLL_INTERVAL_SECONDS=5 \
+    -v "$r1_vol:/var/lib/postgresql/data" \
+    "$IMAGE" >/dev/null
+  wait_for_pg "$r1_name" || { ko t_chain_restore_r1_to_r2 "R1 did not start"; fail_dump t_chain_restore_r1_to_r2 "$r1_name"; return; }
+  wait_for_promoted "$r1_name" || { ko t_chain_restore_r1_to_r2 "R1 did not promote"; fail_dump t_chain_restore_r1_to_r2 "$r1_name"; return; }
+
+  # Chain semantics check on R1: should have id=1 (before T1) and NOT id=2,3.
+  local r1_pre r1_post
+  r1_pre=$(docker exec "$r1_name" psql -U postgres -At -c "SELECT count(*) FROM pitrtest WHERE id=1")
+  r1_post=$(docker exec "$r1_name" psql -U postgres -At -c "SELECT count(*) FROM pitrtest WHERE id IN (2,3)")
+  assert_eq "$r1_pre" "1" "R1 should have id=1 inherited from S" || { ko t_chain_restore_r1_to_r2 ""; return; }
+  assert_eq "$r1_post" "0" "R1 should NOT have id=2,3 (excluded by T1 restore)" || { ko t_chain_restore_r1_to_r2 ""; return; }
+
+  # Order matters: R1's bucket must hold a full whose stop_time ≤ T2, so
+  # pgbackrest at R2 can pick it. Take a manual full ourselves rather than
+  # racing the watcher's poll loop — under suite load the watcher's
+  # NEEDS_INITIAL_BACKUP trip can lag past the 120s window even with the
+  # 5s poll interval. take_pgbackrest_backup uses R1's WAL_ARCHIVE_*
+  # creds, so the backup goes to r1_bucket exactly like the watcher
+  # would have written it.
+  #
+  # Manual backup with retry. Don't pre-wait on a "stanza-create completed"
+  # log line — bootstrap_pgbackrest_stanza races recovery + S3 I/O under
+  # suite load and the log line can lag well past 90 s even after stanza
+  # is actually ready. Cleaner check: just attempt the backup, and on the
+  # "stanza missing data in the repo" error retry with backoff. After
+  # ~10 retries (~120 s wall time) bootstrap has either landed or
+  # something else is wrong.
+  #
+  # Stderr is appended to /tmp/pgssl-r1-backup-err.log so the post-mortem
+  # has the actual pgbackrest error instead of a generic "manual full
+  # failed" — surfaces in the ko message on terminal failure.
+  docker exec "$r1_name" psql -U postgres -c "SELECT pg_switch_wal();" >/dev/null
+  : > /tmp/pgssl-r1-backup-err.log
+  local backup_attempt backup_ok=0
+  for backup_attempt in $(seq 1 10); do
+    if docker exec -u postgres "$r1_name" bash -c '
+      if [ -f /var/lib/postgresql/data/.pgbackrest_repo_path ]; then
+        export PGBACKREST_REPO1_PATH="$(cat /var/lib/postgresql/data/.pgbackrest_repo_path)"
+      else
+        export PGBACKREST_REPO1_PATH="$WAL_ARCHIVE_PATH"
+      fi
+      export PGBACKREST_REPO1_S3_BUCKET="$WAL_ARCHIVE_BUCKET"
+      export PGBACKREST_REPO1_S3_KEY="$WAL_ARCHIVE_KEY"
+      export PGBACKREST_REPO1_S3_KEY_SECRET="$WAL_ARCHIVE_SECRET"
+      export PGBACKREST_REPO1_S3_REGION="$WAL_ARCHIVE_REGION"
+      export PGBACKREST_REPO1_S3_ENDPOINT="$WAL_ARCHIVE_ENDPOINT"
+      pgbackrest --stanza=main backup --type=full
+    ' 2>>/tmp/pgssl-r1-backup-err.log >/dev/null; then
+      backup_ok=1
+      break
+    fi
+    sleep 12
+  done
+  if [ "$backup_ok" != 1 ]; then
+    ko t_chain_restore_r1_to_r2 "R1 manual full failed after 10 attempts (~2 min); last 30 lines of pgbackrest stderr: $(tail -30 /tmp/pgssl-r1-backup-err.log 2>/dev/null | tr '\n' '|')"
+    fail_dump t_chain_restore_r1_to_r2 "$r1_name"
+    return
+  fi
+
+  # Capture R1's per-cluster repo path for R2's WAL_RECOVER_FROM_PATH.
+  local r1_path
+  r1_path=$(docker exec "$r1_name" cat /var/lib/postgresql/data/.pgbackrest_repo_path 2>/dev/null \
+    || echo "/pgbackrest")
+
+  # Now drive R1 forward post-promote: insert id=10 'on-r1' (pre-T2),
+  # capture T2, insert id=11 'post-t2', force WAL switches so the segments
+  # spanning T2 ship to archive (recovery needs WAL with a record dated
+  # > T2 to declare "target reached" before promoting).
+  docker exec "$r1_name" psql -U postgres -c "INSERT INTO pitrtest(id,marker) VALUES (10,'on-r1');" >/dev/null
+  sleep 2
+  local target_t2
+  target_t2=$(docker exec "$r1_name" psql -U postgres -At -c "SELECT now()::timestamptz(0)")
+  sleep 2
+  docker exec "$r1_name" psql -U postgres -c "INSERT INTO pitrtest(id,marker) VALUES (11,'post-t2');" >/dev/null
+
+  # Capture the WAL segment id=11's commit lives in BEFORE we issue any
+  # switch. pg_current_wal_lsn() now points just past id=11's commit; the
+  # segment name from pg_walfile_name is the segment carrying that LSN
+  # (until the next switch closes it). This is the segment R2 must see
+  # in r1_bucket — the previous probe used pg_stat_archiver.last_archived_time
+  # (wall-clock) which can advance without shipping the segment whose
+  # *content* spans T2, so R2's recovery walked all-but-the-needed WAL
+  # and FATALed.
+  local id11_segment
+  id11_segment=$(docker exec "$r1_name" psql -U postgres -At -c \
+    "SELECT pg_walfile_name(pg_current_wal_lsn())")
+
+  # Two switches — first closes id11_segment (ships it), second nudges the
+  # archiver if WAL volume alone wouldn't cross the segment boundary.
+  docker exec "$r1_name" psql -U postgres -c "SELECT pg_switch_wal(); SELECT pg_switch_wal();" >/dev/null
+
+  # Wait until pg_stat_archiver.last_archived_wal has reached id11_segment.
+  # WAL segment names are zero-padded hex sortable as strings, so >=
+  # semantics fall out of bash's `\>` (lexicographic = numeric-by-segment).
+  local r1_ship_deadline=$(($(date +%s) + 90)) shipped_id11=0
+  while [ "$(date +%s)" -lt "$r1_ship_deadline" ]; do
+    local last_archived_wal
+    last_archived_wal=$(docker exec "$r1_name" psql -U postgres -At -c \
+      "SELECT last_archived_wal FROM pg_stat_archiver" 2>/dev/null || echo "")
+    if [ -n "$last_archived_wal" ]; then
+      if [ "$last_archived_wal" = "$id11_segment" ] \
+         || [ "$last_archived_wal" \> "$id11_segment" ]; then
+        shipped_id11=1; break
+      fi
+    fi
+    docker exec "$r1_name" psql -U postgres -c "SELECT pg_switch_wal();" >/dev/null 2>&1
+    sleep 2
+  done
+  if [ "$shipped_id11" != 1 ]; then
+    ko t_chain_restore_r1_to_r2 "R1's archiver did not ship segment ${id11_segment} (with id=11/post-T2 commit) within 90s"
+    fail_dump t_chain_restore_r1_to_r2 "$r1_name"
+    return
+  fi
+
+  # R2: restore from R1's bucket at T2 + archive into its own bucket.
+  new_volume "$r2_vol"
+  docker rm -f "$r2_name" >/dev/null 2>&1 || true
+  docker run -d --name "$r2_name" --label postgres-ssl-e2e=1 --network "$NET" \
+    -e POSTGRES_PASSWORD=test \
+    -e "WAL_RECOVER_FROM_BUCKET=$r1_bucket" \
+    -e "WAL_RECOVER_FROM_ENDPOINT=http://${MINIO}:9000" \
+    -e WAL_RECOVER_FROM_REGION=us-east-1 \
+    -e WAL_RECOVER_FROM_KEY=$MINIO_USER \
+    -e WAL_RECOVER_FROM_SECRET=$MINIO_PASS \
+    -e "WAL_RECOVER_FROM_PATH=$r1_path" \
+    -e "WAL_ARCHIVE_BUCKET=$r2_bucket" \
+    -e "WAL_ARCHIVE_ENDPOINT=http://${MINIO}:9000" \
+    -e WAL_ARCHIVE_REGION=us-east-1 \
+    -e WAL_ARCHIVE_KEY=$MINIO_USER \
+    -e WAL_ARCHIVE_SECRET=$MINIO_PASS \
+    -e WAL_ARCHIVE_PATH=/pgbackrest \
+    -e PGBACKREST_REPO1_S3_URI_STYLE=path \
+    -e "POSTGRES_RECOVERY_TARGET_TIME=$target_t2" \
+    -v "$r2_vol:/var/lib/postgresql/data" \
+    "$IMAGE" >/dev/null
+  wait_for_pg "$r2_name" || { ko t_chain_restore_r1_to_r2 "R2 did not start"; fail_dump t_chain_restore_r1_to_r2 "$r2_name"; return; }
+  wait_for_promoted "$r2_name" || { ko t_chain_restore_r1_to_r2 "R2 did not promote"; fail_dump t_chain_restore_r1_to_r2 "$r2_name"; return; }
+
+  # Chain semantics on R2:
+  #   id=1   pre-T1 (S)            → present (inherited via R1)
+  #   id=2,3 post-T1 (S)           → absent  (excluded by R1's restore)
+  #   id=10  on-R1 pre-T2          → present (inherited from R1)
+  #   id=11  post-T2 (R1)          → absent  (excluded by R2's restore)
+  local pre_t1 post_t1 on_r1 post_t2
+  pre_t1=$(docker exec "$r2_name" psql -U postgres -At -c "SELECT count(*) FROM pitrtest WHERE id=1")
+  post_t1=$(docker exec "$r2_name" psql -U postgres -At -c "SELECT count(*) FROM pitrtest WHERE id IN (2,3)")
+  on_r1=$(docker exec "$r2_name" psql -U postgres -At -c "SELECT count(*) FROM pitrtest WHERE id=10")
+  post_t2=$(docker exec "$r2_name" psql -U postgres -At -c "SELECT count(*) FROM pitrtest WHERE id=11")
+  assert_eq "$pre_t1"  "1" "R2 pre-T1 (id=1) should be inherited via R1"               || { ko t_chain_restore_r1_to_r2 ""; return; }
+  assert_eq "$post_t1" "0" "R2 post-T1 (id=2,3) excluded by R1's restore"              || { ko t_chain_restore_r1_to_r2 ""; return; }
+  assert_eq "$on_r1"   "1" "R2 on-R1 (id=10) inherited from R1's pre-T2 timeline"      || { ko t_chain_restore_r1_to_r2 ""; return; }
+  assert_eq "$post_t2" "0" "R2 post-T2 (id=11) excluded by R2's restore"               || { ko t_chain_restore_r1_to_r2 ""; return; }
+
+  ok t_chain_restore_r1_to_r2
+  note "S→R1@T1, R1→R2@T2; chain semantics intact (pre-T1=1, post-T1=0, on-r1=1, post-T2=0)"
+  mc "mc rm -r --force local/${r1_bucket}" >/dev/null 2>&1 || true
+  mc "mc rm -r --force local/${r2_bucket}" >/dev/null 2>&1 || true
+  docker rm -f "$src_name" "$r1_name" "$r2_name" >/dev/null
+  docker volume rm "$src_vol" "$r1_vol" "$r2_vol" >/dev/null
+}
+
 # ----- runner ----------------------------------------------------------------
 
 ALL_TESTS=(
@@ -2321,6 +3121,13 @@ ALL_TESTS=(
   t_restore_then_wipe_volume_redoes_restore
   t_restored_service_can_enable_archive_after_promote
   t_restored_marker_persists_across_restarts
+  # learnings from test-postgres-pitr (image-level mirrors of the railway
+  # mutation-driven e2e flows)
+  t_pitr_idle_source_target_time_fatals
+  t_pitr_target_xid_routes_xid_through_stack
+  t_pitr_missing_wal_segment_fatals
+  t_lifecycle_enable_disable_reenable
+  t_chain_restore_r1_to_r2
   # t_watcher_reconciles_state_against_bucket_on_boot — depends on
   # reconcile_state_with_bucket() in the watcher, which isn't on the
   # per-cluster-archive-paths branch yet. Reinstate when D1 lands.
