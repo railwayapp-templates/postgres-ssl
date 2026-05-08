@@ -2404,13 +2404,20 @@ setup_idle_source() {
     sleep 1
   done
 
-  # Schema first (in pre-backup WAL → applied via base restore), then full
-  # backup, then the row insert (its commit lands in post-checkpoint WAL,
-  # which is what recovery_target_xid scans through).
-  docker exec "$name" psql -U postgres -c "CREATE TABLE pitrtest(id int, marker text);" >/dev/null
+  # Each docker exec below MUST succeed — silent failures here used to
+  # produce empty fields in the echoed metadata, which the calling test
+  # then passed verbatim to `docker run -e POSTGRES_RECOVERY_TARGET_TIME=`,
+  # the wrapper saw the env var as unset, skipped the pgbackrest restore
+  # path entirely, and ran initdb instead. Test then waited 120s for a
+  # FATAL that would never come.
+  docker exec "$name" psql -U postgres -c "CREATE TABLE pitrtest(id int, marker text);" >/dev/null \
+    || { echo "setup_idle_source: CREATE TABLE failed; container probably exited" >&2; return 1; }
   local source_path
-  source_path=$(docker exec "$name" cat /var/lib/postgresql/data/.pgbackrest_repo_path 2>/dev/null \
-    || echo "/pgbackrest")
+  source_path=$(docker exec "$name" cat /var/lib/postgresql/data/.pgbackrest_repo_path 2>/dev/null) \
+    || { echo "setup_idle_source: read .pgbackrest_repo_path failed" >&2; return 1; }
+  if [ -z "$source_path" ]; then
+    source_path="/pgbackrest"
+  fi
   docker exec -u postgres "$name" bash -c '
     if [ -f /var/lib/postgresql/data/.pgbackrest_repo_path ]; then
       export PGBACKREST_REPO1_PATH="$(cat /var/lib/postgresql/data/.pgbackrest_repo_path)"
@@ -2423,7 +2430,8 @@ setup_idle_source() {
     export PGBACKREST_REPO1_S3_REGION="$WAL_ARCHIVE_REGION"
     export PGBACKREST_REPO1_S3_ENDPOINT="$WAL_ARCHIVE_ENDPOINT"
     pgbackrest --stanza=main backup --type=full
-  ' >/dev/null 2>&1 || return 1
+  ' >/dev/null 2>&1 \
+    || { echo "setup_idle_source: pgbackrest manual full failed" >&2; return 1; }
 
   # Single post-backup commit; capture its xid via xmin in a separate SELECT.
   # Two-call pattern (vs. INSERT … RETURNING xmin) is deliberate — psql -At
@@ -2431,17 +2439,24 @@ setup_idle_source() {
   # alongside the value, so a `$(…)` capture grabs both lines and the
   # second one corrupts any env var it gets piped into. The follow-up
   # SELECT cleanly returns just the xmin value.
-  docker exec "$name" psql -U postgres -c "INSERT INTO pitrtest VALUES (1, 'only-commit');" >/dev/null
+  docker exec "$name" psql -U postgres -c "INSERT INTO pitrtest VALUES (1, 'only-commit');" >/dev/null \
+    || { echo "setup_idle_source: post-backup INSERT failed" >&2; return 1; }
   local commit_xid
   commit_xid=$(docker exec "$name" psql -U postgres -At -c \
-    "SELECT xmin::text::bigint FROM pitrtest WHERE id=1")
+    "SELECT xmin::text::bigint FROM pitrtest WHERE id=1") \
+    || { echo "setup_idle_source: xmin capture failed" >&2; return 1; }
+  if [ -z "$commit_xid" ] || [ "$commit_xid" = "0" ]; then
+    echo "setup_idle_source: captured xid is empty/zero (got '$commit_xid')" >&2
+    return 1
+  fi
   echo "setup_idle_source: captured commit xid=${commit_xid} (post-backup INSERT)" >&2
 
   # Force the commit's WAL segment to ship to S3 BEFORE we generate a string
   # of empty switches — without this, the segment with the commit could lag
   # behind the empty ones in archive (async push order isn't guaranteed
   # under load) and the restore would miss it.
-  docker exec "$name" psql -U postgres -c "SELECT pg_switch_wal();" >/dev/null
+  docker exec "$name" psql -U postgres -c "SELECT pg_switch_wal();" >/dev/null \
+    || { echo "setup_idle_source: pg_switch_wal failed" >&2; return 1; }
   sleep 3
 
   # Sleep so target NOW() lands strictly past the commit's WAL timestamp,
@@ -2449,9 +2464,15 @@ setup_idle_source() {
   # head advances past target while pg_last_committed_xact stays at the
   # only insert's commit.
   local target
-  target=$(docker exec "$name" psql -U postgres -At -c "SELECT now()::timestamptz(0)")
+  target=$(docker exec "$name" psql -U postgres -At -c "SELECT now()::timestamptz(0)") \
+    || { echo "setup_idle_source: target capture failed" >&2; return 1; }
+  if [ -z "$target" ]; then
+    echo "setup_idle_source: target empty" >&2
+    return 1
+  fi
   for _ in 1 2 3 4 5; do
-    docker exec "$name" psql -U postgres -c "SELECT pg_switch_wal();" >/dev/null
+    docker exec "$name" psql -U postgres -c "SELECT pg_switch_wal();" >/dev/null \
+      || { echo "setup_idle_source: late pg_switch_wal failed" >&2; return 1; }
     sleep 1
   done
   sleep 4  # let the last batch of empty segments ship to S3
@@ -2928,31 +2949,21 @@ t_chain_restore_r1_to_r2() {
   # creds, so the backup goes to r1_bucket exactly like the watcher
   # would have written it.
   #
-  # Wait for stanza-create on r1_bucket to complete before issuing the
-  # manual backup — bootstrap_pgbackrest_stanza runs in a background fork
-  # post-promote and the helper's pgbackrest call would error
-  # ("stanza missing data in the repo") if it fires first. 90 s ceiling
-  # is generous; under suite load bootstrap can lag a few tens of seconds.
+  # Manual backup with retry. Don't pre-wait on a "stanza-create completed"
+  # log line — bootstrap_pgbackrest_stanza races recovery + S3 I/O under
+  # suite load and the log line can lag well past 90 s even after stanza
+  # is actually ready. Cleaner check: just attempt the backup, and on the
+  # "stanza missing data in the repo" error retry with backoff. After
+  # ~10 retries (~120 s wall time) bootstrap has either landed or
+  # something else is wrong.
+  #
+  # Stderr is appended to /tmp/pgssl-r1-backup-err.log so the post-mortem
+  # has the actual pgbackrest error instead of a generic "manual full
+  # failed" — surfaces in the ko message on terminal failure.
   docker exec "$r1_name" psql -U postgres -c "SELECT pg_switch_wal();" >/dev/null
-  local stanza_seen=0
-  for _ in $(seq 1 90); do
-    if docker logs "$r1_name" 2>&1 | grep -q "stanza-create completed"; then
-      stanza_seen=1
-      break
-    fi
-    sleep 1
-  done
-  if [ "$stanza_seen" != 1 ]; then
-    ko t_chain_restore_r1_to_r2 "R1's stanza-create did not complete within 90s"
-    fail_dump t_chain_restore_r1_to_r2 "$r1_name"
-    return
-  fi
-  # Manual backup with a real-stderr capture so a future failure surfaces
-  # the actual pgbackrest error instead of a generic "manual full failed".
-  # Two retries with 5 s sleep cover the post-stanza-create settle window
-  # (S3 read-after-write on the freshly-uploaded backup.info).
-  local backup_attempt
-  for backup_attempt in 1 2 3; do
+  : > /tmp/pgssl-r1-backup-err.log
+  local backup_attempt backup_ok=0
+  for backup_attempt in $(seq 1 10); do
     if docker exec -u postgres "$r1_name" bash -c '
       if [ -f /var/lib/postgresql/data/.pgbackrest_repo_path ]; then
         export PGBACKREST_REPO1_PATH="$(cat /var/lib/postgresql/data/.pgbackrest_repo_path)"
@@ -2966,15 +2977,16 @@ t_chain_restore_r1_to_r2() {
       export PGBACKREST_REPO1_S3_ENDPOINT="$WAL_ARCHIVE_ENDPOINT"
       pgbackrest --stanza=main backup --type=full
     ' 2>>/tmp/pgssl-r1-backup-err.log >/dev/null; then
+      backup_ok=1
       break
     fi
-    if [ "$backup_attempt" = 3 ]; then
-      ko t_chain_restore_r1_to_r2 "R1 manual full failed after 3 attempts (last 20 lines from /tmp/pgssl-r1-backup-err.log: $(tail -20 /tmp/pgssl-r1-backup-err.log 2>/dev/null | tr '\n' '|'))"
-      fail_dump t_chain_restore_r1_to_r2 "$r1_name"
-      return
-    fi
-    sleep 5
+    sleep 12
   done
+  if [ "$backup_ok" != 1 ]; then
+    ko t_chain_restore_r1_to_r2 "R1 manual full failed after 10 attempts (~2 min); last 30 lines of pgbackrest stderr: $(tail -30 /tmp/pgssl-r1-backup-err.log 2>/dev/null | tr '\n' '|')"
+    fail_dump t_chain_restore_r1_to_r2 "$r1_name"
+    return
+  fi
 
   # Capture R1's per-cluster repo path for R2's WAL_RECOVER_FROM_PATH.
   local r1_path
