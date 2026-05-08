@@ -2512,43 +2512,48 @@ t_pitr_idle_source_target_time_fatals() {
   docker volume rm "$src_vol" "$rest_vol" >/dev/null
 }
 
-# I2. POSTGRES_RECOVERY_TARGET_XID drives wrapper to pick the xid path.
-# Image-level smoke test for the recovery_target_type pick — pins the
-# decision logic in restore_from_pgbackrest_if_empty_volume so a future
-# refactor that drops the env-var branch (or fat-fingers the variable name)
-# trips the suite. Three load-bearing observations, all from container
-# logs, none dependent on archive-shipping timing:
+# I2. POSTGRES_RECOVERY_TARGET_XID drives the full plumbing chain.
+# Pins four observable points along the wrapper → pgbackrest → postgres
+# pipeline so a regression in any layer trips the suite:
 #
 #   1. wrapper logs "using recovery_target_xid=<xid>"
-#      → proves the bash branch fired
+#      → bash branch in restore_from_pgbackrest_if_empty_volume fired
 #   2. pgbackrest restore line shows "--type=xid"
-#      → proves the wrapper threaded $restore_type all the way to the
-#        pgbackrest invocation (catches a refactor that loses the var)
-#   3. postgres logs "starting point-in-time recovery to XID <xid>"
-#      → proves pgbackrest honored --type=xid and wrote
-#        recovery_target_xid into postgresql.auto.conf
+#      → wrapper threaded $restore_type / $restore_target all the way to
+#        the pgbackrest invocation
+#   3. postgresql.auto.conf written by pgbackrest carries
+#      `recovery_target_xid = '<xid>'`
+#      → pgbackrest 2.58 honored --type=xid and emitted the right knob
+#        (catches a future pgbackrest version that silently drops the
+#        flag, or our pgbackrest config not threading --target-action
+#        through alongside)
+#   4. postgres logs "starting point-in-time recovery to XID <xid>"
+#      → postmaster parsed the recovery target and started archive
+#        recovery in xid mode (different log line than the time-mode
+#        "starting point-in-time recovery to <ts>")
 #
-# End-to-end recovery success (target xid commit found in WAL → promote →
-# row contract honored) is exercised by test-postgres-pitr/idleRestore on
-# a real Railway deployment, where the archive-shipping window is hours
-# long and reliable. Reproducing that in seconds against a synthetic local
-# MinIO is brittle — pgbackrest's async push lag + segment-boundary
-# ordering means the segment carrying the target xid's commit isn't always
-# in the bucket by the time the restore container boots. So this test
-# stops at "wrapper picked the right path"; the rest is covered upstream.
-t_pitr_target_xid_picks_xid_path() {
-  setup_pitr_source >&2 || { ko t_pitr_target_xid_picks_xid_path "setup_pitr_source failed"; return; }
+# What this does NOT pin: that recovery actually terminates at target_xid
+# and promotes with the row contract honored. The xid → COMMIT-record
+# matching itself is postgres's responsibility, and reproducing it
+# deterministically against synthetic local WAL is brittle (the segment
+# carrying target_xid's COMMIT can lap behind the segment-name probe in
+# ways that don't reproduce in production where archive head is hours
+# ahead). End-to-end XID success is exercised by test-postgres-pitr's
+# `idleRestore` flow on a real Railway deployment — the layer where
+# postgres's behavior is what we're really measuring.
+t_pitr_target_xid_routes_xid_through_stack() {
+  setup_pitr_source >&2 || { ko t_pitr_target_xid_routes_xid_through_stack "setup_pitr_source failed"; return; }
   read -r src_name src_vol < "/tmp/pitr-source-${PG_VERSION}"
   local target; target=$(cat "/tmp/pitr-target-${PG_VERSION}")
   local src_path; src_path=$(pitr_source_path)
-  local rest_name=t-xid-pick-${PG_VERSION}
+  local rest_name=t-xid-route-${PG_VERSION}
   local rest_vol=${rest_name}-vol
 
   local target_xid
   target_xid=$(docker exec "$src_name" psql -U postgres -At -c \
     "SELECT xmin::text::bigint FROM pitrtest WHERE id=1")
   if [ -z "$target_xid" ] || [ "$target_xid" = "0" ]; then
-    ko t_pitr_target_xid_picks_xid_path "captured xid empty/zero (got '$target_xid')"
+    ko t_pitr_target_xid_routes_xid_through_stack "captured xid empty/zero (got '$target_xid')"
     return
   fi
 
@@ -2568,10 +2573,10 @@ t_pitr_target_xid_picks_xid_path() {
     -v "$rest_vol:/var/lib/postgresql/data" \
     "$IMAGE" >/dev/null
 
-  # Don't wait for promote — recovery may FATAL on missing WAL (timing-dep
-  # on archive shipping); we only care about the path-pick observations,
-  # which all land in the first ~10s of container life.
-  local deadline=$(($(date +%s) + 30)) saw_wrapper=0 saw_postgres=0 saw_pgbackrest=0
+  # Don't wait for promote — recovery's xid-match termination is what
+  # idleRestore exercises end-to-end. We only care about the routing
+  # observations, all of which land in the first ~10 s of container life.
+  local deadline=$(($(date +%s) + 30)) saw_wrapper=0 saw_pgbackrest=0 saw_postgres=0
   while [ "$(date +%s)" -lt "$deadline" ]; do
     local logs
     logs=$(docker logs "$rest_name" 2>&1)
@@ -2582,23 +2587,49 @@ t_pitr_target_xid_picks_xid_path() {
     sleep 2
   done
   if [ "$saw_wrapper" != 1 ]; then
-    ko t_pitr_target_xid_picks_xid_path "wrapper did not log 'using recovery_target_xid=${target_xid}'"
-    fail_dump t_pitr_target_xid_picks_xid_path "$rest_name"
+    ko t_pitr_target_xid_routes_xid_through_stack "wrapper did not log 'using recovery_target_xid=${target_xid}'"
+    fail_dump t_pitr_target_xid_routes_xid_through_stack "$rest_name"
     return
   fi
   if [ "$saw_pgbackrest" != 1 ]; then
-    ko t_pitr_target_xid_picks_xid_path "pgbackrest restore was not invoked with --type=xid"
-    fail_dump t_pitr_target_xid_picks_xid_path "$rest_name"
+    ko t_pitr_target_xid_routes_xid_through_stack "pgbackrest restore not invoked with --type=xid"
+    fail_dump t_pitr_target_xid_routes_xid_through_stack "$rest_name"
     return
   fi
   if [ "$saw_postgres" != 1 ]; then
-    ko t_pitr_target_xid_picks_xid_path "postgres did not log 'starting point-in-time recovery to XID ${target_xid}'"
-    fail_dump t_pitr_target_xid_picks_xid_path "$rest_name"
+    ko t_pitr_target_xid_routes_xid_through_stack "postgres did not log XID-mode recovery start"
+    fail_dump t_pitr_target_xid_routes_xid_through_stack "$rest_name"
     return
   fi
 
-  ok t_pitr_target_xid_picks_xid_path
-  note "wrapper → pgbackrest → postgres all routed XID=${target_xid} (recovery outcome covered upstream)"
+  # Read postgresql.auto.conf out of the volume — it persists past
+  # container exit (recovery may FATAL on synthetic WAL, but the conf
+  # was written before that). pgbackrest writes auto.conf during
+  # `pgbackrest restore`, well before postgres starts. Catches a
+  # pgbackrest regression that drops `recovery_target_xid` while still
+  # writing the `recovery_target_action` line.
+  local auto_conf
+  auto_conf=$(docker run --rm -v "${rest_vol}:/data" alpine cat /data/postgresql.auto.conf 2>/dev/null || echo "")
+  if [ -z "$auto_conf" ]; then
+    ko t_pitr_target_xid_routes_xid_through_stack "postgresql.auto.conf missing or unreadable"
+    return
+  fi
+  if ! echo "$auto_conf" | grep -qE "^recovery_target_xid = '${target_xid}'$"; then
+    ko t_pitr_target_xid_routes_xid_through_stack "auto.conf missing 'recovery_target_xid = ${target_xid}'"
+    echo "  auto.conf:"
+    echo "$auto_conf" | sed 's/^/    /'
+    return
+  fi
+  # The time path's recovery_target_time MUST NOT also be present —
+  # both knobs in auto.conf is undefined behavior in postgres and would
+  # mean the wrapper failed to suppress _TIME when _XID was set.
+  if echo "$auto_conf" | grep -qE "^recovery_target_time = "; then
+    ko t_pitr_target_xid_routes_xid_through_stack "auto.conf carries both recovery_target_xid AND recovery_target_time — wrapper did not suppress _TIME"
+    return
+  fi
+
+  ok t_pitr_target_xid_routes_xid_through_stack
+  note "wrapper → pgbackrest → auto.conf (recovery_target_xid='${target_xid}') → postgres all routed XID; recovery termination covered upstream"
   docker rm -f "$src_name" "$rest_name" >/dev/null
   docker volume rm "$src_vol" "$rest_vol" >/dev/null
 }
@@ -2896,17 +2927,50 @@ t_chain_restore_r1_to_r2() {
   # Wait for stanza-create on r1_bucket to complete before issuing the
   # manual backup — bootstrap_pgbackrest_stanza runs in a background fork
   # post-promote and the helper's pgbackrest call would error
-  # ("stanza missing data in the repo") if it fires first.
+  # ("stanza missing data in the repo") if it fires first. 90 s ceiling
+  # is generous; under suite load bootstrap can lag a few tens of seconds.
   docker exec "$r1_name" psql -U postgres -c "SELECT pg_switch_wal();" >/dev/null
-  for _ in $(seq 1 30); do
-    docker logs "$r1_name" 2>&1 | grep -q "stanza-create completed" && break
+  local stanza_seen=0
+  for _ in $(seq 1 90); do
+    if docker logs "$r1_name" 2>&1 | grep -q "stanza-create completed"; then
+      stanza_seen=1
+      break
+    fi
     sleep 1
   done
-  if ! take_pgbackrest_backup "$r1_name" full; then
-    ko t_chain_restore_r1_to_r2 "R1 manual full failed"
+  if [ "$stanza_seen" != 1 ]; then
+    ko t_chain_restore_r1_to_r2 "R1's stanza-create did not complete within 90s"
     fail_dump t_chain_restore_r1_to_r2 "$r1_name"
     return
   fi
+  # Manual backup with a real-stderr capture so a future failure surfaces
+  # the actual pgbackrest error instead of a generic "manual full failed".
+  # Two retries with 5 s sleep cover the post-stanza-create settle window
+  # (S3 read-after-write on the freshly-uploaded backup.info).
+  local backup_attempt
+  for backup_attempt in 1 2 3; do
+    if docker exec -u postgres "$r1_name" bash -c '
+      if [ -f /var/lib/postgresql/data/.pgbackrest_repo_path ]; then
+        export PGBACKREST_REPO1_PATH="$(cat /var/lib/postgresql/data/.pgbackrest_repo_path)"
+      else
+        export PGBACKREST_REPO1_PATH="$WAL_ARCHIVE_PATH"
+      fi
+      export PGBACKREST_REPO1_S3_BUCKET="$WAL_ARCHIVE_BUCKET"
+      export PGBACKREST_REPO1_S3_KEY="$WAL_ARCHIVE_KEY"
+      export PGBACKREST_REPO1_S3_KEY_SECRET="$WAL_ARCHIVE_SECRET"
+      export PGBACKREST_REPO1_S3_REGION="$WAL_ARCHIVE_REGION"
+      export PGBACKREST_REPO1_S3_ENDPOINT="$WAL_ARCHIVE_ENDPOINT"
+      pgbackrest --stanza=main backup --type=full
+    ' 2>>/tmp/pgssl-r1-backup-err.log >/dev/null; then
+      break
+    fi
+    if [ "$backup_attempt" = 3 ]; then
+      ko t_chain_restore_r1_to_r2 "R1 manual full failed after 3 attempts (last 20 lines from /tmp/pgssl-r1-backup-err.log: $(tail -20 /tmp/pgssl-r1-backup-err.log 2>/dev/null | tr '\n' '|'))"
+      fail_dump t_chain_restore_r1_to_r2 "$r1_name"
+      return
+    fi
+    sleep 5
+  done
 
   # Capture R1's per-cluster repo path for R2's WAL_RECOVER_FROM_PATH.
   local r1_path
@@ -3044,7 +3108,7 @@ ALL_TESTS=(
   # learnings from test-postgres-pitr (image-level mirrors of the railway
   # mutation-driven e2e flows)
   t_pitr_idle_source_target_time_fatals
-  t_pitr_target_xid_picks_xid_path
+  t_pitr_target_xid_routes_xid_through_stack
   t_pitr_missing_wal_segment_fatals
   t_lifecycle_enable_disable_reenable
   t_chain_restore_r1_to_r2
