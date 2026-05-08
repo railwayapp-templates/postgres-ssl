@@ -524,7 +524,50 @@ bootstrap_pgbackrest_stanza() {
     else
       echo "pgbackrest: stanza-create failed (will retry on next boot)" >&2
     fi
+
+    warmup_commit_ts
   ) &
+}
+
+# Issue a tiny transactional commit on every boot so pg_last_committed_xact()
+# returns a real value to the PITR picker even on a freshly-restarted cluster
+# that hasn't taken any user writes yet.
+#
+# track_commit_timestamp persists commit-ts data on disk in pg_commit_ts/, but
+# the in-memory `newestCommitTsXid` cursor (ShmemVariableCache) is reset to
+# InvalidTransactionId on every postmaster start. pg_last_committed_xact()
+# reads that cursor first, so it returns NULL until the cluster does its
+# first new commit since boot — even if pg_commit_ts/ has years of history.
+#
+# That NULL return propagates to the picker as "no commit-ts ceiling" and
+# forces the +1s backup-stop fallback path (volumeInstance.ts), which is
+# coarser than the real ceiling. The fix at the picker layer is independent
+# (see B8), but the upstream issue here is the cluster shouldn't report
+# NULL in the first place. A single transactional WAL message commits, gets
+# its xid recorded in pg_commit_ts, and seeds the in-memory cursor — so the
+# next pg_last_committed_xact() call returns the warmup's commit timestamp.
+#
+# Gated on WAL_ARCHIVE_BUCKET so we don't write WAL when archiving is off
+# (where the ceiling doesn't matter anyway). Gated on track_commit_timestamp
+# being on. Failure is non-fatal — picker just falls back to the +0
+# backup-stop ceiling like before.
+warmup_commit_ts() {
+  [ -z "${WAL_ARCHIVE_BUCKET:-}" ] && return 0
+
+  local guc
+  guc=$(gosu postgres psql -U postgres -h /var/run/postgresql -tAXq \
+    -c "SHOW track_commit_timestamp" 2>/dev/null | tr -d '[:space:]')
+  if [ "$guc" != "on" ]; then
+    return 0
+  fi
+
+  if gosu postgres psql -U postgres -h /var/run/postgresql -tAXq \
+       -c "BEGIN; SELECT pg_logical_emit_message(true, 'rwy_commit_ts_warmup', ''); COMMIT;" \
+       >/dev/null 2>&1; then
+    echo "pgbackrest: commit-ts warmup committed"
+  else
+    echo "pgbackrest: commit-ts warmup failed (non-fatal)" >&2
+  fi
 }
 
 # Stage PITR replay when POSTGRES_RECOVERY_TARGET_TIME is set. Writes
@@ -606,11 +649,24 @@ EOF
 
   # Escape single quotes per postgresql.conf rules (' -> '') so a value with
   # an embedded apostrophe can't break the conf file or smuggle a setting.
-  local escaped_target="${POSTGRES_RECOVERY_TARGET_TIME//\'/\'\'}"
   local escaped_restore="${restore_cmd//\'/\'\'}"
+
+  # POSTGRES_RECOVERY_TARGET_XID, when set, wins over _TIME — same idle-
+  # source-safe rationale as restore_from_pgbackrest_if_empty_volume:
+  # recovery_target_time hangs/FATALs when no commit record exists past
+  # target on an idle DB, recovery_target_xid matches an exact commit.
+  # The picker emits _XID when it clamped to lastCommittedTxnAt.
+  local recovery_param
+  if [ -n "${POSTGRES_RECOVERY_TARGET_XID:-}" ]; then
+    local escaped_xid="${POSTGRES_RECOVERY_TARGET_XID//\'/\'\'}"
+    recovery_param="recovery_target_xid = '${escaped_xid}'"
+  else
+    local escaped_target="${POSTGRES_RECOVERY_TARGET_TIME//\'/\'\'}"
+    recovery_param="recovery_target_time = '${escaped_target}'"
+  fi
   cat > "$PGBACKREST_RECOVERY_CONF" <<EOF
 restore_command = '${escaped_restore}'
-recovery_target_time = '${escaped_target}'
+${recovery_param}
 recovery_target_action = 'promote'
 EOF
   chown postgres:postgres "$PGBACKREST_RECOVERY_CONF"
