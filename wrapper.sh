@@ -608,13 +608,19 @@ EOF
   # an embedded apostrophe can't break the conf file or smuggle a setting.
   local escaped_restore="${restore_cmd//\'/\'\'}"
 
-  # POSTGRES_RECOVERY_TARGET_XID, when set, wins over _TIME — same idle-
-  # source-safe rationale as restore_from_pgbackrest_if_empty_volume:
-  # recovery_target_time hangs/FATALs when no commit record exists past
-  # target on an idle DB, recovery_target_xid matches an exact commit.
-  # The picker emits _XID when it clamped to lastCommittedTxnAt.
+  # Pick the recovery target same way restore_from_pgbackrest_if_empty_volume
+  # does — three modes in priority order:
+  #   1. _TYPE=immediate: stop at earliest consistent point (= backup_end
+  #      LSN). Used when the clamped xid lives inside the most recent base
+  #      backup; recovery_target_xid would FATAL "before consistent recovery
+  #      point" because target xid's commit LSN < min_recovery_lsn.
+  #   2. _XID set: exact-commit match; idle-source-safe.
+  #   3. _TIME: arbitrary historical time; source had post-target commits in
+  #      WAL so postgres observes the timestamp cross.
   local recovery_param
-  if [ -n "${POSTGRES_RECOVERY_TARGET_XID:-}" ]; then
+  if [ "${POSTGRES_RECOVERY_TARGET_TYPE:-}" = "immediate" ]; then
+    recovery_param="recovery_target = 'immediate'"
+  elif [ -n "${POSTGRES_RECOVERY_TARGET_XID:-}" ]; then
     local escaped_xid="${POSTGRES_RECOVERY_TARGET_XID//\'/\'\'}"
     recovery_param="recovery_target_xid = '${escaped_xid}'"
   else
@@ -694,22 +700,34 @@ EOF
   # bucket without touching the default config.
   local recovery_restore_cmd="pgbackrest --config=${PGBACKREST_RECOVERY_S3_CONF} --stanza=main archive-get %f %p"
 
-  # Pick the recovery target type. POSTGRES_RECOVERY_TARGET_XID, when set,
-  # wins over _TIME because it's the only target type postgres can match
-  # exactly on an idle source. recovery_target_time requires postgres to
-  # observe a WAL record with timestamp > target before declaring "target
-  # reached" and firing recovery_target_action=promote; on an idle DB no
-  # such record exists, so recovery FATALs with "recovery ended before
-  # configured recovery target was reached" and the cluster either loops
-  # the FATAL or hangs in hot_standby read-only mode. recovery_target_xid
-  # matches an exact transaction ID — applying the target xid's commit
-  # is unambiguously "target reached." The picker (mono's
-  # createServiceFromPITR mutation) sets _XID when it clamped target
-  # down to lastCommittedTxnAt, leaves it unset for arbitrary
-  # historical times.
+  # Pick the recovery target type. Three modes, in priority order:
+  #
+  #   1. POSTGRES_RECOVERY_TARGET_TYPE=immediate — picker detected the
+  #      clamped target xid lives INSIDE the most recent base backup
+  #      (lastCommittedTxnAt ≤ latestBackupAt: no commits since the snapshot
+  #      began). recovery_target_xid would FATAL with "requested recovery
+  #      stop point is before consistent recovery point" because the xid's
+  #      commit LSN < min_recovery_lsn from the backup's stop checkpoint.
+  #      The snapshot already captures the user's desired state, so stop
+  #      recovery at the earliest consistent point (= backup_end LSN) by
+  #      passing pgBackRest --type=immediate.
+  #
+  #   2. POSTGRES_RECOVERY_TARGET_XID — picker clamped to lastCommittedTxnAt
+  #      and the xid lives in WAL forward of the most recent backup. Exact
+  #      transaction match; idle-source-safe (recovery_target_time would
+  #      FATAL with "recovery ended before configured recovery target was
+  #      reached" because no WAL record has a timestamp > target on an
+  #      idle DB).
+  #
+  #   3. POSTGRES_RECOVERY_TARGET_TIME — arbitrary historical time. Source
+  #      had post-target commits in WAL, so postgres can observe the cross.
   local restore_type="time"
   local restore_target="$POSTGRES_RECOVERY_TARGET_TIME"
-  if [ -n "${POSTGRES_RECOVERY_TARGET_XID:-}" ]; then
+  if [ "${POSTGRES_RECOVERY_TARGET_TYPE:-}" = "immediate" ]; then
+    restore_type="immediate"
+    restore_target=""
+    echo "pgbackrest: using recovery_target=immediate (picker detected target xid is in-snapshot; promotion at backup_end LSN matches user's idle-source target)"
+  elif [ -n "${POSTGRES_RECOVERY_TARGET_XID:-}" ]; then
     restore_type="xid"
     restore_target="$POSTGRES_RECOVERY_TARGET_XID"
     echo "pgbackrest: using recovery_target_xid=${POSTGRES_RECOVERY_TARGET_XID} (idle-source-safe; target-time fallback would FATAL on no-record-after-target)"
@@ -717,14 +735,22 @@ EOF
 
   # --pg1-path is taken from $PGDATA so this works in restore-only mode too,
   # where render_pgbackrest_conf has been called but didn't include repo2.
+  # --target only makes sense for type=time/xid/lsn/name; immediate has no
+  # target so omit the flag entirely.
+  local -a target_args=()
+  if [ "$restore_type" = "immediate" ]; then
+    target_args=("--type=immediate")
+  else
+    target_args=("--type=$restore_type" "--target=$restore_target")
+  fi
   if ! gosu postgres pgbackrest --config="$PGBACKREST_RECOVERY_S3_CONF" \
        --stanza=main \
        --pg1-path="$PGDATA" \
        --recovery-option=restore_command="$recovery_restore_cmd" \
        restore \
-       --type="$restore_type" --target="$restore_target" \
+       "${target_args[@]}" \
        --target-action=promote; then
-    echo "pgbackrest: restore from source bucket failed; fix env vars (WAL_RECOVER_FROM_*, POSTGRES_RECOVERY_TARGET_TIME, POSTGRES_RECOVERY_TARGET_XID) and redeploy" >&2
+    echo "pgbackrest: restore from source bucket failed; fix env vars (WAL_RECOVER_FROM_*, POSTGRES_RECOVERY_TARGET_TIME, POSTGRES_RECOVERY_TARGET_XID, POSTGRES_RECOVERY_TARGET_TYPE) and redeploy" >&2
     exit 1
   fi
 

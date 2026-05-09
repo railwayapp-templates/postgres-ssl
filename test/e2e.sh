@@ -2698,6 +2698,122 @@ t_pitr_target_xid_routes_xid_through_stack() {
   docker volume rm "$src_vol" "$rest_vol" >/dev/null
 }
 
+# I3. POSTGRES_RECOVERY_TARGET_TYPE=immediate routes through wrapper +
+# pgbackrest + postgresql.auto.conf without leaking recovery_target_xid /
+# recovery_target_time.
+#
+# Picker emits TYPE=immediate when the clamped target xid lives INSIDE the
+# most recent base backup (lastCommittedTxnAt ≤ latestBackupAt, e.g. an
+# idle source with only pre-backup commits). recovery_target_xid would
+# FATAL "requested recovery stop point is before consistent recovery
+# point" because target xid's commit LSN < min_recovery_lsn. The image
+# fix: stop recovery at the earliest consistent point (= backup_end LSN)
+# via pgBackRest --type=immediate.
+#
+# Pins the same four observation points as the xid test:
+#   1. wrapper logs "using recovery_target=immediate"
+#   2. pgbackrest restore line shows "--type=immediate" (no --target)
+#   3. postgresql.auto.conf carries `recovery_target = 'immediate'` and
+#      NEITHER recovery_target_xid NOR recovery_target_time
+#   4. postgres logs the immediate-mode recovery start ("starting
+#      archive recovery"; immediate target doesn't log a target value)
+#
+# What this does NOT pin: recovery actually promotes at backup_end LSN
+# with the row contract honored. End-to-end immediate-mode success is
+# exercised by test-postgres-pitr's idleRestore flow once the picker fix
+# lands; the image only owns routing.
+t_pitr_target_immediate_routes_through_stack() {
+  setup_pitr_source >&2 || { ko t_pitr_target_immediate_routes_through_stack "setup_pitr_source failed"; return; }
+  read -r src_name src_vol < "/tmp/pitr-source-${PG_VERSION}"
+  local target; target=$(cat "/tmp/pitr-target-${PG_VERSION}")
+  local src_path; src_path=$(pitr_source_path)
+  local rest_name=t-imm-route-${PG_VERSION}
+  local rest_vol=${rest_name}-vol
+
+  # Picker emits TYPE=immediate alongside the originally-clamped TIME +
+  # XID — TIME stays the wrapper's "this is a restore" sentinel and the
+  # XID is preserved for diagnostics, but TYPE wins the priority compare
+  # and both should be suppressed from the rendered recovery params.
+  local target_xid
+  target_xid=$(docker exec "$src_name" psql -U postgres -At -c \
+    "SELECT xmin::text::bigint FROM pitrtest WHERE id=1")
+  if [ -z "$target_xid" ] || [ "$target_xid" = "0" ]; then
+    ko t_pitr_target_immediate_routes_through_stack "captured xid empty/zero (got '$target_xid')"
+    return
+  fi
+
+  new_volume "$rest_vol"
+  docker rm -f "$rest_name" >/dev/null 2>&1 || true
+  docker run -d --name "$rest_name" --label postgres-ssl-e2e=1 --network "$NET" \
+    -e POSTGRES_PASSWORD=test \
+    -e "WAL_RECOVER_FROM_BUCKET=$BUCKET" \
+    -e "WAL_RECOVER_FROM_ENDPOINT=http://${MINIO}:9000" \
+    -e WAL_RECOVER_FROM_REGION=us-east-1 \
+    -e WAL_RECOVER_FROM_KEY=$MINIO_USER \
+    -e WAL_RECOVER_FROM_SECRET=$MINIO_PASS \
+    -e "WAL_RECOVER_FROM_PATH=$src_path" \
+    -e PGBACKREST_REPO1_S3_URI_STYLE=path \
+    -e "POSTGRES_RECOVERY_TARGET_TIME=$target" \
+    -e "POSTGRES_RECOVERY_TARGET_XID=$target_xid" \
+    -e POSTGRES_RECOVERY_TARGET_TYPE=immediate \
+    -v "$rest_vol:/var/lib/postgresql/data" \
+    "$IMAGE" >/dev/null
+
+  local deadline=$(($(date +%s) + 30)) saw_wrapper=0 saw_pgbackrest=0 saw_postgres=0
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    local logs
+    logs=$(docker logs "$rest_name" 2>&1)
+    echo "$logs" | grep -q "using recovery_target=immediate"            && saw_wrapper=1
+    echo "$logs" | grep -qE "pgbackrest .*--type=immediate"             && saw_pgbackrest=1
+    echo "$logs" | grep -qE "starting archive recovery"                 && saw_postgres=1
+    [ "$saw_wrapper" = 1 ] && [ "$saw_pgbackrest" = 1 ] && [ "$saw_postgres" = 1 ] && break
+    sleep 2
+  done
+  if [ "$saw_wrapper" != 1 ]; then
+    ko t_pitr_target_immediate_routes_through_stack "wrapper did not log 'using recovery_target=immediate'"
+    fail_dump t_pitr_target_immediate_routes_through_stack "$rest_name"
+    return
+  fi
+  if [ "$saw_pgbackrest" != 1 ]; then
+    ko t_pitr_target_immediate_routes_through_stack "pgbackrest restore not invoked with --type=immediate"
+    fail_dump t_pitr_target_immediate_routes_through_stack "$rest_name"
+    return
+  fi
+  if [ "$saw_postgres" != 1 ]; then
+    ko t_pitr_target_immediate_routes_through_stack "postgres did not log archive recovery start"
+    fail_dump t_pitr_target_immediate_routes_through_stack "$rest_name"
+    return
+  fi
+
+  local auto_conf
+  auto_conf=$(docker run --rm -v "${rest_vol}:/data" alpine cat /data/postgresql.auto.conf 2>/dev/null || echo "")
+  if [ -z "$auto_conf" ]; then
+    ko t_pitr_target_immediate_routes_through_stack "postgresql.auto.conf missing or unreadable"
+    return
+  fi
+  if ! echo "$auto_conf" | grep -qE "^recovery_target = 'immediate'$"; then
+    ko t_pitr_target_immediate_routes_through_stack "auto.conf missing 'recovery_target = immediate'"
+    echo "  auto.conf:"
+    echo "$auto_conf" | sed 's/^/    /'
+    return
+  fi
+  # Both _xid and _time MUST be absent — picker's TYPE=immediate signals
+  # "ignore the other knobs"; leaking either would make postgres apply
+  # conflicting targets (recovery_target_xid wins over recovery_target,
+  # which would re-trigger the in-snapshot FATAL).
+  if echo "$auto_conf" | grep -qE "^recovery_target_(xid|time) = "; then
+    ko t_pitr_target_immediate_routes_through_stack "auto.conf carries recovery_target AND recovery_target_xid/time — wrapper did not suppress xid/time when TYPE=immediate"
+    echo "  auto.conf:"
+    echo "$auto_conf" | sed 's/^/    /'
+    return
+  fi
+
+  ok t_pitr_target_immediate_routes_through_stack
+  note "wrapper → pgbackrest → auto.conf (recovery_target='immediate') → postgres all routed IMMEDIATE; xid/time suppressed; recovery termination covered upstream"
+  docker rm -f "$src_name" "$rest_name" >/dev/null
+  docker volume rm "$src_vol" "$rest_vol" >/dev/null
+}
+
 # G3. Restore over a WAL gap → loud refuse.
 # Mirrors test-postgres-pitr/gaps at the image level. Custom setup (not
 # setup_pitr_source) so we have tight control over which segment contains
@@ -3164,6 +3280,7 @@ ALL_TESTS=(
   # mutation-driven e2e flows)
   t_pitr_idle_source_target_time_fatals
   t_pitr_target_xid_routes_xid_through_stack
+  t_pitr_target_immediate_routes_through_stack
   t_pitr_missing_wal_segment_fatals
   t_lifecycle_enable_disable_reenable
   t_chain_restore_r1_to_r2
