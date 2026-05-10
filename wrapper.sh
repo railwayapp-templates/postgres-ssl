@@ -713,16 +713,65 @@ EOF
     restore_type="xid"
     restore_target="$POSTGRES_RECOVERY_TARGET_XID"
     echo "pgbackrest: using recovery_target_xid=${POSTGRES_RECOVERY_TARGET_XID} (idle-source-safe; target-time fallback would FATAL on no-record-after-target)"
+  else
+    # Fallback to --type=immediate when target_time predates every base
+    # backup in the bucket. Without it, pgbackrest refuses the restore with
+    # `[075]: unable to find backup set with stop time less than '<target>'`
+    # because its --type=time selection rule requires backup_stop ≤ target
+    # (so postgres can replay WAL forward from the backup to the target).
+    # That's the right rule in general, but on an idle source where the
+    # user's last commit predates every backup (first PITR enable + no
+    # writes since the last meaningful commit), no backup qualifies and
+    # pgbackrest [075]s.
+    #
+    # The data IS in the bucket: the latest backup's contents represent
+    # state at backup_begin_lsn, which (on an idle source) already
+    # includes everything ≤ the user's last commit. --type=immediate
+    # tells pgbackrest to take the latest backup and stop at the
+    # consistent point (= backup_end_lsn) — postgres replays just enough
+    # WAL during the backup window to reach consistency, then promotes.
+    # Net effect: customer gets their data, no recovery_target match
+    # needed.
+    #
+    # Probe `pgbackrest info` for the earliest backup's stop time. If
+    # the requested target is before it, switch to immediate. Plain-text
+    # output is parsed for portability — no jq/python dep on the image.
+    # pgbackrest emits one `timestamp start/stop: <start> / <stop>` line
+    # per backup in chronological order; the first one is the earliest.
+    local earliest_stop_str earliest_stop_epoch target_epoch
+    earliest_stop_str=$(
+      gosu postgres pgbackrest --config="$PGBACKREST_RECOVERY_S3_CONF" \
+        --stanza=main info 2>/dev/null \
+      | awk -F' / ' '/timestamp start\/stop:/ {print $2; exit}'
+    )
+    target_epoch=$(date -d "$POSTGRES_RECOVERY_TARGET_TIME" +%s 2>/dev/null || echo "")
+    if [ -n "$earliest_stop_str" ]; then
+      earliest_stop_epoch=$(date -d "$earliest_stop_str" +%s 2>/dev/null || echo "")
+    fi
+    if [ -n "$target_epoch" ] && [ -n "${earliest_stop_epoch:-}" ] \
+         && [ "$target_epoch" -lt "$earliest_stop_epoch" ]; then
+      restore_type="immediate"
+      restore_target=""
+      echo "pgbackrest: target_time ${POSTGRES_RECOVERY_TARGET_TIME} predates earliest backup stop ${earliest_stop_str}; switching to --type=immediate (idle-source recovery — data lives in the snapshot, postgres will stop at backup_end_lsn)"
+    fi
   fi
 
   # --pg1-path is taken from $PGDATA so this works in restore-only mode too,
   # where render_pgbackrest_conf has been called but didn't include repo2.
+  # --target only makes sense for type=time/xid/lsn/name; immediate has no
+  # target so omit the flag entirely.
+  local -a target_args=()
+  if [ "$restore_type" = "immediate" ]; then
+    target_args=("--type=immediate")
+  else
+    target_args=("--type=$restore_type" "--target=$restore_target")
+  fi
   if ! gosu postgres pgbackrest --config="$PGBACKREST_RECOVERY_S3_CONF" \
        --stanza=main \
        --pg1-path="$PGDATA" \
        --recovery-option=restore_command="$recovery_restore_cmd" \
        restore \
-       --type="$restore_type" --target="$restore_target" \
+       "${target_args[@]}" \
        --target-action=promote; then
     echo "pgbackrest: restore from source bucket failed; fix env vars (WAL_RECOVER_FROM_*, POSTGRES_RECOVERY_TARGET_TIME, POSTGRES_RECOVERY_TARGET_XID) and redeploy" >&2
     exit 1

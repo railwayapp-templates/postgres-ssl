@@ -2698,6 +2698,153 @@ t_pitr_target_xid_routes_xid_through_stack() {
   docker volume rm "$src_vol" "$rest_vol" >/dev/null
 }
 
+# I3. Idle-source restore: target_time predates earliest backup → wrapper
+# falls back to --type=immediate.
+#
+# Customer scenario: cluster runs, user commits some rows, user enables PITR.
+# First base backup is taken AFTER the commits. User clicks restore before
+# making any more writes. Frontend pins target to lastCommittedTxnAt, which
+# predates the earliest backup. pgbackrest's default --type=time selection
+# requires `backup_stop ≤ target` so it can replay WAL forward — that rule
+# is correct in general, but here NO backup qualifies and pgbackrest [075]s
+# "unable to find backup set with stop time less than '<target>'".
+#
+# The data IS in the bucket: latest backup's contents = state at
+# backup_begin_lsn, which on an idle source already includes everything ≤
+# the user's last commit. Fix: wrapper probes `pgbackrest info` first; if
+# target_time < earliest backup's stop_time, switches to --type=immediate.
+# pgbackrest takes the latest backup, postgres stops at backup_end_lsn,
+# customer gets their data.
+#
+# This test pins:
+#   1. wrapper logs the fallback-decision diagnostic
+#   2. pgbackrest invoked with --type=immediate (no --target flag — failure
+#      mode without the fix is [075] on --type=time)
+#   3. restored cluster comes up and serves the pre-backup row
+t_pitr_target_predates_earliest_backup_uses_immediate_fallback() {
+  reset_bucket
+  local src_name=t-idle-src-${PG_VERSION}
+  local src_vol=${src_name}-vol
+  new_volume "$src_vol"
+  docker rm -f "$src_name" >/dev/null 2>&1 || true
+  run_archiving_pg "$src_name" "$src_vol"
+  wait_for_pg "$src_name" || {
+    ko "${FUNCNAME[0]}" "source postgres did not start"
+    fail_dump "${FUNCNAME[0]}" "$src_name"
+    return
+  }
+  for _ in $(seq 1 15); do
+    docker logs "$src_name" 2>&1 | grep -q "stanza-create completed" && break
+    sleep 1
+  done
+
+  # Commit a row, capture wall-clock as target, then take the initial full
+  # backup. backup.stop_time will be AFTER target — exactly the customer
+  # shape (last commit predates the only backup).
+  docker exec "$src_name" psql -U postgres -c \
+    "CREATE TABLE pitrtest(id int, marker text);" >/dev/null
+  docker exec "$src_name" psql -U postgres -c \
+    "INSERT INTO pitrtest VALUES (1, 'pre-backup');" >/dev/null
+  local target
+  target=$(docker exec "$src_name" psql -U postgres -At -c \
+    "SELECT now()::timestamptz(0)")
+  # Gap so backup.stop_time > target after second-rounding.
+  sleep 3
+
+  local src_path
+  src_path=$(docker exec "$src_name" cat /var/lib/postgresql/data/.pgbackrest_repo_path 2>/dev/null \
+    || echo "/pgbackrest")
+  docker exec -u postgres "$src_name" bash -c '
+    if [ -f /var/lib/postgresql/data/.pgbackrest_repo_path ]; then
+      export PGBACKREST_REPO1_PATH="$(cat /var/lib/postgresql/data/.pgbackrest_repo_path)"
+    else
+      export PGBACKREST_REPO1_PATH="$WAL_ARCHIVE_PATH"
+    fi
+    export PGBACKREST_REPO1_S3_BUCKET="$WAL_ARCHIVE_BUCKET"
+    export PGBACKREST_REPO1_S3_KEY="$WAL_ARCHIVE_KEY"
+    export PGBACKREST_REPO1_S3_KEY_SECRET="$WAL_ARCHIVE_SECRET"
+    export PGBACKREST_REPO1_S3_REGION="$WAL_ARCHIVE_REGION"
+    export PGBACKREST_REPO1_S3_ENDPOINT="$WAL_ARCHIVE_ENDPOINT"
+    pgbackrest --stanza=main backup --type=full
+  ' >/dev/null 2>&1 || {
+    ko "${FUNCNAME[0]}" "manual full backup failed"
+    fail_dump "${FUNCNAME[0]}" "$src_name"
+    return
+  }
+
+  local rest_name=t-idle-rest-${PG_VERSION}
+  local rest_vol=${rest_name}-vol
+  new_volume "$rest_vol"
+  docker rm -f "$rest_name" >/dev/null 2>&1 || true
+  docker run -d --name "$rest_name" --label postgres-ssl-e2e=1 --network "$NET" \
+    -e POSTGRES_PASSWORD=test \
+    -e "WAL_RECOVER_FROM_BUCKET=$BUCKET" \
+    -e "WAL_RECOVER_FROM_ENDPOINT=http://${MINIO}:9000" \
+    -e WAL_RECOVER_FROM_REGION=us-east-1 \
+    -e WAL_RECOVER_FROM_KEY=$MINIO_USER \
+    -e WAL_RECOVER_FROM_SECRET=$MINIO_PASS \
+    -e "WAL_RECOVER_FROM_PATH=$src_path" \
+    -e PGBACKREST_REPO1_S3_URI_STYLE=path \
+    -e "POSTGRES_RECOVERY_TARGET_TIME=$target" \
+    -v "$rest_vol:/var/lib/postgresql/data" \
+    "$IMAGE" >/dev/null
+
+  wait_for_pg "$rest_name" || {
+    ko "${FUNCNAME[0]}" "restored postgres did not start — fallback probably did not trip"
+    fail_dump "${FUNCNAME[0]}" "$rest_name"
+    return
+  }
+
+  local logs
+  logs=$(docker logs "$rest_name" 2>&1)
+  # Wrapper diagnostic — confirms the probe ran and decided to switch.
+  # Without this line the fallback didn't fire; the restore likely just
+  # happened to succeed via some other path.
+  if ! echo "$logs" | grep -q "switching to --type=immediate"; then
+    ko "${FUNCNAME[0]}" "wrapper did not log immediate-fallback decision"
+    fail_dump "${FUNCNAME[0]}" "$rest_name"
+    return
+  fi
+  # pgbackrest invocation — must NOT carry --type=time. Catches a future
+  # refactor that emits both flags.
+  if ! echo "$logs" | grep -qE "pgbackrest .*--type=immediate"; then
+    ko "${FUNCNAME[0]}" "pgbackrest restore not invoked with --type=immediate"
+    fail_dump "${FUNCNAME[0]}" "$rest_name"
+    return
+  fi
+  if echo "$logs" | grep -qE "pgbackrest .*--type=time"; then
+    ko "${FUNCNAME[0]}" "pgbackrest restore also invoked with --type=time — wrapper double-fired"
+    fail_dump "${FUNCNAME[0]}" "$rest_name"
+    return
+  fi
+  # Loud-refuse signal that the fix is what's keeping us alive — without
+  # immediate fallback, this exact target produces [075] from pgbackrest.
+  if echo "$logs" | grep -q "ERROR: \[075\]: unable to find backup set with stop time less than"; then
+    ko "${FUNCNAME[0]}" "pgbackrest still emitted [075] — fallback fired too late"
+    fail_dump "${FUNCNAME[0]}" "$rest_name"
+    return
+  fi
+
+  # End-to-end behavior: the pre-backup row IS in the restored cluster.
+  # Validates the "data lives in the snapshot" claim — without it, the
+  # immediate fallback would restore an empty/wrong dataset and this
+  # would return 0.
+  local count
+  count=$(docker exec "$rest_name" psql -U postgres -At -c \
+    "SELECT count(*) FROM pitrtest WHERE id=1 AND marker='pre-backup'" 2>/dev/null \
+    || echo "")
+  if [ "$count" != "1" ]; then
+    ko "${FUNCNAME[0]}" "restored cluster missing the pre-backup row (count=${count})"
+    fail_dump "${FUNCNAME[0]}" "$rest_name"
+    return
+  fi
+
+  ok "${FUNCNAME[0]}"
+  note "wrapper probed pgbackrest info → target predates earliest backup → --type=immediate fallback → restored cluster came up with the pre-backup row"
+  docker rm -f "$src_name" "$rest_name" >/dev/null
+  docker volume rm "$src_vol" "$rest_vol" >/dev/null
+}
+
 # G3. Restore over a WAL gap → loud refuse.
 # Mirrors test-postgres-pitr/gaps at the image level. Custom setup (not
 # setup_pitr_source) so we have tight control over which segment contains
@@ -3164,6 +3311,7 @@ ALL_TESTS=(
   # mutation-driven e2e flows)
   t_pitr_idle_source_target_time_fatals
   t_pitr_target_xid_routes_xid_through_stack
+  t_pitr_target_predates_earliest_backup_uses_immediate_fallback
   t_pitr_missing_wal_segment_fatals
   t_lifecycle_enable_disable_reenable
   t_chain_restore_r1_to_r2
