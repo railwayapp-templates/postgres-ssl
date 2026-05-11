@@ -163,6 +163,7 @@ run_backup() {
         ;;
     esac
     log "backup --type=$type completed"
+    emit_pitr_anchor
     return 0
   fi
   log "backup --type=$type failed (will retry on next poll)"
@@ -224,6 +225,33 @@ decide_action() {
       DECIDED_ACTION="diff"; return 0
     fi
   fi
+}
+
+# Emits one transactional commit right after a successful backup so the PITR
+# picker has a commit-timestamp anchor to clamp `recovery_target_time`
+# against. Without this, a brand-new cluster with a base backup but zero
+# user commits leaves `pg_last_committed_xact()` and
+# `pg_xact_commit_timestamp(newest_commit_ts_xid from pg_control_checkpoint())`
+# both NULL — the picker has no safe ceiling and any restore target FATALs
+# recovery with "recovery ended before configured recovery target was
+# reached" (it only stops at XLOG_XACT_COMMIT records).
+#
+# transactional=true produces a real XLOG_XACT_COMMIT record with a commit
+# timestamp, populates `pg_commit_ts/`, and the next checkpoint persists
+# `newest_commit_ts_xid` into pg_control. The picker's GREATEST-of-two-
+# sources query picks it up on the next 30s probe refresh.
+#
+# Idempotent: every subsequent backup re-fires the emit. If the cluster
+# already has user commits, the extra anchor is invisible noise (one trivial
+# transaction, no table side effect). Failure is non-fatal — `pg_logical_emit_message`
+# only fails on a postmaster shutdown or a write barrier, in which case the
+# next iteration's backup will retry.
+emit_pitr_anchor() {
+  psql -U postgres -tAXq -c \
+    "SELECT pg_logical_emit_message(true, 'rwy_pitr_anchor', '')" \
+    >/dev/null 2>&1 \
+    && log "pitr anchor emitted" \
+    || log "pitr anchor emit failed (non-fatal)"
 }
 
 # Emits a few bytes of WAL with no table side-effects so archive_timeout=60
