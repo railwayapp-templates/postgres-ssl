@@ -120,6 +120,8 @@ Operator-facing env contract:
 | `WAL_ARCHIVE_PATH` | path prefix where archive-push writes (default `/pgbackrest`) |
 | `WAL_RECOVER_FROM_BUCKET` / `_ENDPOINT` / `_REGION` / `_KEY` / `_SECRET` / `_PATH` | source-bucket coordinates on a PITR-restored fork; mounted as `repo2` (read-only) so `archive-get` and the empty-volume `pgbackrest restore` can pull source WAL during replay. Set by backboard on restore; not normally a manual knob. |
 | `POSTGRES_RECOVERY_TARGET_TIME` | ISO 8601 timestamp; stages archive-recovery replay on next start |
+| `POSTGRES_RECOVERY_TARGET_XID` | exact transaction ID; takes precedence over `_TIME` for idle-source-safe restores |
+| `POSTGRES_RECOVERY_TARGET_TYPE` | set to `immediate` to restore to base-backup consistency only, no WAL replay past `pg_backup_stop` — takes precedence over `_TIME` and `_XID`. Used when the source has zero tracked commits to anchor against. |
 | `POSTGRES_ARCHIVE_TIMEOUT` | seconds Postgres waits before forcing a WAL switch (default `60`) |
 | `WAL_BACKUP_FULL_INTERVAL_HOURS` | image-owned full base-backup cadence (default `168` = weekly; `0` disables periodic fulls). Initial / gap-recovery fulls fire regardless. |
 | `WAL_BACKUP_DIFF_INTERVAL_HOURS` | image-owned differential base-backup cadence (default `24`; `0` disables) |

@@ -527,9 +527,17 @@ bootstrap_pgbackrest_stanza() {
   ) &
 }
 
-# Stage PITR replay when POSTGRES_RECOVERY_TARGET_TIME is set. Writes
-# recovery settings to $PGDATA/conf.d/pgbackrest-recovery.conf and creates
-# recovery.signal.
+# Stage PITR replay when POSTGRES_RECOVERY_TARGET_TIME (timestamp),
+# POSTGRES_RECOVERY_TARGET_XID (exact xid), or
+# POSTGRES_RECOVERY_TARGET_TYPE=immediate (restore-to-base-backup, no
+# target needed) is set. Writes recovery settings to
+# $PGDATA/conf.d/pgbackrest-recovery.conf and creates recovery.signal.
+#
+# `immediate` lands on the consistent-state at the end of the base backup
+# and stops there — no commit timestamp anchor required. The picker uses
+# it when the source has zero tracked commits (brand-new cluster); the
+# user gets the seed-data state without having to fabricate a commit
+# server-side.
 #
 # Two filesystem stamps coordinate "exactly once per successful promote":
 #   - .pitr_staging: written when we hand recovery off to Postgres. Means a
@@ -550,7 +558,11 @@ bootstrap_pgbackrest_stanza() {
 # the archive-push wrapper's --repo=1 pin.
 configure_pgbackrest_recovery() {
   [ -z "${WAL_RECOVER_FROM_BUCKET:-}" ] && return 0
-  [ -z "$POSTGRES_RECOVERY_TARGET_TIME" ] && return 0
+  if [ -z "${POSTGRES_RECOVERY_TARGET_TIME:-}" ] \
+     && [ -z "${POSTGRES_RECOVERY_TARGET_XID:-}" ] \
+     && [ "${POSTGRES_RECOVERY_TARGET_TYPE:-}" != "immediate" ]; then
+    return 0
+  fi
   [ ! -f "$POSTGRES_CONF_FILE" ] && return 0
 
   # /etc/pgbackrest is rebuilt on every boot, so always re-render the
@@ -608,18 +620,27 @@ EOF
   # an embedded apostrophe can't break the conf file or smuggle a setting.
   local escaped_restore="${restore_cmd//\'/\'\'}"
 
-  # POSTGRES_RECOVERY_TARGET_XID, when set, wins over _TIME — same idle-
+  # Pick the recovery target. TYPE=immediate is the no-anchor path —
+  # postgres stops at end-of-base-backup consistency, no WAL replay past
+  # that, no target value needed. XID wins over TIME for the same idle-
   # source-safe rationale as restore_from_pgbackrest_if_empty_volume:
   # recovery_target_time hangs/FATALs when no commit record exists past
   # target on an idle DB, recovery_target_xid matches an exact commit.
-  # The picker emits _XID when it clamped to lastCommittedTxnAt.
+  # The picker emits _XID when it clamped to lastCommittedTxnAt; _TYPE
+  # when the source has zero committed transactions to anchor against.
   local recovery_param
-  if [ -n "${POSTGRES_RECOVERY_TARGET_XID:-}" ]; then
+  local target_label
+  if [ "${POSTGRES_RECOVERY_TARGET_TYPE:-}" = "immediate" ]; then
+    recovery_param="recovery_target = 'immediate'"
+    target_label="immediate"
+  elif [ -n "${POSTGRES_RECOVERY_TARGET_XID:-}" ]; then
     local escaped_xid="${POSTGRES_RECOVERY_TARGET_XID//\'/\'\'}"
     recovery_param="recovery_target_xid = '${escaped_xid}'"
+    target_label="xid=${POSTGRES_RECOVERY_TARGET_XID}"
   else
     local escaped_target="${POSTGRES_RECOVERY_TARGET_TIME//\'/\'\'}"
     recovery_param="recovery_target_time = '${escaped_target}'"
+    target_label="time=${POSTGRES_RECOVERY_TARGET_TIME}"
   fi
   cat > "$PGBACKREST_RECOVERY_CONF" <<EOF
 restore_command = '${escaped_restore}'
@@ -630,7 +651,7 @@ EOF
   chmod 0640 "$PGBACKREST_RECOVERY_CONF"
   touch "$PGDATA/recovery.signal"
   touch "$PITR_STAGING_FILE"
-  echo "pgbackrest: PITR replay staged (target=${POSTGRES_RECOVERY_TARGET_TIME})"
+  echo "pgbackrest: PITR replay staged (${target_label})"
 }
 
 # When a restored service is created with an empty volume + WAL_RECOVER_FROM_*
@@ -649,14 +670,18 @@ EOF
 restore_from_pgbackrest_if_empty_volume() {
   # Log gate state up front so post-mortems on "why did pgbackrest restore
   # run when I expected it to be skipped" don't require guessing.
-  echo "pgbackrest: restore-gate WAL_RECOVER_FROM_BUCKET=${WAL_RECOVER_FROM_BUCKET:+set} POSTGRES_RECOVERY_TARGET_TIME=${POSTGRES_RECOVERY_TARGET_TIME:+set} PG_VERSION=$([ -f "$PGDATA/PG_VERSION" ] && echo present || echo missing) RESTORED_MARKER=$([ -f "$PGBACKREST_RESTORED_MARKER" ] && echo present || echo missing) PGDATA=$PGDATA"
+  echo "pgbackrest: restore-gate WAL_RECOVER_FROM_BUCKET=${WAL_RECOVER_FROM_BUCKET:+set} POSTGRES_RECOVERY_TARGET_TIME=${POSTGRES_RECOVERY_TARGET_TIME:+set} POSTGRES_RECOVERY_TARGET_XID=${POSTGRES_RECOVERY_TARGET_XID:+set} POSTGRES_RECOVERY_TARGET_TYPE=${POSTGRES_RECOVERY_TARGET_TYPE:-} PG_VERSION=$([ -f "$PGDATA/PG_VERSION" ] && echo present || echo missing) RESTORED_MARKER=$([ -f "$PGBACKREST_RESTORED_MARKER" ] && echo present || echo missing) PGDATA=$PGDATA"
 
   [ -z "${WAL_RECOVER_FROM_BUCKET:-}" ] && return 0
-  [ -z "${POSTGRES_RECOVERY_TARGET_TIME:-}" ] && return 0
+  if [ -z "${POSTGRES_RECOVERY_TARGET_TIME:-}" ] \
+     && [ -z "${POSTGRES_RECOVERY_TARGET_XID:-}" ] \
+     && [ "${POSTGRES_RECOVERY_TARGET_TYPE:-}" != "immediate" ]; then
+    return 0
+  fi
   [ -f "$PGDATA/PG_VERSION" ] && return 0
   [ -f "$PGBACKREST_RESTORED_MARKER" ] && return 0
 
-  echo "pgbackrest: empty PGDATA + recovery target — restoring from source bucket (target=${POSTGRES_RECOVERY_TARGET_TIME})"
+  echo "pgbackrest: empty PGDATA + recovery target — restoring from source bucket"
 
   install -d -m 0700 -o postgres -g postgres "$PGDATA"
 
@@ -694,44 +719,53 @@ EOF
   # bucket without touching the default config.
   local recovery_restore_cmd="pgbackrest --config=${PGBACKREST_RECOVERY_S3_CONF} --stanza=main archive-get %f %p"
 
-  # Pick the recovery target type. POSTGRES_RECOVERY_TARGET_XID, when set,
-  # wins over _TIME because it's the only target type postgres can match
-  # exactly on an idle source. recovery_target_time requires postgres to
-  # observe a WAL record with timestamp > target before declaring "target
-  # reached" and firing recovery_target_action=promote; on an idle DB no
-  # such record exists, so recovery FATALs with "recovery ended before
-  # configured recovery target was reached" and the cluster either loops
-  # the FATAL or hangs in hot_standby read-only mode. recovery_target_xid
-  # matches an exact transaction ID — applying the target xid's commit
-  # is unambiguously "target reached." The picker (mono's
-  # createServiceFromPITR mutation) sets _XID when it clamped target
-  # down to lastCommittedTxnAt, leaves it unset for arbitrary
-  # historical times.
-  local restore_type="time"
-  local restore_target="$POSTGRES_RECOVERY_TARGET_TIME"
-  if [ -n "${POSTGRES_RECOVERY_TARGET_XID:-}" ]; then
-    restore_type="xid"
-    restore_target="$POSTGRES_RECOVERY_TARGET_XID"
+  # Pick the recovery target type. _TYPE=immediate wins outright — there's
+  # no target value, pgbackrest stops at end-of-base-backup consistency.
+  # _XID wins over _TIME for the idle-source-safe rationale:
+  # recovery_target_time requires postgres to observe a WAL record with
+  # timestamp > target before declaring "target reached" and firing
+  # recovery_target_action=promote; on an idle DB no such record exists,
+  # so recovery FATALs with "recovery ended before configured recovery
+  # target was reached" and the cluster either loops the FATAL or hangs
+  # in hot_standby read-only mode. recovery_target_xid matches an exact
+  # transaction ID — applying the target xid's commit is unambiguously
+  # "target reached." The picker (mono's volumeInstancePITRRestore
+  # mutation) sets _XID when it clamped target down to lastCommittedTxnAt,
+  # sets _TYPE=immediate when the source has zero tracked commits and
+  # there's no time/xid to pin to.
+  local pgbackrest_args=(
+    --config="$PGBACKREST_RECOVERY_S3_CONF"
+    --stanza=main
+    --pg1-path="$PGDATA"
+    --recovery-option="restore_command=$recovery_restore_cmd"
+    restore
+    --target-action=promote
+  )
+  local restore_label
+  if [ "${POSTGRES_RECOVERY_TARGET_TYPE:-}" = "immediate" ]; then
+    pgbackrest_args+=( --type=immediate )
+    restore_label="immediate"
+    echo "pgbackrest: using --type=immediate (restore-to-base-backup; no target value, no commit-timestamp anchor needed)"
+  elif [ -n "${POSTGRES_RECOVERY_TARGET_XID:-}" ]; then
+    pgbackrest_args+=( --type=xid --target="$POSTGRES_RECOVERY_TARGET_XID" )
+    restore_label="xid=${POSTGRES_RECOVERY_TARGET_XID}"
     echo "pgbackrest: using recovery_target_xid=${POSTGRES_RECOVERY_TARGET_XID} (idle-source-safe; target-time fallback would FATAL on no-record-after-target)"
+  else
+    pgbackrest_args+=( --type=time --target="$POSTGRES_RECOVERY_TARGET_TIME" )
+    restore_label="time=${POSTGRES_RECOVERY_TARGET_TIME}"
   fi
 
   # --pg1-path is taken from $PGDATA so this works in restore-only mode too,
   # where render_pgbackrest_conf has been called but didn't include repo2.
-  if ! gosu postgres pgbackrest --config="$PGBACKREST_RECOVERY_S3_CONF" \
-       --stanza=main \
-       --pg1-path="$PGDATA" \
-       --recovery-option=restore_command="$recovery_restore_cmd" \
-       restore \
-       --type="$restore_type" --target="$restore_target" \
-       --target-action=promote; then
-    echo "pgbackrest: restore from source bucket failed; fix env vars (WAL_RECOVER_FROM_*, POSTGRES_RECOVERY_TARGET_TIME, POSTGRES_RECOVERY_TARGET_XID) and redeploy" >&2
+  if ! gosu postgres pgbackrest "${pgbackrest_args[@]}"; then
+    echo "pgbackrest: restore from source bucket failed; fix env vars (WAL_RECOVER_FROM_*, POSTGRES_RECOVERY_TARGET_TIME, POSTGRES_RECOVERY_TARGET_XID, POSTGRES_RECOVERY_TARGET_TYPE) and redeploy" >&2
     exit 1
   fi
 
   touch "$PGBACKREST_RESTORED_MARKER"
   chown postgres:postgres "$PGBACKREST_RESTORED_MARKER" 2>/dev/null || true
 
-  echo "pgbackrest: restore complete; postgres will replay forward to ${POSTGRES_RECOVERY_TARGET_TIME} and promote on first start"
+  echo "pgbackrest: restore complete (${restore_label}); postgres will replay forward and promote on first start"
 }
 
 # Fork the backup watcher. Subshell pattern matches bootstrap_pgbackrest_stanza
