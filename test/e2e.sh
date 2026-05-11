@@ -2333,69 +2333,6 @@ t_restored_marker_persists_across_restarts() {
   docker volume rm "$src_vol" "$rest_vol" >/dev/null
 }
 
-# G9-companion: confirms the watcher's boot-time bucket reconcile clears a
-# stale cache when the bucket has been swapped out under it. Drives the new
-# reconcile_state_with_bucket() path in pgbackrest-backup-watcher.sh.
-t_watcher_reconciles_state_against_bucket_on_boot() {
-  local name=t-recon-${PG_VERSION}
-  local vol=${name}-vol
-  reset_bucket
-  new_volume "$vol"
-  docker rm -f "$name" >/dev/null 2>&1 || true
-
-  # Phase 1: archive + take initial full into bucket A. State file gets a
-  # last_full_at entry.
-  run_archiving_pg_fast_watcher "$name" "$vol"
-  wait_for_pg "$name" || { ko t_watcher_reconciles_state_against_bucket_on_boot "phase1 startup"; return; }
-  for _ in $(seq 1 15); do
-    docker logs "$name" 2>&1 | grep -q "stanza-create completed" && break
-    sleep 1
-  done
-  docker exec "$name" psql -U postgres -c "CREATE TABLE t(id int); SELECT pg_switch_wal();" >/dev/null
-  wait_for_watcher_backup "$name" full 60 || { ko t_watcher_reconciles_state_against_bucket_on_boot "no initial full"; return; }
-  if ! docker exec "$name" grep -q "^last_full_at=" /var/lib/postgresql/data/.pgbackrest_backup_state; then
-    ko t_watcher_reconciles_state_against_bucket_on_boot "phase1 didn't populate last_full_at"
-    return
-  fi
-
-  # Phase 2: stop, wipe the bucket externally (simulates "operator pointed
-  # WAL_ARCHIVE_BUCKET at a freshly-created bucket"), restart with same env.
-  # On boot, reconcile must clear the stale last_full_at.
-  docker rm -f "$name" >/dev/null
-  reset_bucket
-
-  run_archiving_pg_fast_watcher "$name" "$vol"
-  wait_for_pg "$name" || { ko t_watcher_reconciles_state_against_bucket_on_boot "phase2 startup"; return; }
-
-  # Reconcile fires once before the watcher's main loop. Wait a few polls.
-  local deadline=$(($(date +%s) + 30)) reconciled=0
-  while [ "$(date +%s)" -lt "$deadline" ]; do
-    if docker logs "$name" 2>&1 | grep -q "reconcile: bucket has no full but cache claims"; then
-      reconciled=1; break
-    fi
-    sleep 2
-  done
-  if [ "$reconciled" != "1" ]; then
-    ko t_watcher_reconciles_state_against_bucket_on_boot "watcher did not log reconcile-cleared"
-    fail_dump t_watcher_reconciles_state_against_bucket_on_boot "$name"
-    return
-  fi
-
-  # Force a WAL switch and confirm NEEDS_INITIAL_BACKUP fires (bucket truly
-  # empty + cache cleared → archived_count > 0 + last_full_at empty → full).
-  docker exec "$name" psql -U postgres -c "INSERT INTO t VALUES (1); SELECT pg_switch_wal();" >/dev/null
-  if ! wait_for_watcher_backup "$name" full 60; then
-    ko t_watcher_reconciles_state_against_bucket_on_boot "watcher did not take fresh initial full after reconcile"
-    fail_dump t_watcher_reconciles_state_against_bucket_on_boot "$name"
-    return
-  fi
-
-  ok t_watcher_reconciles_state_against_bucket_on_boot
-  note "stale cache cleared on boot; NEEDS_INITIAL_BACKUP re-fired against the empty bucket"
-  docker rm -f "$name" >/dev/null
-  docker volume rm "$vol" >/dev/null
-}
-
 # ----- learnings from test-postgres-pitr (railway-side e2e harness) ----------
 #
 # These mirror flows from ../test-postgres-pitr/e2e/run-test.ts at the image
@@ -3167,9 +3104,6 @@ ALL_TESTS=(
   t_pitr_missing_wal_segment_fatals
   t_lifecycle_enable_disable_reenable
   t_chain_restore_r1_to_r2
-  # t_watcher_reconciles_state_against_bucket_on_boot — depends on
-  # reconcile_state_with_bucket() in the watcher, which isn't on the
-  # per-cluster-archive-paths branch yet. Reinstate when D1 lands.
 )
 
 trap 'cleanup_test_resources' EXIT
