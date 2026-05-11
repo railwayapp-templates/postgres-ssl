@@ -964,10 +964,22 @@ t_pitr_retry_after_failed_staging() {
     -e "POSTGRES_RECOVERY_TARGET_TIME=$target" \
     -v "$rest_vol:/var/lib/postgresql/data" \
     "$IMAGE" >/dev/null
-  sleep 6
 
-  if ! docker logs "$rest_name" 2>&1 | grep -q "PITR replay staged (target=$target)"; then
-    ko t_pitr_retry_after_failed_staging "second attempt did not re-stage with new target"
+  # Poll for the staging log instead of `sleep 6 + single grep`. The fixed
+  # sleep was racy on slow CI runners — `docker run -d` returns when the
+  # container is created, not when it starts, and wrapper.sh runs cert
+  # checks + conf rendering + state-dir wiring before reaching
+  # configure_pgbackrest_recovery. On busy hosts the staging log can land
+  # 8+ seconds after `docker run` returns, past the old fixed sleep.
+  local deadline=$(($(date +%s) + 30)) found=0
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if docker logs "$rest_name" 2>&1 | grep -q "PITR replay staged (target=$target)"; then
+      found=1; break
+    fi
+    sleep 2
+  done
+  if [ "$found" != "1" ]; then
+    ko t_pitr_retry_after_failed_staging "second attempt did not re-stage with new target within 30s"
     fail_dump t_pitr_retry_after_failed_staging "$rest_name"
     return
   fi
