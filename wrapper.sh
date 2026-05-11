@@ -798,11 +798,4 @@ unset PGPORT
 bootstrap_pgbackrest_stanza
 fork_pgbackrest_backup_watcher
 
-# Call the entrypoint script with the
-# appropriate PGHOST & PGPORT and redirect
-# the output to stdout if LOG_TO_STDOUT is true
-if [[ "$LOG_TO_STDOUT" == "true" ]]; then
-    /usr/local/bin/docker-entrypoint.sh "$@" 2>&1
-else
-    /usr/local/bin/docker-entrypoint.sh "$@"
-fi
+/usr/local/bin/docker-entrypoint.sh "$@"
