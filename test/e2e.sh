@@ -1269,15 +1269,24 @@ t_watcher_gap_recovery_full() {
   # gap-recovery branch on the next poll.
   docker exec -u postgres "$name" touch /var/lib/postgresql/data/.pgbackrest_gap_pending
 
+  # `cleared gap marker` is emitted right before `backup --type=full
+  # completed` in run_backup(). Wait on both signals inside the loop —
+  # checking them separately races against docker's stdout flush window
+  # (the two echoes can land in different `docker logs` snapshots even
+  # though the watcher emits them back-to-back in the same shell).
   local deadline=$(($(date +%s) + 30)) hit=0
   while [ "$(date +%s)" -lt "$deadline" ]; do
-    local now_count
-    now_count=$(docker logs "$name" 2>&1 | grep -c "backup --type=full completed" || true)
-    if [ "$now_count" -gt "$before_count" ]; then hit=1; break; fi
+    local logs now_count
+    logs=$(docker logs "$name" 2>&1)
+    now_count=$(echo "$logs" | grep -c "backup --type=full completed" || true)
+    if [ "$now_count" -gt "$before_count" ] \
+       && echo "$logs" | grep -q "cleared gap marker"; then
+      hit=1; break
+    fi
     sleep 2
   done
   if [ "$hit" != "1" ]; then
-    ko t_watcher_gap_recovery_full "watcher did not take gap-recovery full"
+    ko t_watcher_gap_recovery_full "watcher did not take gap-recovery full or did not log 'cleared gap marker'"
     fail_dump t_watcher_gap_recovery_full "$name"
     return
   fi
@@ -1285,12 +1294,6 @@ t_watcher_gap_recovery_full() {
   # Marker should be cleared by run_backup() after the full lands.
   if docker exec "$name" test -f /var/lib/postgresql/data/.pgbackrest_gap_pending; then
     ko t_watcher_gap_recovery_full ".pgbackrest_gap_pending was not cleared after gap-recovery full"
-    return
-  fi
-
-  if ! docker logs "$name" 2>&1 | grep -q "cleared gap marker"; then
-    ko t_watcher_gap_recovery_full "expected 'cleared gap marker' log line"
-    fail_dump t_watcher_gap_recovery_full "$name"
     return
   fi
 
