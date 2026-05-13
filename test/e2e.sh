@@ -304,6 +304,59 @@ t_vanilla_boot() {
   docker volume rm "$vol" >/dev/null
 }
 
+t_invalid_bucket_skips_archive() {
+  # Sets WAL_ARCHIVE_BUCKET to junk shapes the upstream resolver might leak
+  # (unresolved Railway template ref + bucket-id UUID). The image guard must
+  # refuse to enable archiving rather than writing the junk into
+  # pgbackrest.conf and letting pgbackrest hard-fail every archive_command
+  # until pgbackrest-archive-push-wrapper.sh's 500 MiB threshold drops WAL.
+  for bad in '${{121ccc45-0912-457e-8dc0-76625fe644bb.BUCKET}}' '121ccc45-0912-457e-8dc0-76625fe644bb'; do
+    local name=t-badbucket-${PG_VERSION}
+    local vol=${name}-vol
+    new_volume "$vol"
+    docker rm -f "$name" >/dev/null 2>&1 || true
+    docker run -d --name "$name" --label postgres-ssl-e2e=1 --network "$NET" \
+      -e POSTGRES_PASSWORD=test \
+      -e "WAL_ARCHIVE_BUCKET=${bad}" \
+      -e "WAL_ARCHIVE_ENDPOINT=http://${MINIO}:9000" \
+      -e "WAL_ARCHIVE_REGION=us-east-1" \
+      -e "WAL_ARCHIVE_KEY=$MINIO_USER" \
+      -e "WAL_ARCHIVE_SECRET=$MINIO_PASS" \
+      -v "$vol:/var/lib/postgresql/data" \
+      "$IMAGE" >/dev/null
+    wait_for_pg "$name" || { ko t_invalid_bucket_skips_archive "postgres did not start with bucket=${bad}"; fail_dump t_invalid_bucket_skips_archive "$name"; return; }
+
+    local archive_mode
+    archive_mode=$(docker exec "$name" psql -U postgres -At -c "SHOW archive_mode")
+    assert_eq "$archive_mode" "off" "archive_mode should be off for invalid bucket (${bad})" || { ko t_invalid_bucket_skips_archive ""; fail_dump t_invalid_bucket_skips_archive "$name"; return; }
+
+    # The junk must NOT have landed in pgbackrest.conf — that's the whole
+    # point. clear_pgbackrest_state_if_disabled treats the unset vars as
+    # "archiving off" and tears down any stale config.
+    if docker exec "$name" test -f /etc/pgbackrest/pgbackrest.conf; then
+      ko t_invalid_bucket_skips_archive "pgbackrest.conf should not exist when bucket is invalid"; fail_dump t_invalid_bucket_skips_archive "$name"; return
+    fi
+    if docker exec "$name" test -f /var/lib/postgresql/data/conf.d/pgbackrest.conf; then
+      ko t_invalid_bucket_skips_archive "conf.d/pgbackrest.conf should not exist when bucket is invalid"; fail_dump t_invalid_bucket_skips_archive "$name"; return
+    fi
+
+    # Sentinel must be present so the dashboard can distinguish "PITR never
+    # enabled" from "PITR enabled but wired to junk." PGDATA in this image is
+    # /var/lib/postgresql/data directly (no pgdata sub-path).
+    if ! docker exec "$name" test -f /var/lib/postgresql/data/.pgbackrest_invalid_bucket; then
+      ko t_invalid_bucket_skips_archive "sentinel .pgbackrest_invalid_bucket missing under PGDATA"; fail_dump t_invalid_bucket_skips_archive "$name"; return
+    fi
+
+    if ! docker logs "$name" 2>&1 | grep -q "WAL_ARCHIVE_BUCKET.*looks invalid"; then
+      ko t_invalid_bucket_skips_archive "expected guard log line missing for bucket=${bad}"; fail_dump t_invalid_bucket_skips_archive "$name"; return
+    fi
+
+    docker rm -f "$name" >/dev/null
+    docker volume rm "$vol" >/dev/null
+  done
+  ok t_invalid_bucket_skips_archive
+}
+
 t_archiving_boot() {
   local name=t-arch-${PG_VERSION}
   local vol=${name}-vol
@@ -3073,6 +3126,7 @@ t_chain_restore_r1_to_r2() {
 
 ALL_TESTS=(
   t_vanilla_boot
+  t_invalid_bucket_skips_archive
   t_archiving_boot
   t_alter_system_survives_restart
   t_s3_unreachable_pg_stays_up

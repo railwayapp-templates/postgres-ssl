@@ -181,6 +181,60 @@ PGBACKREST_RESTORED_MARKER="$PGDATA/.pgbackrest_restored"
 # the user can browse and restore from.
 PGBACKREST_REPO_PATH_MARKER="$PGDATA/.pgbackrest_repo_path"
 
+# Sentinel: WAL_ARCHIVE_BUCKET was set to something we couldn't honor (an
+# unresolved Railway template ref, a bucket-id UUID, whitespace, …). The
+# monitor reads this to distinguish "PITR was never enabled" from "PITR is
+# enabled but wired to junk." Lives under PGDATA so it survives container
+# restarts and gets wiped with the volume.
+PGBACKREST_INVALID_BUCKET_MARKER="$PGDATA/.pgbackrest_invalid_bucket"
+
+# Screen WAL_ARCHIVE_BUCKET for known-bogus shapes before any code path
+# consumes it. If invalid, unset the WAL_ARCHIVE_* vars so every existing
+# `[ -z "${WAL_ARCHIVE_BUCKET:-}" ]` gate downstream treats archiving as
+# off — same behavior as "never enabled." Without this, an unresolved
+# `${{<bucket-id>.BUCKET}}` would land in /etc/pgbackrest/pgbackrest.conf
+# verbatim; pgBackRest would then hard-fail every archive_command and
+# pgbackrest-archive-push-wrapper.sh's 500 MiB WAL-drop threshold would
+# eventually trip — creating a real, unrecoverable PITR gap from what is
+# really an upstream wiring bug. The sentinel file lets the dashboard
+# surface this state distinctly from the no-config and unresolvable-creds
+# states.
+#
+# Caught shapes:
+#   - empty → already handled by existing gates; no-op here.
+#   - contains `${{` or `}}` → unresolved Railway template ref.
+#   - UUID 8-4-4-4-12 hex → almost certainly a raw bucket-id from a
+#     tombstoned bucket (resolver failed to map id → name).
+#   - whitespace or control chars → typo or shell-escape mishap.
+validate_wal_archive_bucket() {
+  local val="${WAL_ARCHIVE_BUCKET:-}"
+  [ -z "$val" ] && { rm -f "$PGBACKREST_INVALID_BUCKET_MARKER" 2>/dev/null || true; return 0; }
+
+  local invalid=""
+  case "$val" in
+    *'${{'*|*'}}'*) invalid="unresolved-template-ref" ;;
+    *[[:space:]]*) invalid="whitespace" ;;
+  esac
+  if [ -z "$invalid" ] \
+    && echo "$val" | grep -qE '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'; then
+    invalid="uuid-shape"
+  fi
+
+  if [ -n "$invalid" ]; then
+    echo "pgbackrest: WAL_ARCHIVE_BUCKET=\"${val}\" looks invalid (${invalid}); refusing to enable archiving" >&2
+    mkdir -p "$(dirname "$PGBACKREST_INVALID_BUCKET_MARKER")"
+    printf '%s\n' "${invalid}" > "$PGBACKREST_INVALID_BUCKET_MARKER" 2>/dev/null || true
+    chown postgres:postgres "$PGBACKREST_INVALID_BUCKET_MARKER" 2>/dev/null || true
+    chmod 0640 "$PGBACKREST_INVALID_BUCKET_MARKER" 2>/dev/null || true
+    unset WAL_ARCHIVE_BUCKET WAL_ARCHIVE_KEY WAL_ARCHIVE_SECRET
+    unset WAL_ARCHIVE_REGION WAL_ARCHIVE_ENDPOINT
+    return 0
+  fi
+
+  rm -f "$PGBACKREST_INVALID_BUCKET_MARKER" 2>/dev/null || true
+}
+validate_wal_archive_bucket
+
 # Add `include_dir = 'conf.d'` to postgresql.conf if not already present.
 # postgresql.conf is not rewritten by Postgres at runtime (only auto.conf is,
 # by ALTER SYSTEM), so this single line is durable. Called from both the
