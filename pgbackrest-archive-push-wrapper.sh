@@ -14,6 +14,11 @@
 # deleted bucket, expired keys, …) gets fixed before the threshold trips
 # and the failure signal disappears.
 #
+# Special case: if the bucket actively does not exist (S3 NoSuchBucket error),
+# there is no recovery without operator action — retrying is pointless and
+# letting WAL accumulate up to the threshold wastes disk. In that case the
+# wrapper drops immediately (returns 0) regardless of pg_wal size.
+#
 # The env var name avoids the PGBACKREST_* prefix on purpose: pgBackRest
 # treats every PGBACKREST_* variable as a config option and warns about
 # unknown names on every invocation. WAL_DROP_THRESHOLD_MB sits outside
@@ -74,9 +79,19 @@ fi
 # repos are configured). Multi-repo scoping for forks is enforced upstream
 # by ensuring repo2 is dropped from the rendered config post-promote, not
 # at the archive-push call site.
-pgbackrest --stanza=main archive-push "$WAL_FILE"
+pgb_out=$(pgbackrest --stanza=main archive-push "$WAL_FILE" 2>&1)
 PGB_RC=$?
+[ -n "$pgb_out" ] && printf '%s\n' "$pgb_out" >&2
 if [ "$PGB_RC" -eq 0 ]; then
+  exit 0
+fi
+
+# Bucket deleted: NoSuchBucket is the S3 error for a bucket that no longer
+# exists. No retry will ever succeed without operator action, so drop the
+# segment immediately rather than accumulating WAL up to the threshold.
+if printf '%s\n' "$pgb_out" | grep -q 'NoSuchBucket'; then
+  echo "pgbackrest-wrapper: bucket does not exist (NoSuchBucket); dropping ${WAL_FILE} immediately" >&2
+  touch "$PGDATA/.pgbackrest_gap_pending" 2>/dev/null || true
   exit 0
 fi
 
