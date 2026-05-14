@@ -68,6 +68,14 @@ GAP_RESOLVED_GRACE_SECONDS="${WAL_BACKUP_GAP_RESOLVED_GRACE_SECONDS:-300}"
 FULL_INTERVAL_HOURS="${WAL_BACKUP_FULL_INTERVAL_HOURS:-168}"
 DIFF_INTERVAL_HOURS="${WAL_BACKUP_DIFF_INTERVAL_HOURS:-24}"
 
+# How often to verify the S3 catalog actually contains a full backup (seconds).
+# Catches divergence between local state (last_full_at) and S3 reality — e.g.
+# the backup command returned exit 0 but the catalog write never completed, or a
+# volume survived a redeployment with stale state pointing at a different stanza
+# path. 0 disables periodic verification (NEEDS_INITIAL_BACKUP still fires on
+# fresh state). Default: 3600 (1 hour).
+CATALOG_VERIFY_INTERVAL_SECONDS="${WAL_BACKUP_CATALOG_VERIFY_INTERVAL_SECONDS:-3600}"
+
 # Resolved cadence in seconds. WAL_BACKUP_FULL_INTERVAL_SECONDS overrides
 # the hours setting — bash arithmetic precludes fractional hours, so the
 # e2e harness needs a second-level knob to exercise retention rollover
@@ -169,6 +177,18 @@ run_backup() {
   return 1
 }
 
+# Returns 0 if the S3 catalog for repo1 has at least one full backup; returns 1
+# if the catalog is empty or unreachable. Uses pgbackrest info --output=json so
+# no text-parsing heuristics are needed. A non-zero exit from pgbackrest itself
+# (stanza not yet created, S3 down, auth failure) is also treated as "can't tell"
+# and returns 1 — the caller only clears local state when the catalog explicitly
+# confirms no backup exists (exit 0 + empty backup list).
+catalog_has_backup() {
+  local info_out
+  info_out=$(timeout 60 pgbackrest --stanza=main --repo=1 info --output=json 2>/dev/null) || return 1
+  printf '%s' "$info_out" | grep -q '"type":"full"'
+}
+
 # Sets DECIDED_ACTION to "full"|"diff"|"" (no action). Runs in the caller's
 # shell — not a subshell — so the diagnostic globals (LAST_FULL_DIAG,
 # GAP_MARKER_DIAG, LAST_FULL_FAILED_DIAG) survive for watcher_iteration to
@@ -194,6 +214,32 @@ decide_action() {
   # time on idle DBs (heartbeat → archive_timeout → archive-push cycle).
   if [ -z "$last_full" ]; then
     DECIDED_ACTION="full"; return 0
+  fi
+
+  # Catalog verification — periodically confirm S3 actually has a full backup.
+  # Catches divergence between local state and S3 reality: the backup command
+  # may have returned exit 0 without committing catalog metadata (S3 partial
+  # write, stanza-create race), or a volume survived a redeployment with stale
+  # state pointing at a different stanza/sysid path. Only clears state when the
+  # catalog explicitly confirms "no backup" (exit 0 + empty backup list); an
+  # unreachable S3 or missing stanza returns non-zero and is treated as
+  # inconclusive so we don't burn a full on every transient S3 hiccup.
+  local last_catalog_verify
+  last_catalog_verify=$(read_state last_catalog_verify_at)
+  local needs_verify=0
+  if [ -z "$last_catalog_verify" ] || [ $((now - last_catalog_verify)) -ge "$CATALOG_VERIFY_INTERVAL_SECONDS" ]; then
+    needs_verify=1
+  fi
+  if [ "$needs_verify" -eq 1 ]; then
+    write_state_field last_catalog_verify_at "$now"
+    log "verifying S3 catalog has full backup"
+    if catalog_has_backup; then
+      log "catalog verified — full backup present in S3"
+    else
+      log "catalog shows no full backup despite local state (last_full=${last_full}); clearing last_full_at to trigger new full"
+      write_state_field last_full_at ""
+      DECIDED_ACTION="full"; return 0
+    fi
   fi
 
   # Gap recovery — explicit drop marker OR failed_count grew since last full.
