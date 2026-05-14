@@ -265,6 +265,44 @@ emit_wal_heartbeat() {
     >/dev/null 2>&1 || true
 }
 
+# Queries pgBackRest catalog and returns the number of full backups for the
+# main stanza. Returns 1 (non-zero) on any probe error so callers can
+# distinguish "0 backups" from "probe failed".
+pgbackrest_full_count() {
+  local info_json
+  info_json=$(pgbackrest --stanza=main info --output=json 2>/dev/null) || return 1
+  [ -z "$info_json" ] && return 1
+  local count
+  count=$(echo "$info_json" | grep -o '"type":"full"' | wc -l | tr -d ' ')
+  echo "$count"
+}
+
+# Checks once per hour that the pgBackRest catalog agrees with the local state
+# file. If last_full_at is set but the catalog shows 0 full backups (wrong S3
+# path, stanza recreated, etc.), clears last_full_at so NEEDS_INITIAL_BACKUP
+# fires on the next poll. Probe failures are silently ignored — transient S3
+# errors must not incorrectly reset state.
+verify_catalog() {
+  local now; now=$(date +%s)
+  local last_verified
+  last_verified=$(read_state last_catalog_verified_at)
+  : "${last_verified:=0}"
+
+  if [ $((now - last_verified)) -lt 3600 ]; then
+    return 0
+  fi
+
+  write_state_field last_catalog_verified_at "$now"
+
+  local count
+  count=$(pgbackrest_full_count) || return 0  # probe failed — don't clear state
+
+  if [ "$count" -eq 0 ]; then
+    log "catalog shows 0 full backups despite local state; resetting last_full_at"
+    write_state_field last_full_at ""
+  fi
+}
+
 watcher_iteration() {
   if ! pg_isready -h 127.0.0.1 -p 5432 -U postgres -q 2>/dev/null; then
     log "iteration skipped: pg_isready=fail (postgres not yet listening on TCP)"
@@ -291,6 +329,7 @@ watcher_iteration() {
   fi
 
   run_backup "$DECIDED_ACTION" || true
+  verify_catalog
 }
 
 # wrapper.sh forks us unconditionally; bail silently if archiving isn't on.
