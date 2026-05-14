@@ -30,14 +30,29 @@ NEXT_URL="https://hub.docker.com/v2/repositories/library/postgres/tags?page_size
 while [ -n "$NEXT_URL" ] && [ -z "$LATEST_VERSION" ]; do
   RESPONSE=$(curl -s "$NEXT_URL")
 
-  LATEST_VERSION=$(echo "$RESPONSE" | \
+  # Collect all matching version tags on this page, sorted descending.
+  CANDIDATES=$(echo "$RESPONSE" | \
     jq -r --arg major "$MAJOR_VERSION" '.results[] |
       select(.name | test("^" + $major + "\\.\\d+$")) |
       .name' | \
-    sort -V | \
-    tail -1)
+    sort -rV)
 
-  # Get next page URL if we didn't find our version
+  # Pick the newest candidate whose multi-platform manifest is fully published
+  # (images array non-empty). A tag with images:[] means Docker Hub received
+  # the push but hasn't finished publishing all platforms — building against it
+  # fails with "no match for platform in manifest".
+  while IFS= read -r candidate; do
+    [ -z "$candidate" ] && continue
+    IMAGE_COUNT=$(curl -s "https://hub.docker.com/v2/repositories/library/postgres/tags/${candidate}" | \
+      jq '.images | length')
+    if [ "${IMAGE_COUNT:-0}" -gt 0 ]; then
+      LATEST_VERSION="$candidate"
+      break
+    fi
+    echo "Skipping ${candidate}: manifest not fully published yet (images=0)" >&2
+  done <<< "$CANDIDATES"
+
+  # Advance to next page only if we still haven't found a usable version.
   if [ -z "$LATEST_VERSION" ]; then
     NEXT_URL=$(echo "$RESPONSE" | jq -r '.next // empty')
   fi
