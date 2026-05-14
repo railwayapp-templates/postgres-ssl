@@ -86,11 +86,14 @@ if [ "$PGB_RC" -eq 0 ]; then
   exit 0
 fi
 
-# Bucket deleted: NoSuchBucket is the S3 error for a bucket that no longer
-# exists. No retry will ever succeed without operator action, so drop the
-# segment immediately rather than accumulating WAL up to the threshold.
-if printf '%s\n' "$pgb_out" | grep -q 'NoSuchBucket'; then
-  echo "pgbackrest-wrapper: bucket does not exist (NoSuchBucket); dropping ${WAL_FILE} immediately" >&2
+# Bucket deleted: when the bucket no longer exists Tigris returns NoSuchBucket
+# on read paths, but validates credentials before checking bucket existence on
+# write paths (archive-push is a PUT). Railway revokes the bucket credentials
+# when the bucket is deleted, so in practice pgBackRest sees InvalidAccessKeyId
+# on the PUT. Both errors mean no recovery without operator action — drop
+# immediately rather than accumulating WAL up to the threshold.
+if printf '%s\n' "$pgb_out" | grep -qE 'NoSuchBucket|InvalidAccessKeyId'; then
+  echo "pgbackrest-wrapper: bucket gone or credentials revoked; dropping ${WAL_FILE} immediately" >&2
   touch "$PGDATA/.pgbackrest_gap_pending" 2>/dev/null || true
   exit 0
 fi
