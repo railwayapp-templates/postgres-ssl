@@ -23,6 +23,16 @@
 set -e
 
 if [ -z "${WAL_ARCHIVE_BUCKET:-}" ]; then
+  # If validate_wal_archive_bucket in wrapper.sh detected a junk bucket it
+  # exports PGBACKREST_BUCKET_INVALID_REASON and unsets WAL_ARCHIVE_BUCKET
+  # before calling docker-entrypoint.sh. Write the sentinel here (during
+  # initdb, AFTER PGDATA exists) so docker logs show the misconfiguration
+  # and the monitor can distinguish "never configured" from "misconfigured."
+  if [ -n "${PGBACKREST_BUCKET_INVALID_REASON:-}" ]; then
+    printf '%s\n' "${PGBACKREST_BUCKET_INVALID_REASON}" > "$PGDATA/.pgbackrest_invalid_bucket" 2>/dev/null || true
+    chmod 0640 "$PGDATA/.pgbackrest_invalid_bucket" 2>/dev/null || true
+    echo "pgbackrest: wrote invalid-bucket sentinel (reason=${PGBACKREST_BUCKET_INVALID_REASON})"
+  fi
   exit 0
 fi
 

@@ -1655,9 +1655,16 @@ t_watcher_gap_recovery_failed_count_path() {
   local before_count
   before_count=$(docker logs "$name" 2>&1 | grep -c "backup --type=full completed" || true)
 
-  # Disable the user → archive-push gets 403 → archive_command returns
-  # non-zero (wrapper threshold not met) → Postgres bumps failed_count.
-  mc "mc admin user disable local ${user}" >/dev/null
+  # Switch the user to read-only → PutObject fails with AccessDenied →
+  # archive_command returns non-zero (wrapper threshold not met) → Postgres
+  # bumps failed_count. Disabling the user entirely would produce
+  # InvalidAccessKeyId, which the archive-push wrapper instant-drops (exit 0)
+  # to avoid stacking failed_count on a bucket that's been deleted — keeping
+  # failed_count=0 and defeating this test's whole premise.
+  mc "
+    mc admin policy detach local readwrite --user ${user} 2>/dev/null || true
+    mc admin policy attach local readonly --user ${user} 2>/dev/null || true
+  " >/dev/null
   for i in 1 2 3 4 5; do
     docker exec "$name" psql -U postgres -c "INSERT INTO t SELECT g FROM generate_series(${i}00000, ${i}00100) g; SELECT pg_switch_wal();" >/dev/null 2>&1
     sleep 2
@@ -1678,9 +1685,12 @@ t_watcher_gap_recovery_failed_count_path() {
     return
   fi
 
-  # Re-enable the user → archive-push succeeds again → grace window starts
+  # Restore write access → archive-push succeeds again → grace window starts
   # from last_failed_time. Wait grace + a few polls.
-  mc "mc admin user enable local ${user}" >/dev/null
+  mc "
+    mc admin policy detach local readonly --user ${user} 2>/dev/null || true
+    mc admin policy attach local readwrite --user ${user} 2>/dev/null || true
+  " >/dev/null
 
   local deadline=$(($(date +%s) + 60)) hit=0
   while [ "$(date +%s)" -lt "$deadline" ]; do

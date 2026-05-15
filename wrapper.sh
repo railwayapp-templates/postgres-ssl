@@ -222,10 +222,18 @@ validate_wal_archive_bucket() {
 
   if [ -n "$invalid" ]; then
     echo "pgbackrest: WAL_ARCHIVE_BUCKET=\"${val}\" looks invalid (${invalid}); refusing to enable archiving" >&2
-    mkdir -p "$(dirname "$PGBACKREST_INVALID_BUCKET_MARKER")"
-    printf '%s\n' "${invalid}" > "$PGBACKREST_INVALID_BUCKET_MARKER" 2>/dev/null || true
-    chown postgres:postgres "$PGBACKREST_INVALID_BUCKET_MARKER" 2>/dev/null || true
-    chmod 0640 "$PGBACKREST_INVALID_BUCKET_MARKER" 2>/dev/null || true
+    # Export so pgbackrest-init.sh can write the sentinel during initdb.
+    # Writing to PGDATA here would break initdb on a fresh volume:
+    # docker-entrypoint.sh skips initdb when `ls -A "$PGDATA"` is non-empty,
+    # even for hidden files — postgres then tries to start from uninitialized
+    # data and fails. On an already-initialized volume (PG_VERSION exists)
+    # initdb hooks don't run, so write the sentinel here instead.
+    export PGBACKREST_BUCKET_INVALID_REASON="$invalid"
+    if [ -f "$PGDATA/PG_VERSION" ]; then
+      printf '%s\n' "${invalid}" > "$PGBACKREST_INVALID_BUCKET_MARKER" 2>/dev/null || true
+      chown postgres:postgres "$PGBACKREST_INVALID_BUCKET_MARKER" 2>/dev/null || true
+      chmod 0640 "$PGBACKREST_INVALID_BUCKET_MARKER" 2>/dev/null || true
+    fi
     unset WAL_ARCHIVE_BUCKET WAL_ARCHIVE_KEY WAL_ARCHIVE_SECRET
     unset WAL_ARCHIVE_REGION WAL_ARCHIVE_ENDPOINT
     return 0

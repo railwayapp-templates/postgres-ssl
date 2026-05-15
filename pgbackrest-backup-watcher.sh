@@ -177,16 +177,19 @@ run_backup() {
   return 1
 }
 
-# Returns 0 if the S3 catalog for repo1 has at least one full backup; returns 1
-# if the catalog is empty or unreachable. Uses pgbackrest info --output=json so
-# no text-parsing heuristics are needed. A non-zero exit from pgbackrest itself
-# (stanza not yet created, S3 down, auth failure) is also treated as "can't tell"
-# and returns 1 — the caller only clears local state when the catalog explicitly
-# confirms no backup exists (exit 0 + empty backup list).
-catalog_has_backup() {
-  local info_out
-  info_out=$(timeout 60 pgbackrest --stanza=main --repo=1 info --output=json 2>/dev/null) || return 1
-  printf '%s' "$info_out" | grep -q '"type":"full"'
+# Probes the S3 catalog for repo1 via pgbackrest info --output=json.
+# No text-parsing heuristics needed. Returns three distinct states:
+#   0 — full backup confirmed present (pgbackrest exit 0 + "full" in output)
+#   1 — conclusively no full backup (pgbackrest exit 0, no "full" entry)
+#   2 — inconclusive (pgbackrest exited non-zero: S3 unreachable, auth failure,
+#       stanza not yet created, etc.) — caller must NOT clear local state
+catalog_check_backup() {
+  local info_out rc
+  info_out=$(timeout 60 pgbackrest --stanza=main --repo=1 info --output=json 2>/dev/null)
+  rc=$?
+  [ "$rc" -ne 0 ] && return 2
+  printf '%s' "$info_out" | grep -q '"type":"full"' && return 0
+  return 1
 }
 
 # Sets DECIDED_ACTION to "full"|"diff"|"" (no action). Runs in the caller's
@@ -233,8 +236,12 @@ decide_action() {
   if [ "$needs_verify" -eq 1 ]; then
     write_state_field last_catalog_verify_at "$now"
     log "verifying S3 catalog has full backup"
-    if catalog_has_backup; then
+    catalog_check_backup
+    local _crc=$?
+    if [ "$_crc" -eq 0 ]; then
       log "catalog verified — full backup present in S3"
+    elif [ "$_crc" -eq 2 ]; then
+      log "catalog check inconclusive (S3 unreachable or stanza not yet created); skipping"
     else
       log "catalog shows no full backup despite local state (last_full=${last_full}); clearing last_full_at to trigger new full"
       write_state_field last_full_at ""
