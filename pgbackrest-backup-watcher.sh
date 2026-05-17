@@ -153,28 +153,42 @@ run_backup() {
   # --repo=1 scopes backup + post-backup expire to this service's own bucket.
   # On a fork repo2 is source's read-only bucket; without the pin pgBackRest
   # would default to writing the new base into both repos.
-  if pgbackrest --stanza=main --repo=1 backup --type="$type"; then
-    local now; now=$(date +%s)
-    case "$type" in
-      full)
-        write_state_field last_full_at "$now"
-        write_state_field last_diff_at "$now"
-        # Re-read failed_count *after* the backup so a failure during the
-        # backup itself is folded into the high-water mark; otherwise the
-        # next iteration would see growth and re-trigger immediately.
-        refresh_archiver_stats || true
-        write_state_field last_full_failed_count "$FAILED_COUNT"
-        [ -f "$GAP_MARKER" ] && rm -f "$GAP_MARKER" && log "cleared gap marker"
-        ;;
-      diff|incr)
-        write_state_field last_diff_at "$now"
-        ;;
-    esac
-    log "backup --type=$type completed"
-    return 0
+  pgbackrest --stanza=main --repo=1 backup --type="$type"
+  local exit_code=$?
+
+  # Exit 55 = FileMissingError: backup.info absent — stanza was never
+  # initialized (bootstrap stanza-create failed or timed out on first boot).
+  # Run stanza-create now and retry once; the watcher loop handles the rest.
+  if [ "$exit_code" -eq 55 ]; then
+    log "stanza not initialized (exit 55), running stanza-create then retrying backup..."
+    pgbackrest --stanza=main stanza-create || true
+    pgbackrest --stanza=main --repo=1 backup --type="$type"
+    exit_code=$?
   fi
-  log "backup --type=$type failed (will retry on next poll)"
-  return 1
+
+  if [ "$exit_code" -ne 0 ]; then
+    log "backup --type=$type failed (will retry on next poll)"
+    return 1
+  fi
+
+  local now; now=$(date +%s)
+  case "$type" in
+    full)
+      write_state_field last_full_at "$now"
+      write_state_field last_diff_at "$now"
+      # Re-read failed_count *after* the backup so a failure during the
+      # backup itself is folded into the high-water mark; otherwise the
+      # next iteration would see growth and re-trigger immediately.
+      refresh_archiver_stats || true
+      write_state_field last_full_failed_count "$FAILED_COUNT"
+      [ -f "$GAP_MARKER" ] && rm -f "$GAP_MARKER" && log "cleared gap marker"
+      ;;
+    diff|incr)
+      write_state_field last_diff_at "$now"
+      ;;
+  esac
+  log "backup --type=$type completed"
+  return 0
 }
 
 # Probes the S3 catalog for repo1 via pgbackrest info --output=json.
