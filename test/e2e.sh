@@ -304,6 +304,59 @@ t_vanilla_boot() {
   docker volume rm "$vol" >/dev/null
 }
 
+t_invalid_bucket_skips_archive() {
+  # Sets WAL_ARCHIVE_BUCKET to junk shapes the upstream resolver might leak
+  # (unresolved Railway template ref + bucket-id UUID). The image guard must
+  # refuse to enable archiving rather than writing the junk into
+  # pgbackrest.conf and letting pgbackrest hard-fail every archive_command
+  # until pgbackrest-archive-push-wrapper.sh's 500 MiB threshold drops WAL.
+  for bad in '${{121ccc45-0912-457e-8dc0-76625fe644bb.BUCKET}}' '121ccc45-0912-457e-8dc0-76625fe644bb'; do
+    local name=t-badbucket-${PG_VERSION}
+    local vol=${name}-vol
+    new_volume "$vol"
+    docker rm -f "$name" >/dev/null 2>&1 || true
+    docker run -d --name "$name" --label postgres-ssl-e2e=1 --network "$NET" \
+      -e POSTGRES_PASSWORD=test \
+      -e "WAL_ARCHIVE_BUCKET=${bad}" \
+      -e "WAL_ARCHIVE_ENDPOINT=http://${MINIO}:9000" \
+      -e "WAL_ARCHIVE_REGION=us-east-1" \
+      -e "WAL_ARCHIVE_KEY=$MINIO_USER" \
+      -e "WAL_ARCHIVE_SECRET=$MINIO_PASS" \
+      -v "$vol:/var/lib/postgresql/data" \
+      "$IMAGE" >/dev/null
+    wait_for_pg "$name" || { ko t_invalid_bucket_skips_archive "postgres did not start with bucket=${bad}"; fail_dump t_invalid_bucket_skips_archive "$name"; return; }
+
+    local archive_mode
+    archive_mode=$(docker exec "$name" psql -U postgres -At -c "SHOW archive_mode")
+    assert_eq "$archive_mode" "off" "archive_mode should be off for invalid bucket (${bad})" || { ko t_invalid_bucket_skips_archive ""; fail_dump t_invalid_bucket_skips_archive "$name"; return; }
+
+    # The junk must NOT have landed in pgbackrest.conf — that's the whole
+    # point. clear_pgbackrest_state_if_disabled treats the unset vars as
+    # "archiving off" and tears down any stale config.
+    if docker exec "$name" test -f /etc/pgbackrest/pgbackrest.conf; then
+      ko t_invalid_bucket_skips_archive "pgbackrest.conf should not exist when bucket is invalid"; fail_dump t_invalid_bucket_skips_archive "$name"; return
+    fi
+    if docker exec "$name" test -f /var/lib/postgresql/data/conf.d/pgbackrest.conf; then
+      ko t_invalid_bucket_skips_archive "conf.d/pgbackrest.conf should not exist when bucket is invalid"; fail_dump t_invalid_bucket_skips_archive "$name"; return
+    fi
+
+    # Sentinel must be present so the dashboard can distinguish "PITR never
+    # enabled" from "PITR enabled but wired to junk." PGDATA in this image is
+    # /var/lib/postgresql/data directly (no pgdata sub-path).
+    if ! docker exec "$name" test -f /var/lib/postgresql/data/.pgbackrest_invalid_bucket; then
+      ko t_invalid_bucket_skips_archive "sentinel .pgbackrest_invalid_bucket missing under PGDATA"; fail_dump t_invalid_bucket_skips_archive "$name"; return
+    fi
+
+    if ! docker logs "$name" 2>&1 | grep -q "WAL_ARCHIVE_BUCKET.*looks invalid"; then
+      ko t_invalid_bucket_skips_archive "expected guard log line missing for bucket=${bad}"; fail_dump t_invalid_bucket_skips_archive "$name"; return
+    fi
+
+    docker rm -f "$name" >/dev/null
+    docker volume rm "$vol" >/dev/null
+  done
+  ok t_invalid_bucket_skips_archive
+}
+
 t_archiving_boot() {
   local name=t-arch-${PG_VERSION}
   local vol=${name}-vol
@@ -1614,9 +1667,16 @@ t_watcher_gap_recovery_failed_count_path() {
   local before_count
   before_count=$(docker logs "$name" 2>&1 | grep -c "backup --type=full completed" || true)
 
-  # Disable the user → archive-push gets 403 → archive_command returns
-  # non-zero (wrapper threshold not met) → Postgres bumps failed_count.
-  mc "mc admin user disable local ${user}" >/dev/null
+  # Switch the user to read-only → PutObject fails with AccessDenied →
+  # archive_command returns non-zero (wrapper threshold not met) → Postgres
+  # bumps failed_count. Disabling the user entirely would produce
+  # InvalidAccessKeyId, which the archive-push wrapper instant-drops (exit 0)
+  # to avoid stacking failed_count on a bucket that's been deleted — keeping
+  # failed_count=0 and defeating this test's whole premise.
+  mc "
+    mc admin policy detach local readwrite --user ${user} 2>/dev/null || true
+    mc admin policy attach local readonly --user ${user} 2>/dev/null || true
+  " >/dev/null
   for i in 1 2 3 4 5; do
     docker exec "$name" psql -U postgres -c "INSERT INTO t SELECT g FROM generate_series(${i}00000, ${i}00100) g; SELECT pg_switch_wal();" >/dev/null 2>&1
     sleep 2
@@ -1637,9 +1697,12 @@ t_watcher_gap_recovery_failed_count_path() {
     return
   fi
 
-  # Re-enable the user → archive-push succeeds again → grace window starts
+  # Restore write access → archive-push succeeds again → grace window starts
   # from last_failed_time. Wait grace + a few polls.
-  mc "mc admin user enable local ${user}" >/dev/null
+  mc "
+    mc admin policy detach local readonly --user ${user} 2>/dev/null || true
+    mc admin policy attach local readwrite --user ${user} 2>/dev/null || true
+  " >/dev/null
 
   local deadline=$(($(date +%s) + 60)) hit=0
   while [ "$(date +%s)" -lt "$deadline" ]; do
@@ -2923,6 +2986,7 @@ t_chain_restore_r1_to_r2() {
 
 ALL_TESTS=(
   t_vanilla_boot
+  t_invalid_bucket_skips_archive
   t_archiving_boot
   t_alter_system_survives_restart
   t_s3_unreachable_pg_stays_up
