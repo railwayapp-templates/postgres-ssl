@@ -581,11 +581,21 @@ bootstrap_pgbackrest_stanza() {
 
     echo "pgbackrest: using repo1-path=${repo_path}"
 
-    if gosu postgres pgbackrest --stanza=main stanza-create; then
-      echo "pgbackrest: stanza-create completed"
-    else
-      echo "pgbackrest: stanza-create failed (will retry on next boot)" >&2
-    fi
+    sc_attempt=0
+    sc_max=5
+    while [ "$sc_attempt" -lt "$sc_max" ]; do
+      sc_attempt=$((sc_attempt + 1))
+      if gosu postgres pgbackrest --stanza=main stanza-create; then
+        echo "pgbackrest: stanza-create completed"
+        break
+      fi
+      if [ "$sc_attempt" -lt "$sc_max" ]; then
+        echo "pgbackrest: stanza-create failed (attempt ${sc_attempt}/${sc_max}), retrying in 30s..." >&2
+        sleep 30
+      else
+        echo "pgbackrest: stanza-create failed after ${sc_max} attempts (will retry on next boot)" >&2
+      fi
+    done
   ) &
 }
 
