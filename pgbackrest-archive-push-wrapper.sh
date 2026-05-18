@@ -4,20 +4,27 @@
 # Wraps `pgbackrest archive-push` so that any kind of archive failure (hard
 # repo error, stuck async worker, anything else) cannot fill pg_wal/ and halt
 # Postgres. When pgbackrest fails AND pg_wal/ has grown past a threshold
-# (default 500 MiB, override via WAL_DROP_THRESHOLD_MB), the wrapper returns
-# success to Postgres anyway. Postgres recycles the WAL segment as if
-# archiving were disabled. The PITR window gets a coverage gap from this
-# segment forward; below the threshold pg_stat_archiver.failed_count climbs
-# normally and the dashboard surfaces "PITR broken — fix archiving config",
-# so the underlying issue (bad creds, deleted bucket, expired keys, …) gets
-# fixed before the threshold trips and the failure signal disappears.
+# (WAL_DROP_THRESHOLD_MB; sized by wrapper.sh's compute_volume_thresholds to
+# min(500 MiB, ~10% of volume) with operator override via this env var), the
+# wrapper returns success to Postgres anyway. Postgres recycles the WAL
+# segment as if archiving were disabled. The PITR window gets a coverage
+# gap from this segment forward; below the threshold
+# pg_stat_archiver.failed_count climbs normally and the dashboard surfaces
+# "PITR broken — fix archiving config", so the underlying issue (bad creds,
+# deleted bucket, expired keys, …) gets fixed before the threshold trips
+# and the failure signal disappears.
+#
+# Special case: if the bucket actively does not exist (S3 NoSuchBucket error),
+# there is no recovery without operator action — retrying is pointless and
+# letting WAL accumulate up to the threshold wastes disk. In that case the
+# wrapper drops immediately (returns 0) regardless of pg_wal size.
 #
 # The env var name avoids the PGBACKREST_* prefix on purpose: pgBackRest
 # treats every PGBACKREST_* variable as a config option and warns about
 # unknown names on every invocation. WAL_DROP_THRESHOLD_MB sits outside
 # that namespace so it doesn't pollute logs.
 #
-# Why 500 MiB here, vs pgBackRest's archive-push-queue-max=5GiB:
+# Why ≤500 MiB here, vs pgBackRest's archive-push-queue-max ≤5GiB:
 # the two thresholds gate orthogonal failure regimes. archive-push-queue-max
 # governs the SPOOL — graceful absorption of transient S3 stalls, where the
 # async worker keeps retrying and most segments eventually get pushed. A
@@ -28,6 +35,9 @@
 # Holding 5 GiB of pg_wal hostage waiting for a fix that requires a config
 # change wastes data-volume disk; 500 MiB is enough to ride out a multi-
 # minute config-redeploy window without eating into customer disk budgets.
+# Both ceilings scale down proportionally on small volumes (1 GiB Hobby ⇒
+# ~100 MiB pg_wal / ~512 MiB spool) so a tiny volume isn't dominated by
+# archive buffers; on ≥25 GiB volumes both caps hold.
 #
 # Below the threshold the wrapper surfaces pgbackrest's failure to Postgres
 # normally, so transient errors retry on the next archive_timeout instead
@@ -69,9 +79,22 @@ fi
 # repos are configured). Multi-repo scoping for forks is enforced upstream
 # by ensuring repo2 is dropped from the rendered config post-promote, not
 # at the archive-push call site.
-pgbackrest --stanza=main archive-push "$WAL_FILE"
+pgb_out=$(pgbackrest --stanza=main archive-push "$WAL_FILE" 2>&1)
 PGB_RC=$?
+[ -n "$pgb_out" ] && printf '%s\n' "$pgb_out" >&2
 if [ "$PGB_RC" -eq 0 ]; then
+  exit 0
+fi
+
+# Bucket deleted: when the bucket no longer exists Tigris returns NoSuchBucket
+# on read paths, but validates credentials before checking bucket existence on
+# write paths (archive-push is a PUT). Railway revokes the bucket credentials
+# when the bucket is deleted, so in practice pgBackRest sees InvalidAccessKeyId
+# on the PUT. Both errors mean no recovery without operator action — drop
+# immediately rather than accumulating WAL up to the threshold.
+if printf '%s\n' "$pgb_out" | grep -qE 'NoSuchBucket|InvalidAccessKeyId'; then
+  echo "pgbackrest-wrapper: bucket gone or credentials revoked; dropping ${WAL_FILE} immediately" >&2
+  touch "$PGDATA/.pgbackrest_gap_pending" 2>/dev/null || true
   exit 0
 fi
 
