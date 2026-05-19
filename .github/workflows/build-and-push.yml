@@ -4,6 +4,13 @@ on:
   schedule:
     - cron: "0 0 * * 1"  # Every Monday at midnight UTC
   workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "Dockerfile.*"
+      - "*.sh"
+      - ".github/workflows/build-and-push.yml"
 
 env:
   LATEST_POSTGRES_MAJOR: 16  # Change this to update which version gets tagged as 'latest'
