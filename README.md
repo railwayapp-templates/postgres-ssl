@@ -278,9 +278,17 @@ periodic full (#85, hardened by #86).
 `pgbackrest backup` is invoked with `--type=full` or `--type=diff`
 depending on the trigger; the `process-max=backup` setting (default
 `clamp(cpus/4, 1, 16)`) caps copy concurrency to leave CPU for live DB
-traffic. `pgbackrest expire` runs automatically after each backup and
-removes fulls/diffs beyond `WAL_BACKUP_RETENTION_FULL` /
-`_DIFF`, plus the WAL their manifests no longer pin.
+traffic. Backups run with `--no-expire-auto`; `pgbackrest expire` is then
+called as its own step right after a *successful* backup, and removes
+fulls/diffs beyond `WAL_BACKUP_RETENTION_FULL` / `_DIFF`, plus the WAL
+their manifests no longer pin. Splitting the two matters because
+pgBackRest's default (`expire-auto=y`) folds expire into the same
+command, so a transient expire failure (e.g. a slow S3-compatible
+endpoint on the post-backup listing) would otherwise fail the whole
+`backup` invocation even though the backup itself landed and is durable
+— leaving the watcher's `last_full_at` unset and re-triggering a brand
+new full upload every retry cycle instead of just deferring retention to
+the next backup.
 
 #### Retention
 

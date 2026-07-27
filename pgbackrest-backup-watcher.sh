@@ -260,7 +260,20 @@ run_backup() {
   # --repo=1 scopes backup + post-backup expire to this service's own bucket.
   # On a fork repo2 is source's read-only bucket; without the pin pgBackRest
   # would default to writing the new base into both repos.
-  pgbackrest --stanza=main --repo=1 backup --type="$type"
+  #
+  # --no-expire-auto: pgBackRest's default (expire-auto=y) runs retention
+  # cleanup as part of this same command, so a failure/timeout during expire
+  # (e.g. a slow S3-compatible endpoint on the post-backup bucket listing)
+  # makes `backup` itself return non-zero even though the backup already
+  # landed and is durable in the catalog. That false failure used to keep
+  # last_full_at empty forever, so decide_action treated the backup as
+  # permanently overdue and re-ran a brand-new FULL upload every retry
+  # cycle — unbounded egress from re-uploading the entire database in a
+  # loop, invisible to anything watching for backup *failures* because the
+  # backup itself kept succeeding. Expire now runs as its own explicit,
+  # non-gating step below, only after the backup is confirmed to have
+  # actually succeeded.
+  pgbackrest --stanza=main --repo=1 backup --type="$type" --no-expire-auto
   local exit_code=$?
 
   # Exit 55 = FileMissingError: backup.info absent — stanza was never
@@ -269,7 +282,7 @@ run_backup() {
   if [ "$exit_code" -eq 55 ]; then
     log "stanza not initialized (exit 55), running stanza-create then retrying backup..."
     pgbackrest --stanza=main stanza-create || true
-    pgbackrest --stanza=main --repo=1 backup --type="$type"
+    pgbackrest --stanza=main --repo=1 backup --type="$type" --no-expire-auto
     exit_code=$?
   fi
 
@@ -301,6 +314,19 @@ run_backup() {
       ;;
   esac
   log "backup --type=$type completed"
+
+  # Retention is best-effort and deliberately decoupled from backup success
+  # (see --no-expire-auto above): a failure here just leaves old
+  # backups/WAL around for one more cycle. The next scheduled backup (full
+  # or diff, per the normal cadence — no dedicated retry loop for expire
+  # alone) tries again; nothing about current restorability regresses in
+  # the meantime. Log line is deliberately distinct from "backup
+  # --type=$type failed" above so this can't be mistaken for a backup
+  # failure by anything grepping watcher logs.
+  if ! pgbackrest --stanza=main --repo=1 expire; then
+    log "pgbackrest expire failed after successful backup --type=$type (retention not enforced this cycle; will retry after next backup)"
+  fi
+
   emit_pitr_anchor
   return 0
 }
