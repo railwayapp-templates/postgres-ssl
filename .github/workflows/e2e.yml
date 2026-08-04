@@ -69,3 +69,56 @@ jobs:
           name: e2e-logs-pg${{ matrix.pg_version }}
           path: failure-artifacts
           retention-days: 14
+
+  # Major-upgrade harness (test/e2e-upgrade.sh): one cell per version pair.
+  # 16→17 is the fleet's common pair; 17→18 pins the majors where initdb's
+  # data-checksums default flipped (18) — every →18 upgrade would fail
+  # --check without the explicit parity flag, which only a real 18 target
+  # can regress-test. The harness builds its own images (FROM, TO, and the
+  # dual-binary job image), so no buildx step is needed here.
+  e2e-upgrade:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { from: 16, to: 17 }
+          - { from: 17, to: 18 }
+
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Run upgrade e2e harness
+        shell: bash
+        env:
+          FROM_VERSION: ${{ matrix.from }}
+          TO_VERSION: ${{ matrix.to }}
+        run: |
+          ./test/e2e-upgrade.sh 2>&1 | tee "e2e-upgrade-${FROM_VERSION}-${TO_VERSION}.log"
+          exit "${PIPESTATUS[0]}"
+
+      - name: Collect failure diagnostics
+        if: failure()
+        env:
+          FROM_VERSION: ${{ matrix.from }}
+          TO_VERSION: ${{ matrix.to }}
+        run: |
+          mkdir -p failure-artifacts
+          mv "e2e-upgrade-${FROM_VERSION}-${TO_VERSION}.log" failure-artifacts/ 2>/dev/null || true
+          docker ps -a > failure-artifacts/docker-ps.txt 2>&1 || true
+          docker volume ls > failure-artifacts/docker-volumes.txt 2>&1 || true
+          for c in $(docker ps -aq --filter "label=postgres-upgrade-e2e=1"); do
+            name=$(docker inspect -f '{{.Name}}' "$c" | sed 's|^/||')
+            docker logs --tail 200 "$c" > "failure-artifacts/container-${name}.log" 2>&1 || true
+          done
+
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-upgrade-logs-${{ matrix.from }}-${{ matrix.to }}
+          path: failure-artifacts
+          retention-days: 14

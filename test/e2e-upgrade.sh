@@ -23,9 +23,18 @@ FROM_IMAGE="postgres-ssl-e2e:${FROM_VERSION}"
 TO_IMAGE="postgres-ssl-e2e:${TO_VERSION}"
 JOB_IMAGE="postgres-upgrade-e2e:${FROM_VERSION}-${TO_VERSION}"
 
+# The chained-upgrade test (FROM -> TO -> TO+1 on one volume) needs a third
+# major; it self-skips when no Dockerfile exists for it.
+CHAIN_VERSION="$((TO_VERSION + 1))"
+CHAIN_IMAGE="postgres-ssl-e2e:${CHAIN_VERSION}"
+CHAIN_JOB_IMAGE="postgres-upgrade-e2e:${TO_VERSION}-${CHAIN_VERSION}"
+
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PGDATA_IN_VOLUME="/var/lib/postgresql/data/pgdata"
 MARKER_PATH="/var/lib/postgresql/data/.railway-major-upgrade.json"
+# Docker network for the remote-client tests: the default bridge has no name
+# resolution, a user-defined one does.
+E2E_NET="upg-e2e-net"
 
 PASS=0
 FAIL=0
@@ -72,6 +81,14 @@ assert_contains() {
   return 1
 }
 
+assert_not_contains() {
+  local haystack="$1" needle="$2" msg="$3"
+  if ! echo "$haystack" | grep -qF -- "$needle"; then return 0; fi
+  echo "  expected NOT to contain: $needle"
+  echo "  msg:                     $msg"
+  return 1
+}
+
 # ----- environment management ------------------------------------------------
 # Always build. The scripts under test (wrapper.sh, upgrade-job.sh) are
 # COPY'd into these images, so an existence check would silently test a stale
@@ -87,6 +104,36 @@ ensure_images() {
   docker build -q -f "$REPO_ROOT/Dockerfile.upgrade" \
     --build-arg "FROM_VERSION=$FROM_VERSION" --build-arg "TO_VERSION=$TO_VERSION" \
     -t "$JOB_IMAGE" "$REPO_ROOT" >/dev/null || exit 1
+  docker network inspect "$E2E_NET" >/dev/null 2>&1 || docker network create "$E2E_NET" >/dev/null
+}
+
+# Built lazily by the chained-upgrade test only — a TO -> TO+1 job image is
+# a full apt-install build, not worth paying when the test self-skips.
+ensure_chain_images() {
+  [ -f "$REPO_ROOT/Dockerfile.${CHAIN_VERSION}" ] || return 1
+  log "building runtime image $CHAIN_IMAGE"
+  docker build -q -f "$REPO_ROOT/Dockerfile.${CHAIN_VERSION}" -t "$CHAIN_IMAGE" "$REPO_ROOT" >/dev/null || return 1
+  log "building job image $CHAIN_JOB_IMAGE"
+  docker build -q -f "$REPO_ROOT/Dockerfile.upgrade" \
+    --build-arg "FROM_VERSION=$TO_VERSION" --build-arg "TO_VERSION=$CHAIN_VERSION" \
+    -t "$CHAIN_JOB_IMAGE" "$REPO_ROOT" >/dev/null || return 1
+}
+
+# Run a shell snippet against a (stopped) volume, via the job image.
+in_volume() {
+  local vol="$1" snippet="$2"
+  docker run --rm --label postgres-upgrade-e2e=1 \
+    -v "$vol:/var/lib/postgresql/data" --entrypoint /bin/sh "$JOB_IMAGE" -c "$snippet"
+}
+
+# psql from a SECOND container over the docker network — a remote client, so
+# it exercises pg_hba's `host all all all` rule rather than the loopback
+# lines that make localhost-only tests blind to remote-auth regressions.
+remote_psql() {
+  local host="$1" sql="$2"
+  docker run --rm --network "$E2E_NET" --label postgres-upgrade-e2e=1 \
+    -e PGPASSWORD=test --entrypoint psql "$FROM_IMAGE" \
+    -h "$host" -U postgres -d postgres -tAc "$sql" 2>&1
 }
 
 # Removing a container is asynchronous enough that the next `docker volume rm`
@@ -282,6 +329,7 @@ volume_data_major() {
 cleanup_all() {
   docker ps -aq --filter label=postgres-upgrade-e2e=1 | xargs -r docker rm -f >/dev/null 2>&1
   docker volume ls -q | grep '^upg-e2e-' | xargs -r docker volume rm >/dev/null 2>&1
+  docker network rm "$E2E_NET" >/dev/null 2>&1
 }
 trap cleanup_all EXIT
 
@@ -553,6 +601,153 @@ t_resume_after_crash_between_swaps() {
   stop_pg resume-pg
 }
 
+# pg_hba.conf: initdb writes only local/loopback lines; the `host all all all`
+# rule that admits remote clients is appended by the official entrypoint at
+# init time and must survive the upgrade (the job carries the old pg_hba
+# across the swap) — a localhost-only check can't see this regression, so
+# assert from a SECOND container over the docker network. Custom user rules
+# must survive too. Then strip the host rules to simulate any other path that
+# regenerates pg_hba, and assert the wrapper self-heals it from config state.
+t_remote_auth_survives_upgrade() {
+  local vol="upg-e2e-remotehba"
+  seed_from_cluster "$vol" || return 1
+
+  run_pg hba-before "$vol" "$FROM_IMAGE" --network "$E2E_NET" || return 1
+  wait_for_pg hba-before || { fail_dump hba-before hba-before; return 1; }
+  assert_eq "$(remote_psql hba-before 'SELECT 1')" "1" "remote client connects before upgrade" || return 1
+  # A recognizable user-added rule, to prove the carry preserves custom lines
+  # rather than resetting to a default file.
+  docker exec hba-before bash -c \
+    "echo 'host all all 192.0.2.0/24 trust # e2e-custom-hba-rule' >> $PGDATA_IN_VOLUME/pg_hba.conf" || return 1
+  stop_pg hba-before
+
+  run_job "$vol" upgrade
+  assert_eq "$JOB_RC" 0 "upgrade exit code" || { echo "$JOB_OUT" | tail -20; return 1; }
+
+  run_pg hba-after "$vol" "$TO_IMAGE" --network "$E2E_NET" || return 1
+  wait_for_pg hba-after || { fail_dump hba-after hba-after; return 1; }
+  assert_eq "$(remote_psql hba-after 'SELECT count(*) FROM upgrade_canary')" "1000" \
+    "remote client connects and reads data after upgrade" || return 1
+  assert_contains "$(docker exec hba-after cat "$PGDATA_IN_VOLUME/pg_hba.conf" 2>&1)" \
+    "e2e-custom-hba-rule" "custom pg_hba rule carried across the upgrade" || return 1
+  stop_pg hba-after
+
+  # Wrapper self-heal layer: lose the host rules entirely (any path that
+  # regenerates pg_hba.conf), boot, and remote auth must come back.
+  in_volume "$vol" "grep -vE '^[[:space:]]*host' $PGDATA_IN_VOLUME/pg_hba.conf > /tmp/hba && cat /tmp/hba > $PGDATA_IN_VOLUME/pg_hba.conf" || return 1
+  run_pg hba-healed "$vol" "$TO_IMAGE" --network "$E2E_NET" || return 1
+  wait_for_pg hba-healed || { fail_dump hba-healed hba-healed; return 1; }
+  assert_contains "$(docker logs hba-healed 2>&1)" "re-appending" "wrapper reported the pg_hba heal" || return 1
+  assert_eq "$(remote_psql hba-healed 'SELECT 1')" "1" "remote client connects after the wrapper heal" || return 1
+  stop_pg hba-healed
+}
+
+# A PITR-restored fork keeps WAL_RECOVER_FROM_* + POSTGRES_RECOVERY_TARGET_TIME
+# set forever; only the sentinels inside $PGDATA (.pitr_configured /
+# .pgbackrest_restored) record that recovery already promoted. If the swap
+# loses them, the first post-upgrade boot re-stages archive recovery against
+# the SOURCE bucket and the database hangs at "the database system is
+# starting up" forever. The job must carry the sentinels across; the wrapper
+# must also treat the completed marker itself as proof (defense in depth).
+t_pitr_fork_survives_upgrade() {
+  local vol="upg-e2e-pitrfork"
+  local recover_env=(
+    -e "WAL_RECOVER_FROM_BUCKET=e2e-nonexistent-bucket"
+    -e "WAL_RECOVER_FROM_ENDPOINT=e2e.invalid"
+    -e "WAL_RECOVER_FROM_REGION=auto"
+    -e "WAL_RECOVER_FROM_KEY=junk"
+    -e "WAL_RECOVER_FROM_SECRET=junk"
+    -e "POSTGRES_RECOVERY_TARGET_TIME=2026-01-01 00:00:00+00"
+  )
+  seed_from_cluster "$vol" || return 1
+  # The restored-fork post-promote shape: both sentinels present.
+  in_volume "$vol" "touch $PGDATA_IN_VOLUME/.pitr_configured $PGDATA_IN_VOLUME/.pgbackrest_restored \
+    && chown postgres:postgres $PGDATA_IN_VOLUME/.pitr_configured $PGDATA_IN_VOLUME/.pgbackrest_restored" || return 1
+
+  # Baseline: the fork shape boots on the FROM major without re-staging.
+  run_pg fork-before "$vol" "$FROM_IMAGE" "${recover_env[@]}" || return 1
+  wait_for_pg fork-before || { fail_dump fork-before fork-before; return 1; }
+  stop_pg fork-before
+
+  run_job "$vol" upgrade
+  assert_eq "$JOB_RC" 0 "upgrade exit code" || { echo "$JOB_OUT" | tail -20; return 1; }
+  in_volume "$vol" "test -f $PGDATA_IN_VOLUME/.pitr_configured && test -f $PGDATA_IN_VOLUME/.pgbackrest_restored" \
+    || { echo "  PITR sentinels did not survive the swap"; return 1; }
+
+  # The regression: with the same fork env, the upgraded database must become
+  # READY (no recovery staged against the unreachable source bucket).
+  run_pg fork-after "$vol" "$TO_IMAGE" "${recover_env[@]}" || return 1
+  wait_for_pg fork-after || { fail_dump fork-after fork-after; return 1; }
+  local logs; logs="$(docker logs fork-after 2>&1)"
+  assert_not_contains "$logs" "PITR replay staged" "no recovery re-staged after upgrade" || return 1
+  in_volume "$vol" "test ! -f $PGDATA_IN_VOLUME/recovery.signal" \
+    || { echo "  recovery.signal appeared on the upgraded fork"; return 1; }
+  assert_eq "$(psql_in fork-after 'SELECT count(*) FROM upgrade_canary')" "1000" "data intact on the upgraded fork" || return 1
+  stop_pg fork-after
+
+  # Defense-in-depth layer: even with the sentinels gone (an older job, a
+  # manual wipe), the completed marker alone must prevent re-staging.
+  in_volume "$vol" "rm -f $PGDATA_IN_VOLUME/.pitr_configured $PGDATA_IN_VOLUME/.pgbackrest_restored" || return 1
+  run_pg fork-marker "$vol" "$TO_IMAGE" "${recover_env[@]}" || return 1
+  wait_for_pg fork-marker || { fail_dump fork-marker fork-marker; return 1; }
+  assert_not_contains "$(docker logs fork-marker 2>&1)" "PITR replay staged" \
+    "completed marker alone prevents re-staging" || return 1
+  stop_pg fork-marker
+}
+
+# Upgrading the same volume twice (FROM -> TO, then TO -> TO+1) must land on
+# TO+1 with the data intact. Regression: a completed marker from the FIRST
+# pair used to read as "already done" for ANY pair — the second job reported
+# success as a silent no-op, the workflow flipped the image tag, and the
+# service boot-refused on a major mismatch after a "successful" upgrade.
+t_second_upgrade_reaches_next_major() {
+  if [ ! -f "$REPO_ROOT/Dockerfile.${CHAIN_VERSION}" ]; then
+    note "skipped: no Dockerfile.${CHAIN_VERSION} to chain onto"
+    return 0
+  fi
+  ensure_chain_images || return 1
+  local vol="upg-e2e-chain"
+  seed_from_cluster "$vol" || return 1
+
+  run_job "$vol" upgrade
+  assert_eq "$JOB_RC" 0 "first upgrade exit code" || { echo "$JOB_OUT" | tail -20; return 1; }
+  assert_eq "$(volume_data_major "$vol")" "$TO_VERSION" "data major after first upgrade" || return 1
+
+  JOB_OUT=$(docker run --rm --label postgres-upgrade-e2e=1 \
+    -e "PGDATA=$PGDATA_IN_VOLUME" \
+    -v "$vol:/var/lib/postgresql/data" \
+    "$CHAIN_JOB_IMAGE" upgrade 2>&1)
+  JOB_RC=$?
+  assert_eq "$JOB_RC" 0 "second upgrade exit code" || { echo "$JOB_OUT" | tail -30; return 1; }
+  assert_not_contains "$JOB_OUT" '"alreadyDone"' "second upgrade actually ran (no silent no-op)" || return 1
+  assert_eq "$(marker_field "$vol" phase)" "completed" "marker phase after chain" || return 1
+  assert_eq "$(marker_field "$vol" to)" "$CHAIN_VERSION" "marker records the second pair" || return 1
+  assert_eq "$(volume_data_major "$vol")" "$CHAIN_VERSION" "data major after second upgrade" || return 1
+
+  remove_container chain-pg
+  docker run -d --name chain-pg --label postgres-upgrade-e2e=1 \
+    -e "POSTGRES_PASSWORD=test" -e "PGDATA=$PGDATA_IN_VOLUME" \
+    -v "$vol:/var/lib/postgresql/data" "$CHAIN_IMAGE" >/dev/null || return 1
+  wait_for_pg chain-pg || { fail_dump chain chain-pg; return 1; }
+  assert_eq "$(psql_in chain-pg 'SELECT count(*) FROM upgrade_canary')" "1000" "data intact after two upgrades" || return 1
+  assert_contains "$(psql_in chain-pg 'SHOW server_version')" "$CHAIN_VERSION." "server is TO+1" || return 1
+  stop_pg chain-pg
+}
+
+# An in-flight (phase=upgraded) marker belonging to a DIFFERENT version pair
+# must not drive this job's directory swap — its upgrade dirs belong to the
+# other job. Refuse loudly, volume untouched.
+t_foreign_pair_upgraded_marker_refused() {
+  local vol="upg-e2e-foreignpair"
+  seed_from_cluster "$vol" || return 1
+  in_volume "$vol" "echo '{\"phase\": \"upgraded\", \"from\": \"13\", \"to\": \"14\"}' > $MARKER_PATH" || return 1
+  run_job "$vol" upgrade
+  assert_eq "$JOB_RC" 2 "foreign-pair upgraded marker refused" || { echo "$JOB_OUT" | tail -10; return 1; }
+  assert_contains "$JOB_OUT" "refuses to finish another pair's swap" "refusal names the mismatch" || return 1
+  assert_eq "$(volume_data_major "$vol")" "$FROM_VERSION" "volume untouched" || return 1
+  in_volume "$vol" "rm -f $MARKER_PATH"
+}
+
 # ----- runner -----------------------------------------------------------------
 ALL_TESTS=(
   t_vanilla_boot
@@ -572,6 +767,10 @@ ALL_TESTS=(
   t_mismatch_boot_failstop
   t_boot_refused_mid_upgrade
   t_resume_after_crash_between_swaps
+  t_remote_auth_survives_upgrade
+  t_pitr_fork_survives_upgrade
+  t_second_upgrade_reaches_next_major
+  t_foreign_pair_upgraded_marker_refused
 )
 
 TESTS=("${@:-}")

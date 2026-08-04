@@ -129,6 +129,28 @@ ssl_ca_file = '$SSL_DIR/root.crt'
 EOF
 fi
 
+# Re-append the remote-access rule when pg_hba.conf has lost it. The official
+# entrypoint writes `host all all all <method>` ONCE, at initdb time — any
+# path that regenerates pg_hba.conf afterwards (a major upgrade promotes a
+# freshly initdb'd data directory; the upgrade job carries the old pg_hba
+# across, but this heals every other route too) leaves only initdb's default
+# local/loopback lines, so the database comes back healthy-looking while
+# EVERY remote client fails with "no pg_hba.conf entry". Same shape as the
+# SSL re-apply above: keyed on the CONFIG state itself, so it self-heals no
+# matter what reset it. The method mirrors the entrypoint's default. The
+# check accepts any host-family keyword (hostssl/hostnossl/…) so a user who
+# deliberately narrowed the rule to TLS-only doesn't get it silently
+# re-widened.
+PG_HBA_FILE="$PGDATA/pg_hba.conf"
+if [ -f "$POSTGRES_CONF_FILE" ] && [ -f "$PG_HBA_FILE" ] \
+  && ! grep -qE "^[[:space:]]*host(ssl|nossl|gssenc|nogssenc)?([[:space:]]+all){3}([[:space:]]|$)" "$PG_HBA_FILE"; then
+  echo "wrapper: pg_hba.conf has no 'host all all all' rule, re-appending (remote clients would be refused)"
+  cat >> "$PG_HBA_FILE" <<EOF
+
+host all all all ${POSTGRES_HOST_AUTH_METHOD:-scram-sha-256}
+EOF
+fi
+
 # Adds pg_stat_statements to shared_preload_libraries in a config file
 # Usage: add_pg_stat_statements <config_file>
 add_pg_stat_statements() {
@@ -1049,6 +1071,22 @@ configure_pgbackrest_recovery() {
   [ -z "$POSTGRES_RECOVERY_TARGET_TIME" ] && return 0
   [ ! -f "$POSTGRES_CONF_FILE" ] && return 0
 
+  # A COMPLETED major-upgrade marker is proof recovery already promoted on
+  # this volume, equivalent to .pitr_configured. Two layers guard the
+  # upgraded-restored-fork case (WAL_RECOVER_FROM_* + the target time stay
+  # set forever on a fork, so re-staging would point archive recovery at the
+  # source bucket and the database would never become ready): the upgrade
+  # job carries .pitr_configured/.pitr_staging/.pgbackrest_restored into the
+  # new data dir across its swap (layer 1), and this marker check (layer 2)
+  # covers any volume whose sentinels were still lost — the job refuses
+  # recovery.signal/standby.signal volumes, so only a cluster whose recovery
+  # had finished can ever have been upgraded.
+  local upgrade_completed=0
+  if [ -f "$UPGRADE_MARKER_FILE" ] \
+    && [ "$(jq -r '.phase // empty' "$UPGRADE_MARKER_FILE" 2>/dev/null || true)" = "completed" ]; then
+    upgrade_completed=1
+  fi
+
   # /etc/pgbackrest lives on the container's root filesystem, not the
   # mounted volume, so it's gone on a genuine redeploy (a brand-new
   # container) even though it'd survive a plain in-place restart of the
@@ -1065,7 +1103,7 @@ configure_pgbackrest_recovery() {
   # avoid leaking source-bucket creds onto disk for a long-running promoted
   # service with no functional benefit.
   local recovery_genuinely_done=0
-  if [ -f "$PITR_DONE_MARKER" ]; then
+  if [ -f "$PITR_DONE_MARKER" ] || [ "$upgrade_completed" = 1 ]; then
     recovery_genuinely_done=1
   elif [ -f "$PGBACKREST_RESTORED_MARKER" ] && [ ! -f "$PGDATA/recovery.signal" ]; then
     recovery_genuinely_done=1
@@ -1100,8 +1138,12 @@ EOF
   # postgresql.auto.conf: skip the conf.d write AND the staging path.
   # Unchanged from before — this gate is about the empty-volume-restore
   # case having already written its own restore_command directly, not about
-  # whether recovery has actually finished (that's handled above).
-  if [ -f "$PGBACKREST_RESTORED_MARKER" ] || [ -f "$PITR_DONE_MARKER" ]; then
+  # whether recovery has actually finished (that's handled above). The
+  # completed-upgrade marker joins the gate for the same reason it sets
+  # recovery_genuinely_done: staging recovery on a post-upgrade volume would
+  # hang the database against the source bucket forever.
+  if [ -f "$PGBACKREST_RESTORED_MARKER" ] || [ -f "$PITR_DONE_MARKER" ] \
+    || [ "$upgrade_completed" = 1 ]; then
     return 0
   fi
 

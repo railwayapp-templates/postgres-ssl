@@ -20,10 +20,21 @@
 #              Feeds the dashboard preflight's extension check.
 #
 # Marker contract (volume root, .railway-major-upgrade.json):
-#   absent               — nothing committed; any failure rolls back.
+#   absent               — nothing committed; any failure rolls back. One
+#                          exception: when the disk shape itself proves
+#                          pg_upgrade finished (old cluster's pg_control
+#                          renamed to pg_control.old AND the new dir's
+#                          PG_VERSION is the target major), upgrade mode
+#                          rolls FORWARD — the old cluster can no longer be
+#                          started, so a lost marker must not brick the
+#                          volume.
 #   phase == "upgraded"  — pg_upgrade succeeded; directory swap may be
 #                          incomplete. Roll FORWARD (re-run upgrade mode).
 #   phase == "completed" — swap done; the runtime image of TO major boots.
+# Both phases are scoped to the marker's own (from, to) pair: a completed
+# marker of a PREVIOUS pair is history, not state — the job proceeds when
+# the data major matches its FROM (and overwrites the marker at its own
+# commit point); an in-flight marker of a foreign pair is refused outright.
 # The runtime wrapper.sh refuses to boot while a non-completed marker exists,
 # and refuses an image/data major mismatch, so no mismatched boot can ever
 # touch the data directory.
@@ -138,6 +149,21 @@ cluster_state() {
     | awk -F: '/Database cluster state/ {sub(/^ +/,"",$2); print $2}'
 }
 
+# A recovery.signal or standby.signal volume can't be upgraded in place:
+# it's a standby or a mid-restore cluster whose recovery intent lives in
+# those files, and ensure_clean_shutdown's quiesce would CONSUME them —
+# postgres eats recovery.signal on promote — silently turning a
+# point-in-time restore into "whatever WAL happened to be local". Refuse
+# loudly in both modes, before anything touches the cluster.
+refuse_recovery_shapes() {
+  local sig
+  for sig in recovery.signal standby.signal; do
+    if [ -f "$PGDATA/$sig" ]; then
+      die 2 "$PGDATA/$sig is present — this cluster is mid-recovery or a standby, which cannot be upgraded in place. Let recovery finish (or promote the standby), then re-run."
+    fi
+  done
+}
+
 # pg_upgrade refuses a cluster that was not shut down cleanly, and it is right
 # to: unreplayed WAL would be silently dropped by --link. A container killed
 # mid-flight leaves exactly that state, so recover it here — start the OLD
@@ -182,12 +208,48 @@ check_from_major() {
 # ----- initdb of the target cluster ------------------------------------------
 
 # Match the old cluster's page-checksum setting; pg_upgrade requires parity.
+# Both directions must be EXPLICIT: initdb's default flipped to checksums-ON
+# in PostgreSQL 18, so a checksums-off source (the fleet default for clusters
+# initdb'd before 18) meeting an 18 target's default fails --check with "old
+# cluster does not use data checksums but the new one does". Emit
+# --no-data-checksums when the target's initdb knows the flag (18+; older
+# initdb rejects it, and its default is off anyway).
 checksum_flag() {
   local version
   version="$("$OLD_BINDIR/pg_controldata" "$PGDATA" 2>/dev/null | awk -F: '/Data page checksum version/ {gsub(/ /,"",$2); print $2}')"
   if [ -n "$version" ] && [ "$version" != "0" ]; then
     echo "--data-checksums"
+  elif [ "$version" = "0" ] && "$NEW_BINDIR/initdb" --help 2>/dev/null | grep -q -- "--no-data-checksums"; then
+    echo "--no-data-checksums"
   fi
+}
+
+# Effective CPU allocation for --jobs: cgroup v2 cpu.max, then cgroup v1
+# cfs quota, then nproc. Same derivation as wrapper.sh's detect_cpus — a
+# Railway container's nproc reports the HOST's cores, so sizing off it
+# oversubscribes a small allocation badly (pg_upgrade forks per-database
+# workers that each fork dump/restore pipelines).
+detect_cpus() {
+  local quota period
+
+  if [ -r /sys/fs/cgroup/cpu.max ]; then
+    read -r quota period < /sys/fs/cgroup/cpu.max
+    if [ "$quota" != "max" ] && [ -n "$quota" ] && [ -n "$period" ] && [ "$period" -gt 0 ]; then
+      echo $(( (quota + period - 1) / period ))
+      return
+    fi
+  fi
+
+  if [ -r /sys/fs/cgroup/cpu/cpu.cfs_quota_us ] && [ -r /sys/fs/cgroup/cpu/cpu.cfs_period_us ]; then
+    quota=$(cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us)
+    period=$(cat /sys/fs/cgroup/cpu/cpu.cfs_period_us)
+    if [ "$quota" -gt 0 ] && [ "$period" -gt 0 ]; then
+      echo $(( (quota + period - 1) / period ))
+      return
+    fi
+  fi
+
+  nproc 2>/dev/null || echo 1
 }
 
 init_new_cluster() {
@@ -211,7 +273,7 @@ run_pg_upgrade() {
     --old-datadir "$PGDATA" \
     --new-datadir "$new_dir" \
     --username=postgres \
-    --jobs "$(nproc)" \
+    --jobs "$(detect_cpus)" \
     $extra 2>&1)
   rc=$?
   echo "$out"
@@ -272,11 +334,56 @@ mode_check() {
   fi
 }
 
+# Carry per-cluster files the new data dir must inherit from the old one,
+# called before the swap's renames (idempotent — re-copying from the same
+# source on a resume is a no-op in effect):
+#
+#   pg_hba.conf / pg_ident.conf — the new cluster's copies are bare initdb
+#     defaults, which lack the `host all all all <method>` line the official
+#     entrypoint appends at init time (and any custom rules the user added).
+#     Without the carry, every remote client gets "no pg_hba.conf entry"
+#     after the upgrade — localhost still works via the default local trust
+#     line, which is exactly why it's easy to miss. wrapper.sh additionally
+#     self-heals a missing host line from config state (belt and braces).
+#
+#   .pitr_configured / .pitr_staging / .pgbackrest_restored — PITR lifecycle
+#     sentinels that live inside $PGDATA but describe VOLUME-level history.
+#     A PITR-restored fork keeps WAL_RECOVER_FROM_* + POSTGRES_RECOVERY_TARGET_TIME
+#     set forever; only these sentinels tell wrapper.sh that recovery already
+#     promoted. Losing them to the swap makes the next boot re-stage archive
+#     recovery against the source bucket and the database never becomes
+#     ready. wrapper.sh also treats a completed upgrade marker as proof of
+#     promoted recovery (defense in depth); this carry keeps the sentinels
+#     themselves truthful.
+carry_cluster_config() {
+  local src="$1" dst="$2" f
+  for f in pg_hba.conf pg_ident.conf; do
+    [ -f "$src/$f" ] || continue
+    cp -p "$src/$f" "$dst/$f" || die 3 "failed to carry $f into the new data dir"
+  done
+  for f in .pitr_configured .pitr_staging .pgbackrest_restored; do
+    [ -f "$src/$f" ] || continue
+    cp -p "$src/$f" "$dst/$f" || die 3 "failed to carry $f into the new data dir"
+  done
+}
+
 finish_swap() {
   # $PGDATA holds the OLD cluster and the NEW one is complete: move old aside,
   # promote new. Two renames; a crash between them leaves no $PGDATA, which
   # the marker (phase=upgraded) makes recoverable — and which wrapper.sh
   # refuses to boot into, so nothing can initdb over the gap.
+  #
+  # Before the renames, carry auth config + PITR sentinels from wherever the
+  # old cluster currently sits (still at $PGDATA on a first pass, already
+  # moved aside on a resume after a crash between the renames).
+  if [ -d "$NEW_DATA_DIR" ]; then
+    if [ -d "$PGDATA" ] && [ "$(data_major)" = "$FROM_MAJOR" ]; then
+      carry_cluster_config "$PGDATA" "$NEW_DATA_DIR"
+    elif [ -d "$OLD_KEEP_DIR" ]; then
+      carry_cluster_config "$OLD_KEEP_DIR" "$NEW_DATA_DIR"
+    fi
+  fi
+
   if [ -d "$PGDATA" ] && [ "$(data_major)" = "$FROM_MAJOR" ]; then
     mv "$PGDATA" "$OLD_KEEP_DIR" || die 3 "failed to move old data dir aside"
   fi
@@ -297,21 +404,59 @@ mode_upgrade() {
   check_mount
   take_job_lock
 
-  # Resume handling: the marker decides, never guesswork.
-  case "$(read_marker_field phase)" in
+  # Resume handling: the marker decides, but only for THIS job's version
+  # pair. Markers are never deleted after an upgrade, so a later upgrade of
+  # the same volume (16→17 done, now 17→18) finds the previous pair's
+  # completed marker — reading that as "already done" would report success
+  # while the data stays on the old major, and the workflow would flip the
+  # image tag into a boot refusal.
+  local marker_phase marker_from marker_to
+  marker_phase="$(read_marker_field phase)"
+  marker_from="$(read_marker_field from)"
+  marker_to="$(read_marker_field to)"
+  case "$marker_phase" in
     completed)
-      log "marker says completed — nothing to do"
-      result "{\"ok\": true, \"mode\": \"upgrade\", \"phase\": \"completed\", \"alreadyDone\": true}"
-      exit 0
+      if [ "$marker_to" = "$TO_MAJOR" ]; then
+        log "marker says completed for ${marker_from:-?} -> $TO_MAJOR — nothing to do"
+        result "{\"ok\": true, \"mode\": \"upgrade\", \"phase\": \"completed\", \"alreadyDone\": true}"
+        exit 0
+      fi
+      if [ "$(data_major)" != "$FROM_MAJOR" ]; then
+        die 2 "marker records a completed ${marker_from:-?} -> ${marker_to:-?} upgrade but the data directory is major '$(data_major)'; this job upgrades $FROM_MAJOR -> $TO_MAJOR"
+      fi
+      log "marker records a completed ${marker_from:-?} -> ${marker_to:-?} upgrade (history); data is $FROM_MAJOR — proceeding with $FROM_MAJOR -> $TO_MAJOR"
       ;;
     upgraded)
+      # A foreign-pair in-flight marker must NOT drive finish_swap: this
+      # job's NEW_DATA_DIR/OLD_KEEP_DIR names embed ITS majors, so it would
+      # be swapping directories that belong to a different job. Refuse
+      # loudly; only the matching pair's job can resolve the volume.
+      if [ "$marker_from" != "$FROM_MAJOR" ] || [ "$marker_to" != "$TO_MAJOR" ]; then
+        die 2 "marker records an in-flight ${marker_from:-?} -> ${marker_to:-?} upgrade; this job ($FROM_MAJOR -> $TO_MAJOR) refuses to finish another pair's swap — run the ${marker_from:-?}-${marker_to:-?} job to resolve it"
+      fi
       log "marker says upgraded — resuming directory swap"
       finish_swap
+      ;;
+    "")
+      # No marker, but the disk shape can still prove pg_upgrade finished:
+      # --link renames the old cluster's pg_control to pg_control.old as its
+      # last act, and the new data dir carries the target major's
+      # PG_VERSION. If the marker write was lost (crash after pg_upgrade,
+      # or a marker durability failure on an earlier image), this is the
+      # only window where "no marker" does NOT mean "roll back" — the old
+      # cluster can't be restarted (pg_control is gone), so roll forward.
+      # This keeps the marker from being a single point of failure.
+      if [ -f "$PGDATA/global/pg_control.old" ] \
+        && [ "$(cat "$NEW_DATA_DIR/PG_VERSION" 2>/dev/null)" = "$TO_MAJOR" ]; then
+        log "no marker, but the disk shape shows a finished pg_upgrade (pg_control.old present, new dir is $TO_MAJOR) — resuming directory swap"
+        finish_swap
+      fi
       ;;
   esac
 
   check_from_major
   clear_stale_pidfile
+  refuse_recovery_shapes
   ensure_clean_shutdown
   init_new_cluster "$NEW_DATA_DIR"
 
