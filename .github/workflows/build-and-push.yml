@@ -68,3 +68,62 @@ jobs:
             ghcr.io/${{ github.repository }}:${{ steps.get_version.outputs.minor_version }}
             ${{ matrix.postgres_major == env.LATEST_POSTGRES_MAJOR && format('ghcr.io/{0}:latest', github.repository) || '' }}
 
+
+  # One image per (source, target) major pair, carrying both majors' server
+  # binaries so pg_upgrade can drive both clusters. The dashboard's upgrade
+  # workflow dispatches these by tag, so every pair a user can select must
+  # exist: any supported major to any NEWER supported major.
+  #
+  # 14 is the oldest major the upgrade flow offers (13 is past upstream EOL and
+  # is not an upgrade target), which keeps this at 10 pairs.
+  build-upgrade-jobs:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+
+    strategy:
+      matrix:
+        include:
+          - { from: 14, to: 15 }
+          - { from: 14, to: 16 }
+          - { from: 14, to: 17 }
+          - { from: 14, to: 18 }
+          - { from: 15, to: 16 }
+          - { from: 15, to: 17 }
+          - { from: 15, to: 18 }
+          - { from: 16, to: 17 }
+          - { from: 16, to: 18 }
+          - { from: 17, to: 18 }
+
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          platforms: linux/amd64,linux/arm64
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push the upgrade job image
+        uses: docker/build-push-action@v5
+        with:
+          file: Dockerfile.upgrade
+          platforms: linux/arm64,linux/amd64
+          push: true
+          build-args: |
+            FROM_VERSION=${{ matrix.from }}
+            TO_VERSION=${{ matrix.to }}
+          tags: |
+            ghcr.io/${{ github.repository }}/upgrade:${{ matrix.from }}-${{ matrix.to }}

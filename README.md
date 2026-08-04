@@ -354,7 +354,10 @@ change this behavior, feel free to build your own image without passing the
 ## Major version upgrades
 
 `Dockerfile.upgrade` builds a one-shot job image carrying two majors' server
-binaries, driven by `upgrade-job.sh`. Built per source→target pair:
+binaries, driven by `upgrade-job.sh`. CI publishes one image per supported
+(source → newer target) pair as
+`ghcr.io/railwayapp-templates/postgres-ssl/upgrade:<from>-<to>`, which is what
+the dashboard's upgrade workflow dispatches. Locally:
 
 ```bash
 docker build -f Dockerfile.upgrade \
