@@ -8,8 +8,16 @@
 #
 # Modes (first argument, default "upgrade"):
 #   check    — initdb a throwaway target cluster and run pg_upgrade --check.
-#              Read-only with respect to the volume. Exit 0 = upgradeable,
-#              exit 1 = blockers (printed), exit 2 = precondition failure.
+#              Exit 0 = upgradeable, exit 1 = blockers (printed), exit 2 =
+#              precondition failure. NOT strictly read-only: a cluster that
+#              was not shut down cleanly (the platform stops containers with
+#              SIGKILL, so that is the common case) is first quiesced —
+#              start the old server, replay its WAL, shut down cleanly —
+#              which is exactly what the next normal boot would have done.
+#              Only a cleanly-shut-down volume is checked without writes.
+#              Volumes with recovery.signal / standby.signal are refused
+#              outright (exit 2) in both modes: quiescing would consume the
+#              recovery intent, and those shapes can't be upgraded in place.
 #   upgrade  — the real thing: --check first, then pg_upgrade --link into a
 #              new data dir on the volume, write the completion marker (the
 #              commit point), then swap directories. Crash-safe: re-running
@@ -47,6 +55,11 @@ TO_MAJOR="${PG_UPGRADE_TO:?PG_UPGRADE_TO not set}"
 EXPECTED_VOLUME_MOUNT_PATH="/var/lib/postgresql/data"
 VOLUME_ROOT="$EXPECTED_VOLUME_MOUNT_PATH"
 PGDATA="${PGDATA:-$VOLUME_ROOT/pgdata}"
+# Strip trailing slashes. Every sibling path below is built by appending a
+# suffix to $PGDATA, so "…/pgdata/" would put the new cluster INSIDE the data
+# dir ("…/pgdata/.upgrade-17") — the swap's first rename then orphans it and
+# the volume wedges at phase=upgraded forever.
+while [ "${PGDATA%/}" != "$PGDATA" ] && [ -n "${PGDATA%/}" ]; do PGDATA="${PGDATA%/}"; done
 MARKER_FILE="$VOLUME_ROOT/.railway-major-upgrade.json"
 
 OLD_BINDIR="/usr/lib/postgresql/${FROM_MAJOR}/bin"
@@ -75,14 +88,21 @@ read_marker_field() {
   jq -r ".$1" "$MARKER_FILE" 2>/dev/null | sed 's/^null$//'
 }
 
+# The marker is the commit point — it must be durable before we act on it,
+# so every step is checked and fatal. die(3) here fires BEFORE the caller
+# mutates any directory: after pg_upgrade the old cluster's pg_control has
+# been renamed away, so proceeding on a marker that may not exist would
+# leave a volume neither direction can interpret. The rename itself is only
+# durable once the PARENT DIRECTORY is fsynced — syncing the file alone
+# leaves the new directory entry volatile on ext4/xfs.
 write_marker() {
   local json="$1"
   local tmp="${MARKER_FILE}.tmp"
-  echo "$json" > "$tmp"
-  # The marker is the commit point — it must be durable before we act on it.
-  sync "$tmp"
-  mv "$tmp" "$MARKER_FILE"
-  sync "$MARKER_FILE" 2>/dev/null || sync
+  echo "$json" > "$tmp" || die 3 "failed to write the upgrade marker temp file"
+  sync "$tmp" || die 3 "failed to fsync the upgrade marker temp file"
+  mv "$tmp" "$MARKER_FILE" || die 3 "failed to move the upgrade marker into place"
+  sync "$MARKER_FILE" || die 3 "failed to fsync the upgrade marker"
+  sync "$VOLUME_ROOT" 2>/dev/null || sync || die 3 "failed to fsync the volume root after the marker rename"
 }
 
 as_postgres() {
@@ -117,18 +137,23 @@ check_mount() {
 
 JOB_LOCK_FILE="$VOLUME_ROOT/.railway-major-upgrade.lock"
 
-# Exclude a second upgrade job on the same volume. This is the hazard that can
-# actually happen (an activity retry racing a still-running attempt); a
-# postgres running in ANOTHER container is not detectable from here — separate
-# PID and IPC namespaces make postmaster.pid's liveness and shmem checks
-# meaningless across containers — and is excluded by the orchestrator instead
-# (volume lock + service maintenance restriction + the deploy pipeline
-# stopping the incumbent before this container starts).
+# Exclusive flock on the volume-root lock file, held for this job's lifetime.
+# The runtime image (wrapper.sh) holds the SAME file with a SHARED flock for
+# its container's whole life, so this excludes BOTH hazards that share the
+# volume: a second upgrade job (an activity retry racing a still-running
+# attempt) and a live database container the orchestrator failed to stop —
+# postmaster.pid can't detect the latter (separate PID/IPC namespaces make
+# its liveness and shmem checks meaningless across containers), but the
+# flock, living in the shared filesystem, can. The orchestrator's own
+# exclusion (volume lock + service maintenance restriction + stopping the
+# incumbent before this container starts) remains the first line of defense;
+# this is the in-image backstop that turns a workflow bug into a refusal
+# instead of a corrupted volume.
 take_job_lock() {
   command -v flock >/dev/null 2>&1 || return 0
-  exec 9>"$JOB_LOCK_FILE" || return 0
+  exec 9>>"$JOB_LOCK_FILE" || return 0
   if ! flock -n 9; then
-    die 2 "another upgrade job is already running on this volume"
+    die 2 "the volume is in use — another upgrade job, or a still-running database container, holds the upgrade lock"
   fi
 }
 
@@ -312,8 +337,22 @@ mode_manifest() {
 mode_check() {
   check_mount
   take_job_lock
+
+  # A marker mid-upgrade means the volume's state belongs to the upgrade
+  # workflow, not to a preflight: name that instead of failing on whatever
+  # half-swapped shape the disk happens to be in.
+  local phase
+  phase="$(read_marker_field phase)"
+  if [ -n "$phase" ] && [ "$phase" != "completed" ]; then
+    die 2 "a major upgrade is already in progress on this volume (marker phase: $phase) — resolve it before running check"
+  fi
+
   clear_stale_pidfile
   check_from_major
+  refuse_recovery_shapes
+  # Quiesces an unclean cluster (WAL replay + clean shutdown — what the next
+  # normal boot would do); see the header for why check is only strictly
+  # read-only on a cleanly-shut-down volume.
   ensure_clean_shutdown
 
   local tmp_new="/tmp/pg-upgrade-check-target"

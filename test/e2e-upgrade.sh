@@ -461,7 +461,7 @@ t_refuses_concurrent_job() {
   local rc="$JOB_RC" out="$JOB_OUT"
   docker rm -f lockholder >/dev/null 2>&1
   assert_eq "$rc" 2 "second job refused" || { echo "$out" | tail -10; return 1; }
-  assert_contains "$out" "another upgrade job is already running" "lock message" || return 1
+  assert_contains "$out" "holds the upgrade lock" "lock message" || return 1
 }
 
 # The whole point: upgrade succeeds, marker completes, the TO image boots,
@@ -748,6 +748,167 @@ t_foreign_pair_upgraded_marker_refused() {
   in_volume "$vol" "rm -f $MARKER_PATH"
 }
 
+# The in-image job-vs-runtime backstop: with the database container RUNNING
+# on the volume (its wrapper holds the shared flock for the container's
+# lifetime — through docker-entrypoint's exec of postgres, which is exactly
+# what this proves), both job modes must refuse, and the database must be
+# unharmed. Without this, a job racing a live runtime bricks the volume
+# while reporting ok:true.
+t_job_refused_while_runtime_live() {
+  local vol="upg-e2e-joblock"
+  fresh_volume "$vol" || return 1
+  run_pg lockrt-pg "$vol" "$FROM_IMAGE" || return 1
+  wait_for_pg lockrt-pg || { fail_dump lockrt lockrt-pg; return 1; }
+  psql_must lockrt-pg "CREATE TABLE lock_canary (id int); INSERT INTO lock_canary VALUES (1)" || return 1
+
+  run_job "$vol" upgrade
+  assert_eq "$JOB_RC" 2 "upgrade refused while runtime is live" || { echo "$JOB_OUT" | tail -10; return 1; }
+  assert_contains "$JOB_OUT" "holds the upgrade lock" "refusal names the lock" || return 1
+  run_job "$vol" check
+  assert_eq "$JOB_RC" 2 "check refused while runtime is live" || { echo "$JOB_OUT" | tail -10; return 1; }
+
+  # The database kept running through both refusals.
+  assert_eq "$(psql_in lockrt-pg 'SELECT count(*) FROM lock_canary')" "1" "database unharmed" || return 1
+  stop_pg lockrt-pg
+
+  # And with the runtime stopped, the same job succeeds — the lock is released
+  # with the container, not leaked.
+  run_job "$vol" upgrade
+  assert_eq "$JOB_RC" 0 "upgrade succeeds once the runtime is stopped" || { echo "$JOB_OUT" | tail -20; return 1; }
+}
+
+# The runtime-vs-job direction of the same lock: a database deployed while
+# an upgrade job holds the exclusive flock must refuse to boot.
+t_runtime_refused_while_job_locked() {
+  local vol="upg-e2e-rtlock"
+  seed_from_cluster "$vol" || return 1
+  docker run -d --name rt-lockholder --label postgres-upgrade-e2e=1 \
+    -v "$vol:/var/lib/postgresql/data" --entrypoint /bin/sh "$JOB_IMAGE" \
+    -c "exec 9>/var/lib/postgresql/data/.railway-major-upgrade.lock; flock 9; sleep 60" >/dev/null
+  sleep 2
+  local rc=0
+  expect_boot_refusal "$vol" "$FROM_IMAGE" "upgrade job is currently running" || rc=1
+  docker rm -f rt-lockholder >/dev/null 2>&1
+  return "$rc"
+}
+
+# recovery.signal / standby.signal volumes are refused by BOTH modes, and the
+# signal file is not consumed: check's quiesce would otherwise eat a
+# mid-restore volume's recovery intent (replaying to "whatever WAL is local"
+# instead of the configured target), and a standby that PASSES check would
+# still fail the real run.
+t_recovery_shapes_refused() {
+  local vol="upg-e2e-recshape"
+  seed_from_cluster "$vol" || return 1
+  local sig
+  for sig in recovery.signal standby.signal; do
+    in_volume "$vol" "touch $PGDATA_IN_VOLUME/$sig && chown postgres:postgres $PGDATA_IN_VOLUME/$sig" || return 1
+    run_job "$vol" check
+    assert_eq "$JOB_RC" 2 "check refuses a $sig volume" || { echo "$JOB_OUT" | tail -10; return 1; }
+    assert_contains "$JOB_OUT" "$sig" "refusal names $sig" || return 1
+    run_job "$vol" upgrade
+    assert_eq "$JOB_RC" 2 "upgrade refuses a $sig volume" || { echo "$JOB_OUT" | tail -10; return 1; }
+    in_volume "$vol" "test -f $PGDATA_IN_VOLUME/$sig" \
+      || { echo "  $sig was consumed by the refused job"; return 1; }
+    in_volume "$vol" "rm -f $PGDATA_IN_VOLUME/$sig" || return 1
+  done
+
+  # The volume is still upgradeable once the signals are gone.
+  run_job "$vol" check
+  assert_eq "$JOB_RC" 0 "check passes after the signals are removed" || { echo "$JOB_OUT" | tail -10; return 1; }
+}
+
+# The marker-lost window: pg_upgrade finished (old cluster's pg_control
+# renamed to pg_control.old — it can never start again) but the marker is
+# gone. The disk shape alone must drive the roll-forward; without it the
+# volume is bricked in both directions. Reconstructed from a completed
+# upgrade: put the dirs back to "post-pg_upgrade, pre-swap" and delete the
+# marker.
+t_marker_lost_after_pg_upgrade_resumes() {
+  local vol="upg-e2e-lostmarker"
+  seed_from_cluster "$vol" || return 1
+  run_job "$vol" upgrade
+  assert_eq "$JOB_RC" 0 "initial upgrade" || { echo "$JOB_OUT" | tail -20; return 1; }
+  # The premise: pg_upgrade --link really does rename pg_control away.
+  in_volume "$vol" "test -f ${PGDATA_IN_VOLUME}.old-${FROM_VERSION}/global/pg_control.old" \
+    || { echo "  premise broken: pg_upgrade left no pg_control.old"; return 1; }
+  in_volume "$vol" "
+    set -e
+    cd /var/lib/postgresql/data
+    mv pgdata pgdata.upgrade-${TO_VERSION}
+    mv pgdata.old-${FROM_VERSION} pgdata
+    rm -f $MARKER_PATH
+  " || return 1
+
+  run_job "$vol" upgrade
+  assert_eq "$JOB_RC" 0 "marker-less resume exit code" || { echo "$JOB_OUT" | tail -20; return 1; }
+  assert_contains "$JOB_OUT" "disk shape shows a finished pg_upgrade" "roll-forward inferred from disk" || return 1
+  assert_eq "$(marker_field "$vol" phase)" "completed" "marker rebuilt as completed" || return 1
+  run_pg lostmarker-pg "$vol" "$TO_IMAGE" || return 1
+  wait_for_pg lostmarker-pg || { fail_dump lostmarker lostmarker-pg; return 1; }
+  assert_eq "$(psql_in lostmarker-pg 'SELECT count(*) FROM upgrade_canary')" "1000" "data intact after marker-less resume" || return 1
+  stop_pg lostmarker-pg
+}
+
+# pgdata.old-<from> is the rollback body and pins every pre-upgrade inode
+# (--link hardlinks); it must survive normal boots and be reclaimed in the
+# background once the upgraded database has been up past the grace period,
+# stamping oldDataDirRemovedAt in the marker.
+t_old_datadir_reclaimed() {
+  local vol="upg-e2e-reclaim"
+  seed_from_cluster "$vol" || return 1
+  run_job "$vol" upgrade
+  assert_eq "$JOB_RC" 0 "upgrade exit code" || { echo "$JOB_OUT" | tail -20; return 1; }
+
+  # A normal boot (default 24h grace) must NOT reclaim.
+  run_pg reclaim-hold "$vol" "$TO_IMAGE" || return 1
+  wait_for_pg reclaim-hold || { fail_dump reclaim-hold reclaim-hold; return 1; }
+  sleep 5
+  local held_rc=0
+  docker exec reclaim-hold test -d "${PGDATA_IN_VOLUME}.old-${FROM_VERSION}" || held_rc=1
+  stop_pg reclaim-hold
+  [ "$held_rc" = "0" ] || { echo "  old data dir reclaimed before the grace period"; return 1; }
+
+  # With the grace collapsed, the same boot reclaims and stamps the marker.
+  run_pg reclaim-pg "$vol" "$TO_IMAGE" -e "UPGRADE_OLD_DIR_RETENTION_SECONDS=1" || return 1
+  wait_for_pg reclaim-pg || { fail_dump reclaim reclaim-pg; return 1; }
+  local deadline=$(($(date +%s) + 90))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if [ -n "$(marker_field "$vol" oldDataDirRemovedAt)" ]; then
+      break
+    fi
+    sleep 3
+  done
+  assert_contains "$(docker logs reclaim-pg 2>&1)" "pre-upgrade data dir reclaimed" "reclaim reported" || { fail_dump reclaim reclaim-pg; stop_pg reclaim-pg; return 1; }
+  stop_pg reclaim-pg
+  in_volume "$vol" "test ! -e ${PGDATA_IN_VOLUME}.old-${FROM_VERSION}" \
+    || { echo "  old data dir still present after reclaim"; return 1; }
+  [ -n "$(marker_field "$vol" oldDataDirRemovedAt)" ] \
+    || { echo "  marker has no oldDataDirRemovedAt after reclaim"; return 1; }
+}
+
+# A trailing slash on PGDATA must not change any derived path: it used to
+# put the new cluster INSIDE the data dir and wedge the volume at
+# phase=upgraded permanently.
+t_trailing_slash_pgdata() {
+  local vol="upg-e2e-slash"
+  seed_from_cluster "$vol" || return 1
+  JOB_OUT=$(docker run --rm --label postgres-upgrade-e2e=1 \
+    -e "PGDATA=${PGDATA_IN_VOLUME}/" \
+    -v "$vol:/var/lib/postgresql/data" \
+    "$JOB_IMAGE" upgrade 2>&1)
+  JOB_RC=$?
+  assert_eq "$JOB_RC" 0 "upgrade with trailing-slash PGDATA" || { echo "$JOB_OUT" | tail -30; return 1; }
+  assert_eq "$(marker_field "$vol" phase)" "completed" "marker completed" || return 1
+  assert_eq "$(volume_data_major "$vol")" "$TO_VERSION" "data major is TO" || return 1
+
+  # The runtime normalizes too.
+  run_pg slash-pg "$vol" "$TO_IMAGE" -e "PGDATA=${PGDATA_IN_VOLUME}/" || return 1
+  wait_for_pg slash-pg || { fail_dump slash slash-pg; return 1; }
+  assert_eq "$(psql_in slash-pg 'SELECT count(*) FROM upgrade_canary')" "1000" "data intact with trailing-slash PGDATA" || return 1
+  stop_pg slash-pg
+}
+
 # ----- runner -----------------------------------------------------------------
 ALL_TESTS=(
   t_vanilla_boot
@@ -771,6 +932,12 @@ ALL_TESTS=(
   t_pitr_fork_survives_upgrade
   t_second_upgrade_reaches_next_major
   t_foreign_pair_upgraded_marker_refused
+  t_job_refused_while_runtime_live
+  t_runtime_refused_while_job_locked
+  t_recovery_shapes_refused
+  t_marker_lost_after_pg_upgrade_resumes
+  t_old_datadir_reclaimed
+  t_trailing_slash_pgdata
 )
 
 TESTS=("${@:-}")

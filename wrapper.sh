@@ -15,6 +15,14 @@ if [ -n "$RAILWAY_ENVIRONMENT" ] && [ "$RAILWAY_VOLUME_MOUNT_PATH" != "$EXPECTED
   exit 1
 fi
 
+# Strip trailing slashes from PGDATA. Postgres itself tolerates them, but
+# the major-upgrade job builds sibling paths by appending to $PGDATA
+# ("${PGDATA}.upgrade-<to>"), so a value with a trailing slash must never be
+# allowed to take root on a volume — normalize here exactly like
+# upgrade-job.sh does, so both programs agree on every derived path.
+while [ "${PGDATA%/}" != "$PGDATA" ] && [ -n "${PGDATA%/}" ]; do PGDATA="${PGDATA%/}"; done
+export PGDATA
+
 # check if PGDATA starts with the expected volume mount path
 # this ensures data files are stored in the correct location
 # if not, print error and exit to prevent data loss or access issues
@@ -22,6 +30,37 @@ if [[ ! "$PGDATA" =~ ^"$EXPECTED_VOLUME_MOUNT_PATH" ]]; then
   echo "PGDATA variable does not start with the expected volume mount path, expected to start with $EXPECTED_VOLUME_MOUNT_PATH"
   echo "Please update the PGDATA variable to start with the expected volume mount path and redeploy the service"
   exit 1
+fi
+
+# -----------------------------------------------------------------------------
+# Volume-lifetime lock shared with the major-upgrade job. upgrade-job.sh
+# holds this file EXCLUSIVELY (flock -n) for its whole run; the runtime
+# holds it SHARED for the container's lifetime. Together they make both
+# races refuse instead of corrupting: a job dispatched against a live
+# database fails its exclusive lock, and a database deployed while a job is
+# mid-flight fails here. The fd is opened by THIS shell, which stays alive
+# as PID 1 (docker-entrypoint.sh below is a child, not an exec), so the
+# lock is held exactly as long as the container regardless of what postgres
+# does with its inherited copy of the fd — closing a duplicate descriptor
+# does not release a flock while the original stays open.
+#
+# Legacy PGDATA-at-the-volume-root layouts skip the lock on first init:
+# creating the lock file inside an empty PGDATA would make docker-entrypoint
+# skip initdb (it checks `ls -A`), and that layout can't take an in-place
+# upgrade anyway (no sibling slot on the volume for the new data dir).
+# -----------------------------------------------------------------------------
+UPGRADE_LOCK_FILE="$EXPECTED_VOLUME_MOUNT_PATH/.railway-major-upgrade.lock"
+if command -v flock >/dev/null 2>&1 && [ -d "$EXPECTED_VOLUME_MOUNT_PATH" ] \
+  && ! { [ "$PGDATA" = "$EXPECTED_VOLUME_MOUNT_PATH" ] && [ ! -f "$PGDATA/PG_VERSION" ]; }; then
+  if exec 8>>"$UPGRADE_LOCK_FILE" 2>/dev/null; then
+    if ! flock -n -s 8; then
+      echo "A major version upgrade job is currently running against this volume."
+      echo "The database must not start until it finishes; retry the deploy once the upgrade completes."
+      exit 1
+    fi
+  else
+    echo "wrapper: could not open $UPGRADE_LOCK_FILE; continuing without the upgrade lock" >&2
+  fi
 fi
 
 # -----------------------------------------------------------------------------
@@ -1515,10 +1554,63 @@ fork_post_upgrade_analyze() {
   ) &
 }
 
+# After a completed upgrade the previous cluster stays at ${PGDATA}.old-<from>
+# as the rollback body. pg_upgrade --link hardlinked the data files, so the
+# kept directory pins every pre-upgrade inode: space freed inside the upgraded
+# database (dropped tables, VACUUM FULL) is not returned to the volume while
+# the old directory holds the second link. Keep it until the upgrade is
+# CONFIRMED — the upgraded database up and answering, past a grace period
+# measured from the marker's completedAt (default 24h;
+# UPGRADE_OLD_DIR_RETENTION_SECONDS overrides, mainly for tests) — then
+# reclaim it in the background and stamp oldDataDirRemovedAt in the marker.
+# Forked on every boot alongside the analyze task, and it sleeps out the
+# remaining grace inside a long-lived container, so the reclaim does not
+# depend on a redeploy happening to land after the grace elapses.
+fork_old_datadir_reclaim() {
+  [ -f "$UPGRADE_MARKER_FILE" ] || return 0
+  [ "$(jq -r '.phase // empty' "$UPGRADE_MARKER_FILE" 2>/dev/null || true)" = "completed" ] || return 0
+  [ -z "$(jq -r '.oldDataDirRemovedAt // empty' "$UPGRADE_MARKER_FILE" 2>/dev/null || true)" ] || return 0
+  compgen -G "${PGDATA}.old-*" >/dev/null 2>&1 || return 0
+  (
+    retention="${UPGRADE_OLD_DIR_RETENTION_SECONDS:-86400}"
+    completed_at=$(jq -r '.completedAt // empty' "$UPGRADE_MARKER_FILE" 2>/dev/null) || exit 0
+    completed_epoch=$(date -d "$completed_at" +%s 2>/dev/null) || exit 0
+    [ -n "$completed_epoch" ] || exit 0
+    wait_secs=$(( completed_epoch + retention - $(date +%s) ))
+    if [ "$wait_secs" -gt 0 ]; then
+      echo "post-upgrade: keeping the pre-upgrade data dir for rollback; reclaiming in ${wait_secs}s"
+      sleep "$wait_secs"
+    fi
+    # Confirmation = the upgraded database is actually up and answering, not
+    # merely "the grace elapsed": a crash-looping upgrade must keep its
+    # rollback body. If postgres never becomes ready, leave everything in
+    # place — the next boot retries.
+    for _ in $(seq 1 120); do
+      pg_isready -q -h /var/run/postgresql -p 5432 2>/dev/null && break
+      sleep 5
+    done
+    pg_isready -q -h /var/run/postgresql -p 5432 2>/dev/null || exit 0
+    echo "post-upgrade: reclaiming the pre-upgrade data dir (${PGDATA}.old-*)"
+    if ! rm -rf "${PGDATA}".old-*; then
+      echo "post-upgrade: could not remove the pre-upgrade data dir; will retry on next boot"
+      exit 0
+    fi
+    tmp_marker="${UPGRADE_MARKER_FILE}.tmp"
+    if jq --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '.oldDataDirRemovedAt = $t' \
+        "$UPGRADE_MARKER_FILE" > "$tmp_marker" 2>/dev/null; then
+      mv "$tmp_marker" "$UPGRADE_MARKER_FILE"
+    else
+      rm -f "$tmp_marker"
+    fi
+    echo "post-upgrade: pre-upgrade data dir reclaimed"
+  ) &
+}
+
 bootstrap_pgbackrest_stanza
 fork_pgbackrest_backup_watcher
 fork_collation_refresh
 fork_post_upgrade_analyze
+fork_old_datadir_reclaim
 
 # H1 (audit): we considered `exec docker-entrypoint.sh` and a
 # trap+wait+forward-SIGTERM pattern to make `docker stop` flush
