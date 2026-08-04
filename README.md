@@ -383,6 +383,12 @@ The job tolerates the platform's ungraceful container stop: it clears a stale
 cleanly, replays WAL with the old binaries and shuts down cleanly before
 upgrading (pg_upgrade requires it).
 
+Because `pg_upgrade` promotes a freshly `initdb`'d data directory, settings that
+live in `postgresql.conf` do not carry over. The certificates survive at the
+volume root, so `wrapper.sh` re-applies the `ssl` settings whenever the config
+has none while certs exist — without that, an upgraded database comes back with
+SSL off and rejects every `sslmode=require` client.
+
 ### Archive re-anchoring
 
 `pg_upgrade` initdb's the target, so an upgraded service comes back with a new

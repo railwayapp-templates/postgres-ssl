@@ -110,6 +110,25 @@ if [ -f "$POSTGRES_CONF_FILE" ] && [ ! -f "$SSL_DIR/server.crt" ]; then
   bash "$INIT_SSL_SCRIPT"
 fi
 
+# Re-apply the ssl settings when the certificates exist but postgresql.conf
+# doesn't reference them. The checks above are keyed on the CERTIFICATE, which
+# lives at the volume root and therefore survives anything that replaces the
+# data directory — a major upgrade promotes a freshly initdb'd $PGDATA, so
+# postgresql.conf loses `ssl = on` while server.crt is still right there. The
+# result is a database that silently comes back with SSL off, rejecting every
+# sslmode=require client. Keying this on the CONFIG instead self-heals that
+# and any other path that resets postgresql.conf.
+if [ -f "$POSTGRES_CONF_FILE" ] && [ -f "$SSL_DIR/server.crt" ] \
+  && ! grep -qE "^[[:space:]]*ssl[[:space:]]*=" "$POSTGRES_CONF_FILE"; then
+  echo "wrapper: postgresql.conf has no ssl settings but certificates exist, re-applying"
+  cat >> "$POSTGRES_CONF_FILE" <<EOF
+ssl = on
+ssl_cert_file = '$SSL_DIR/server.crt'
+ssl_key_file = '$SSL_DIR/server.key'
+ssl_ca_file = '$SSL_DIR/root.crt'
+EOF
+fi
+
 # Adds pg_stat_statements to shared_preload_libraries in a config file
 # Usage: add_pg_stat_statements <config_file>
 add_pg_stat_statements() {

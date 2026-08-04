@@ -89,28 +89,77 @@ ensure_images() {
     -t "$JOB_IMAGE" "$REPO_ROOT" >/dev/null || exit 1
 }
 
+# Removing a container is asynchronous enough that the next `docker volume rm`
+# can still see the volume as in-use. Wait for the name to actually disappear
+# before returning, so callers can rely on the volume being free.
+remove_container() {
+  local name="$1" deadline=$(($(date +%s) + 30))
+  docker rm -f "$name" >/dev/null 2>&1
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    docker ps -a --format '{{.Names}}' | grep -qx "$name" || return 0
+    sleep 1
+  done
+  echo "  container $name did not go away"
+  return 1
+}
+
+# A volume that a dying container still holds fails to delete — and with the
+# failure swallowed, the "fresh" volume silently carries the previous test's
+# data (or its still-terminating postgres). Retry until the delete really
+# succeeds, and fail the test rather than proceed on a dirty volume.
 fresh_volume() {
-  local vol="$1"
-  docker volume rm "$vol" >/dev/null 2>&1 || true
-  docker volume create "$vol" >/dev/null
+  local vol="$1" deadline=$(($(date +%s) + 60))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if ! docker volume inspect "$vol" >/dev/null 2>&1; then
+      docker volume create "$vol" >/dev/null
+      return 0
+    fi
+    docker volume rm "$vol" >/dev/null 2>&1
+    sleep 1
+  done
+  echo "  could not free volume $vol (still in use)"
+  return 1
 }
 
 # Start a runtime postgres container on a volume. Extra docker args pass
 # through after name+vol+image.
+#
+# Container names are reused across tests, so a leftover container of the same
+# name must be removed first and the run must FAIL LOUDLY otherwise: a swallowed
+# name conflict leaves the old container (on the old volume) answering, and every
+# later psql in the test silently seeds or asserts against the wrong database.
 run_pg() {
   local name="$1" vol="$2" image="$3"; shift 3
-  docker run -d --name "$name" --label postgres-upgrade-e2e=1 \
+  remove_container "$name" || return 1
+  if ! docker run -d --name "$name" --label postgres-upgrade-e2e=1 \
     -e "POSTGRES_PASSWORD=test" \
     -e "PGDATA=$PGDATA_IN_VOLUME" \
     "$@" \
     -v "$vol:/var/lib/postgresql/data" \
-    "$image" >/dev/null
+    "$image" >/dev/null; then
+    echo "  docker run failed for container $name on volume $vol"
+    return 1
+  fi
 }
 
+# Waits for the REAL server, not the temporary one docker-entrypoint runs
+# during initdb to execute the init scripts. pg_isready answers on that temp
+# server's socket too, so a seed issued on its say-so can land mid-init and be
+# rolled away with it. The "ready to accept connections" line is only logged by
+# the final server, so gate on that as well.
+# Waits for the FINAL server, never the temporary one docker-entrypoint runs
+# during initdb to execute the init scripts. That temp server logs its own
+# "ready to accept connections" and then shuts down, so both pg_isready on the
+# unix socket and a log grep will happily match it — and a seed issued then dies
+# with "the database system is shutting down". The discriminator is TCP: the
+# temp server is started with listen_addresses='' and has no TCP listener, so a
+# TCP-ready answer can only come from the real one.
 wait_for_pg() {
-  local container="$1" deadline=$(($(date +%s) + 90))
+  local container="$1" deadline=$(($(date +%s) + 120))
   while [ "$(date +%s)" -lt "$deadline" ]; do
-    if docker exec "$container" pg_isready -q -U postgres 2>/dev/null; then return 0; fi
+    if docker exec "$container" pg_isready -q -h 127.0.0.1 -p 5432 -U postgres 2>/dev/null; then
+      return 0
+    fi
     if [ "$(docker inspect -f '{{.State.Status}}' "$container" 2>/dev/null)" = "exited" ]; then
       return 1
     fi
@@ -124,6 +173,20 @@ psql_in() {
   docker exec "$container" psql -U postgres -tAc "$sql" 2>&1
 }
 
+# Same, but fails the test when postgres reports an error. Setup steps must
+# never be silently swallowed — a seed that didn't run turns into a confusing
+# "relation does not exist" three assertions later.
+psql_must() {
+  local container="$1" sql="$2" out
+  out="$(psql_in "$container" "$sql")"
+  if echo "$out" | grep -qE "^(ERROR|FATAL|psql: error)"; then
+    echo "  psql failed: $sql"
+    echo "  output: $out"
+    fail_dump "psql:$container" "$container"
+    return 1
+  fi
+}
+
 # Clean stop: shut postgres down through pg_ctl so pg_control records
 # "shut down". `docker stop` alone is NOT clean on this image — bash as PID 1
 # never forwards SIGTERM, so postgres is SIGKILLed after the grace period and
@@ -133,7 +196,7 @@ stop_pg() {
   local name="$1"
   docker exec "$name" gosu postgres pg_ctl -D "$PGDATA_IN_VOLUME" -w -t 60 -m fast stop >/dev/null 2>&1
   docker stop -t 30 "$name" >/dev/null 2>&1
-  docker rm -f "$name" >/dev/null 2>&1
+  remove_container "$name"
 }
 
 # Ungraceful stop: what the platform actually does when a deployment is
@@ -142,7 +205,7 @@ stop_pg() {
 kill_pg() {
   local name="$1"
   docker kill -s KILL "$name" >/dev/null 2>&1
-  docker rm -f "$name" >/dev/null 2>&1
+  remove_container "$name"
 }
 
 # Run the upgrade job in a given mode on a volume; captures combined output.
@@ -173,7 +236,7 @@ expect_boot_refusal() {
   BOOT_OUT=$(docker logs "$name" 2>&1)
   local exit_code
   exit_code=$(docker inspect -f '{{.State.ExitCode}}' "$name" 2>/dev/null)
-  docker rm -f "$name" >/dev/null 2>&1
+  remove_container "$name"
   if [ "$status" != "exited" ] || [ "$exit_code" = "0" ]; then
     echo "  expected the container to exit nonzero (status=$status exit=$exit_code)"
     return 1
@@ -185,17 +248,19 @@ expect_boot_refusal() {
 # Leaves the volume ready for the job. $2 optional extra SQL.
 seed_from_cluster() {
   local vol="$1" extra_sql="${2:-}"
-  fresh_volume "$vol"
-  run_pg seed-pg "$vol" "$FROM_IMAGE"
+  fresh_volume "$vol" || return 1
+  run_pg seed-pg "$vol" "$FROM_IMAGE" || return 1
   wait_for_pg seed-pg || { fail_dump seed seed-pg; return 1; }
-  psql_in seed-pg "CREATE TABLE upgrade_canary (id serial PRIMARY KEY, body text)" >/dev/null
-  psql_in seed-pg "INSERT INTO upgrade_canary (body) SELECT 'row-' || g FROM generate_series(1, 1000) g" >/dev/null
-  psql_in seed-pg "CREATE INDEX upgrade_canary_body_idx ON upgrade_canary (body)" >/dev/null
-  psql_in seed-pg "CREATE EXTENSION IF NOT EXISTS vector" >/dev/null
-  psql_in seed-pg "CREATE TABLE embeddings (id int, v vector(3)); INSERT INTO embeddings VALUES (1, '[1,2,3]')" >/dev/null
+  psql_must seed-pg "CREATE TABLE upgrade_canary (id serial PRIMARY KEY, body text)" || return 1
+  psql_must seed-pg "INSERT INTO upgrade_canary (body) SELECT 'row-' || g FROM generate_series(1, 1000) g" || return 1
+  psql_must seed-pg "CREATE INDEX upgrade_canary_body_idx ON upgrade_canary (body)" || return 1
+  psql_must seed-pg "CREATE EXTENSION IF NOT EXISTS vector" || return 1
+  psql_must seed-pg "CREATE TABLE embeddings (id int, v vector(3)); INSERT INTO embeddings VALUES (1, '[1,2,3]')" || return 1
   if [ -n "$extra_sql" ]; then
-    psql_in seed-pg "$extra_sql" >/dev/null
+    psql_must seed-pg "$extra_sql" || return 1
   fi
+  # Prove the seed is durable before handing the volume to the job.
+  assert_eq "$(psql_in seed-pg 'SELECT count(*) FROM upgrade_canary')" "1000" "seed persisted" || return 1
   stop_pg seed-pg
 }
 
@@ -226,8 +291,8 @@ trap cleanup_all EXIT
 # boot + restart on the FROM major.
 t_vanilla_boot() {
   local vol="upg-e2e-vanilla"
-  fresh_volume "$vol"
-  run_pg vanilla-pg "$vol" "$FROM_IMAGE"
+  fresh_volume "$vol" || return 1
+  run_pg vanilla-pg "$vol" "$FROM_IMAGE" || return 1
   wait_for_pg vanilla-pg || { fail_dump vanilla vanilla-pg; return 1; }
   psql_in vanilla-pg "SELECT 1" | grep -q 1 || return 1
   docker restart vanilla-pg >/dev/null
@@ -243,7 +308,7 @@ t_check_pass() {
   assert_eq "$JOB_RC" 0 "check mode exit code" || { echo "$JOB_OUT" | tail -20; return 1; }
   assert_contains "$JOB_OUT" '"ok": true' "machine-readable result" || return 1
   assert_eq "$(volume_data_major "$vol")" "$FROM_VERSION" "data major untouched by check" || return 1
-  run_pg checkpass-pg "$vol" "$FROM_IMAGE"
+  run_pg checkpass-pg "$vol" "$FROM_IMAGE" || return 1
   wait_for_pg checkpass-pg || { fail_dump checkpass checkpass-pg; return 1; }
   assert_eq "$(psql_in checkpass-pg 'SELECT count(*) FROM upgrade_canary')" "1000" "data intact after check" || return 1
   stop_pg checkpass-pg
@@ -259,8 +324,8 @@ t_check_pass() {
 # mirror.
 t_check_blocker() {
   local vol="upg-e2e-blocker"
-  fresh_volume "$vol"
-  run_pg blocker-pg "$vol" "$FROM_IMAGE"
+  fresh_volume "$vol" || return 1
+  run_pg blocker-pg "$vol" "$FROM_IMAGE" || return 1
   wait_for_pg blocker-pg || { fail_dump blocker blocker-pg; return 1; }
   psql_in blocker-pg "ALTER SYSTEM SET max_prepared_transactions = 10" >/dev/null
   docker restart blocker-pg >/dev/null
@@ -274,7 +339,7 @@ t_check_blocker() {
   assert_contains "$JOB_OUT" "prepared transaction" "blocker named in output" || return 1
 
   # Untouched: the old cluster still boots and the blocker is still there.
-  run_pg blocker2-pg "$vol" "$FROM_IMAGE"
+  run_pg blocker2-pg "$vol" "$FROM_IMAGE" || return 1
   wait_for_pg blocker2-pg || { fail_dump blocker2 blocker2-pg; return 1; }
   assert_eq "$(psql_in blocker2-pg 'SELECT count(*) FROM pg_prepared_xacts')" "1" "cluster untouched by a failed check" || return 1
   psql_in blocker2-pg "ROLLBACK PREPARED 'e2e_blocker_tx'" >/dev/null
@@ -300,8 +365,8 @@ t_check_blocker_pre16_types() {
 # Wrong source major: a FROM->TO job pointed at a TO-major volume refuses.
 t_refuses_wrong_major() {
   local vol="upg-e2e-wrongmajor"
-  fresh_volume "$vol"
-  run_pg wrong-pg "$vol" "$TO_IMAGE"
+  fresh_volume "$vol" || return 1
+  run_pg wrong-pg "$vol" "$TO_IMAGE" || return 1
   wait_for_pg wrong-pg || { fail_dump wrongmajor wrong-pg; return 1; }
   stop_pg wrong-pg
   run_job "$vol" upgrade
@@ -315,13 +380,13 @@ t_refuses_wrong_major() {
 # upgrade fails. Committed rows written right before the kill must survive.
 t_recovers_unclean_shutdown() {
   local vol="upg-e2e-unclean"
-  fresh_volume "$vol"
-  run_pg unclean-pg "$vol" "$FROM_IMAGE"
+  fresh_volume "$vol" || return 1
+  run_pg unclean-pg "$vol" "$FROM_IMAGE" || return 1
   wait_for_pg unclean-pg || { fail_dump unclean unclean-pg; return 1; }
-  psql_in unclean-pg "CREATE TABLE unclean_canary (id int)" >/dev/null
-  psql_in unclean-pg "INSERT INTO unclean_canary SELECT generate_series(1, 500)" >/dev/null
-  psql_in unclean-pg "CHECKPOINT" >/dev/null
-  psql_in unclean-pg "INSERT INTO unclean_canary SELECT generate_series(501, 700)" >/dev/null
+  psql_must unclean-pg "CREATE TABLE unclean_canary (id int)" || return 1
+  psql_must unclean-pg "INSERT INTO unclean_canary SELECT generate_series(1, 500)" || return 1
+  psql_must unclean-pg "CHECKPOINT" || return 1
+  psql_must unclean-pg "INSERT INTO unclean_canary SELECT generate_series(501, 700)" || return 1
   kill_pg unclean-pg
 
   run_job "$vol" upgrade
@@ -329,7 +394,7 @@ t_recovers_unclean_shutdown() {
   assert_contains "$JOB_OUT" "replaying WAL" "recovery path was taken" || return 1
   assert_eq "$(marker_field "$vol" phase)" "completed" "marker completed" || return 1
 
-  run_pg unclean2-pg "$vol" "$TO_IMAGE"
+  run_pg unclean2-pg "$vol" "$TO_IMAGE" || return 1
   wait_for_pg unclean2-pg || { fail_dump unclean2 unclean2-pg; return 1; }
   assert_eq "$(psql_in unclean2-pg 'SELECT count(*) FROM unclean_canary')" "700" "post-checkpoint rows replayed and upgraded" || return 1
   stop_pg unclean2-pg
@@ -361,7 +426,7 @@ t_upgrade_happy_path() {
   assert_eq "$(marker_field "$vol" phase)" "completed" "marker phase" || return 1
   assert_eq "$(volume_data_major "$vol")" "$TO_VERSION" "on-disk major is now TO" || return 1
 
-  run_pg happy-pg "$vol" "$TO_IMAGE"
+  run_pg happy-pg "$vol" "$TO_IMAGE" || return 1
   wait_for_pg happy-pg || { fail_dump happy happy-pg; return 1; }
   assert_eq "$(psql_in happy-pg 'SELECT count(*) FROM upgrade_canary')" "1000" "rows survived" || return 1
   assert_contains "$(psql_in happy-pg "SELECT body FROM upgrade_canary WHERE body = 'row-500'")" "row-500" "index-reachable row" || return 1
@@ -397,11 +462,34 @@ t_manifest_mode() {
   assert_contains "$JOB_OUT" '"pg_stat_statements"' "contrib extension present" || return 1
 }
 
+# pg_upgrade promotes a freshly initdb'd data directory, so postgresql.conf
+# loses the ssl settings while the certificates survive at the volume root.
+# A database that comes back with SSL off rejects every sslmode=require client,
+# so the wrapper must re-apply the settings from the config's own state.
+t_ssl_survives_upgrade() {
+  local vol="upg-e2e-ssl"
+  seed_from_cluster "$vol" || return 1
+  run_pg ssl-before "$vol" "$FROM_IMAGE" || return 1
+  wait_for_pg ssl-before || { fail_dump ssl-before ssl-before; return 1; }
+  assert_eq "$(psql_in ssl-before 'SHOW ssl')" "on" "ssl on before upgrade" || return 1
+  stop_pg ssl-before
+
+  run_job "$vol" upgrade
+  assert_eq "$JOB_RC" 0 "upgrade exit code" || { echo "$JOB_OUT" | tail -20; return 1; }
+
+  run_pg ssl-after "$vol" "$TO_IMAGE" || return 1
+  wait_for_pg ssl-after || { fail_dump ssl-after ssl-after; return 1; }
+  assert_eq "$(psql_in ssl-after 'SHOW ssl')" "on" "ssl still on after upgrade" || return 1
+  # And a TLS connection actually completes, not just the setting being present.
+  assert_contains "$(docker exec ssl-after psql 'sslmode=require host=localhost user=postgres dbname=postgres' -tAc 'SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()' 2>&1)" "t" "sslmode=require connection is encrypted" || return 1
+  stop_pg ssl-after
+}
+
 # After the upgraded database boots, the staged statistics rebuild runs and
 # flips needsAnalyze off.
 t_analyze_staged() {
   local vol="upg-e2e-happy"
-  run_pg analyze-pg "$vol" "$TO_IMAGE"
+  run_pg analyze-pg "$vol" "$TO_IMAGE" || return 1
   wait_for_pg analyze-pg || { fail_dump analyze analyze-pg; return 1; }
   local deadline=$(($(date +%s) + 120))
   while [ "$(date +%s)" -lt "$deadline" ]; do
@@ -459,7 +547,7 @@ t_resume_after_crash_between_swaps() {
   run_job "$vol" upgrade
   assert_eq "$JOB_RC" 0 "resume exit code" || { echo "$JOB_OUT" | tail -20; return 1; }
   assert_eq "$(marker_field "$vol" phase)" "completed" "marker completed after resume" || return 1
-  run_pg resume-pg "$vol" "$TO_IMAGE"
+  run_pg resume-pg "$vol" "$TO_IMAGE" || return 1
   wait_for_pg resume-pg || { fail_dump resume resume-pg; return 1; }
   assert_eq "$(psql_in resume-pg 'SELECT count(*) FROM upgrade_canary')" "1000" "data intact after resume" || return 1
   stop_pg resume-pg
@@ -478,6 +566,7 @@ ALL_TESTS=(
   t_upgrade_idempotent
   t_status_mode
   t_manifest_mode
+  t_ssl_survives_upgrade
   t_analyze_staged
   t_old_image_on_upgraded_data
   t_mismatch_boot_failstop
