@@ -1,0 +1,37 @@
+# Dual-binary one-shot upgrade job image: carries the TARGET major as the
+# base plus the SOURCE major's server binaries, so pg_upgrade can drive both
+# clusters. Built per (FROM_VERSION, TO_VERSION) pair, e.g.:
+#
+#   docker build -f Dockerfile.upgrade \
+#     --build-arg FROM_VERSION=16 --build-arg TO_VERSION=17 \
+#     -t postgres-upgrade:16-17 .
+#
+# The entrypoint (upgrade-job.sh) is the whole program: check / upgrade /
+# status / manifest modes, documented in the script header. It runs against
+# the database service's own volume while the service is stopped.
+ARG TO_VERSION=17
+FROM postgres:${TO_VERSION}
+
+ARG FROM_VERSION=16
+ARG TO_VERSION
+ENV PG_UPGRADE_FROM=${FROM_VERSION}
+ENV PG_UPGRADE_TO=${TO_VERSION}
+
+# The official image's PGDG apt source is pinned to its own major's component;
+# widen it so the source major's packages resolve too. pgvector installs for
+# BOTH majors: pg_upgrade starts the old server (its loaded libraries must
+# resolve) and the new cluster must be able to load every library the old one
+# references, or --check fails with "loadable libraries" errors.
+RUN sed -ri "s/^(deb .*pgdg main).*$/\1 ${FROM_VERSION} ${TO_VERSION}/" /etc/apt/sources.list.d/pgdg.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+      postgresql-${FROM_VERSION} \
+      postgresql-${FROM_VERSION}-pgvector \
+      postgresql-${TO_VERSION}-pgvector \
+      jq \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --chmod=755 upgrade-job.sh /usr/local/bin/upgrade-job.sh
+
+ENTRYPOINT ["upgrade-job.sh"]
+CMD ["upgrade"]

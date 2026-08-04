@@ -24,6 +24,42 @@ if [[ ! "$PGDATA" =~ ^"$EXPECTED_VOLUME_MOUNT_PATH" ]]; then
   exit 1
 fi
 
+# -----------------------------------------------------------------------------
+# Major-version guards. Both are fail-stop and loud, and both run before
+# anything touches the data directory, so a mismatched boot can never corrupt
+# data or initdb over a half-swapped upgrade.
+#
+# 1. A major-upgrade marker (written by the upgrade job image) in any phase
+#    other than "completed" means the volume is mid-upgrade: the data
+#    directory may be absent or half-swapped. Refuse to boot; the upgrade
+#    workflow resolves it (roll forward or roll back), never this container.
+# 2. On-disk PG_VERSION must match this image's major. Postgres itself would
+#    refuse anyway, but deep in startup with a confusing error; failing here
+#    names the actual problem and the fix. A fresh volume (no PG_VERSION)
+#    skips the check — that's first init.
+# -----------------------------------------------------------------------------
+UPGRADE_MARKER_FILE="$EXPECTED_VOLUME_MOUNT_PATH/.railway-major-upgrade.json"
+if [ -f "$UPGRADE_MARKER_FILE" ]; then
+  # `|| true` so an unreadable marker still lands in the fail-stop branch
+  # below instead of tripping set -e with no message.
+  MARKER_PHASE=$(jq -r '.phase // empty' "$UPGRADE_MARKER_FILE" 2>/dev/null || true)
+  if [ "$MARKER_PHASE" != "completed" ]; then
+    echo "A major version upgrade is in progress on this volume (marker phase: ${MARKER_PHASE:-unreadable})."
+    echo "The database must not start until the upgrade workflow finishes or rolls back."
+    exit 1
+  fi
+fi
+
+if [ -f "$PGDATA/PG_VERSION" ]; then
+  DATA_MAJOR=$(cat "$PGDATA/PG_VERSION")
+  if [ -n "$PG_MAJOR" ] && [ "$DATA_MAJOR" != "$PG_MAJOR" ]; then
+    echo "This image runs PostgreSQL $PG_MAJOR but the data directory holds major version $DATA_MAJOR."
+    echo "Changing the image tag does not upgrade the data files. Set the image back to postgres $DATA_MAJOR,"
+    echo "or run a major version upgrade from the service's settings."
+    exit 1
+  fi
+fi
+
 # Set up needed variables
 SSL_DIR="/var/lib/postgresql/data/certs"
 INIT_SSL_SCRIPT="/docker-entrypoint-initdb.d/init-ssl.sh"
@@ -1142,9 +1178,37 @@ if [ -n "${WAL_ARCHIVE_BUCKET:-}" ] && [ -f "$PGDATA/global/pg_control" ] && [ !
   unset _early_repo_path
 fi
 
+# After a major upgrade, planner statistics start empty (pg_upgrade does not
+# carry them across majors before 18). Rebuild them in stages in the
+# background once postgres accepts connections, so the database is usable
+# immediately and reaches full statistics without operator action. The
+# marker's needsAnalyze flag makes this one-shot across restarts.
+fork_post_upgrade_analyze() {
+  [ -f "$UPGRADE_MARKER_FILE" ] || return 0
+  [ "$(jq -r '.needsAnalyze // false' "$UPGRADE_MARKER_FILE" 2>/dev/null)" = "true" ] || return 0
+  (
+    for _ in $(seq 1 120); do
+      if pg_isready -q -h /var/run/postgresql -p 5432 2>/dev/null; then
+        echo "post-upgrade: rebuilding planner statistics in stages"
+        if vacuumdb --all --analyze-in-stages -h /var/run/postgresql -p 5432 -U postgres >/dev/null 2>&1; then
+          tmp_marker="${UPGRADE_MARKER_FILE}.tmp"
+          jq '.needsAnalyze = false' "$UPGRADE_MARKER_FILE" > "$tmp_marker" 2>/dev/null \
+            && mv "$tmp_marker" "$UPGRADE_MARKER_FILE"
+          echo "post-upgrade: statistics rebuild complete"
+        else
+          echo "post-upgrade: statistics rebuild failed; will retry on next boot"
+        fi
+        exit 0
+      fi
+      sleep 5
+    done
+  ) &
+}
+
 bootstrap_pgbackrest_stanza
 fork_pgbackrest_backup_watcher
 fork_collation_refresh
+fork_post_upgrade_analyze
 
 # H1 (audit): we considered `exec docker-entrypoint.sh` and a
 # trap+wait+forward-SIGTERM pattern to make `docker stop` flush

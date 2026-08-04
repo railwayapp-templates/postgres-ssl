@@ -341,3 +341,38 @@ is set in the `PGPORT` environment variable. We did this to allow connections
 to the postgres service over the `RAILWAY_TCP_PROXY_PORT`. If you need to
 change this behavior, feel free to build your own image without passing the
 `--port` parameter to the `CMD` command in the Dockerfile.
+
+## Major version upgrades
+
+`Dockerfile.upgrade` builds a one-shot job image carrying two majors' server
+binaries, driven by `upgrade-job.sh`. Built per source→target pair:
+
+```bash
+docker build -f Dockerfile.upgrade \
+  --build-arg FROM_VERSION=16 --build-arg TO_VERSION=17 \
+  -t postgres-upgrade:16-17 .
+```
+
+It runs against the database's own volume while the service is stopped, and
+takes a mode as its argument:
+
+| Mode | Effect |
+|------|--------|
+| `check` | `pg_upgrade --check` against a throwaway target cluster. Volume untouched. Exit 1 = blockers. |
+| `upgrade` | `--check`, then `pg_upgrade --link`, then the completion marker and directory swap. |
+| `status` | Prints the marker phase + on-disk major as JSON, for resume decisions. |
+| `manifest` | Prints the target major's installable extensions as JSON. |
+
+`.railway-major-upgrade.json` at the volume root is the commit point:
+`upgraded` means pg_upgrade succeeded and recovery must roll **forward**;
+`completed` means the swap is done. `wrapper.sh` refuses to boot while a
+non-completed marker exists, and refuses any image whose major differs from
+the on-disk `PG_VERSION` — so no mismatched boot can touch the data.
+
+The job tolerates the platform's ungraceful container stop: it clears a stale
+`postmaster.pid` and, when `pg_control` says the cluster was not shut down
+cleanly, replays WAL with the old binaries and shuts down cleanly before
+upgrading (pg_upgrade requires it).
+
+Tests: `./test/e2e-upgrade.sh` (add `FROM_VERSION=14 TO_VERSION=17` to cover a
+pre-16 source, where pg_upgrade's `reg*`/`aclitem` checks fire).
