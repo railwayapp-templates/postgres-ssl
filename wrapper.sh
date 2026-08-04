@@ -264,6 +264,26 @@ PGBACKREST_RESTORED_MARKER="$PGDATA/.pgbackrest_restored"
 # the user can browse and restore from.
 PGBACKREST_REPO_PATH_MARKER="$PGDATA/.pgbackrest_repo_path"
 
+# Identity fingerprint of the cluster the repo-path marker was derived from
+# (`sysid=` + `pg_version=`), written next to the marker every time the marker
+# is derived. The marker on its own cannot say whether it still belongs to the
+# cluster on disk — it is a bare path that wins VERBATIM over derivation, by
+# design, so that the effective repo path is stable across boots. When the
+# cluster underneath it is REPLACED (pg_upgrade initdb's a new cluster: new
+# system_identifier and new PG_VERSION), a marker that outlives the swap keeps
+# archiving into the previous cluster's repo — archive-push then fails against
+# that repo's archive.info forever and stanza-create errors on the system-id
+# mismatch. Comparing this fingerprint against the live values on every boot
+# catches that whatever the cause, which is the point: the major-upgrade
+# marker is deleted/aged out eventually, and a cluster re-identified by any
+# other route needs exactly the same handling.
+#
+# Holds no path on purpose. The marker is the sole authority on the active
+# path, so there is nothing here that can drift out of sync with it — and a
+# WAL_REGRESSION migration (which re-points the path of a cluster whose
+# identity did NOT change) must not look like a re-identification.
+PGBACKREST_REPO_ANCHOR_FILE="$PGDATA/.pgbackrest_repo_anchor"
+
 # Sentinel: WAL_ARCHIVE_BUCKET was set to something we couldn't honor (an
 # unresolved Railway template ref, a bucket-id UUID, whitespace, …). The
 # monitor reads this to distinguish "PITR was never enabled" from "PITR is
@@ -362,6 +382,37 @@ read_postgres_sysid() {
     | awk -F: '/Database system identifier/ { gsub(/[ \t]/,"",$2); print $2 }'
 }
 
+# The cluster's on-disk major. Empty pre-initdb. `|| true` because this file
+# runs under `set -e` and an unreadable PG_VERSION must never abort the boot.
+read_postgres_major() {
+  [ ! -f "$PGDATA/PG_VERSION" ] && return 0
+  cat "$PGDATA/PG_VERSION" 2>/dev/null || true
+}
+
+# Field reader for the anchor file. Empty when the file or the field is absent.
+# grep sits mid-pipeline so a no-match exits 0 overall — a bare `grep` here
+# would abort the boot under `set -e` the first time a field is missing.
+read_pgbackrest_anchor_field() {
+  local field="$1"
+  [ ! -f "$PGBACKREST_REPO_ANCHOR_FILE" ] && return 0
+  grep -E "^${field}=" "$PGBACKREST_REPO_ANCHOR_FILE" 2>/dev/null | tail -1 | cut -d= -f2-
+}
+
+# Record which cluster the current repo-path marker belongs to. tmp+rename so
+# a reader never sees a half-written fingerprint, and so a crash can only ever
+# leave the PREVIOUS anchor in place — which is what makes the re-anchor
+# retryable (see reanchor_pgbackrest_repo_path_if_reidentified).
+write_pgbackrest_repo_anchor() {
+  local sysid="$1" major="$2" tmp
+  [ -z "$sysid" ] && return 1
+  [ -z "$major" ] && return 1
+  tmp=$(mktemp "${PGBACKREST_REPO_ANCHOR_FILE}.XXXX") || return 1
+  printf 'sysid=%s\npg_version=%s\n' "$sysid" "$major" > "$tmp" || { rm -f "$tmp"; return 1; }
+  chown postgres:postgres "$tmp" 2>/dev/null || true
+  chmod 0640 "$tmp" 2>/dev/null || true
+  mv "$tmp" "$PGBACKREST_REPO_ANCHOR_FILE" || { rm -f "$tmp"; return 1; }
+}
+
 # Resolve the effective repo1-path for archiving:
 #
 #   1. Marker file present → trust it. Idempotent across boots; survives
@@ -394,14 +445,203 @@ derive_pgbackrest_repo_path() {
 
   local cluster_path="${user_path%/}/cluster-${sysid}"
   write_pgbackrest_repo_path_marker "$cluster_path"
+  # Fingerprint the cluster this path was derived FROM, so a later boot can
+  # tell whether the marker still belongs to the cluster on disk. Written here
+  # rather than inside the marker writer: the marker writer is also the flip
+  # step of a re-anchor, where the anchor must land last, as the commit point.
+  write_pgbackrest_repo_anchor "$sysid" "$(read_postgres_major)" \
+    || echo "pgbackrest: could not write the repo-path anchor for cluster ${sysid}" >&2
   echo "$cluster_path"
 }
 
+# tmp+rename: the archive-push wrapper `cat`s this file on every WAL switch,
+# so a reader must see either the whole old path or the whole new one — same
+# reasoning as the watcher's apply_active_path, which is the other writer.
 write_pgbackrest_repo_path_marker() {
-  local path="$1"
-  echo "$path" > "$PGBACKREST_REPO_PATH_MARKER"
-  chown postgres:postgres "$PGBACKREST_REPO_PATH_MARKER" 2>/dev/null || true
-  chmod 0640 "$PGBACKREST_REPO_PATH_MARKER" 2>/dev/null || true
+  local path="$1" tmp
+  [ -z "$path" ] && return 1
+  tmp=$(mktemp "${PGBACKREST_REPO_PATH_MARKER}.XXXX") || return 1
+  printf '%s\n' "$path" > "$tmp" || { rm -f "$tmp"; return 1; }
+  chown postgres:postgres "$tmp" 2>/dev/null || true
+  chmod 0640 "$tmp" 2>/dev/null || true
+  mv "$tmp" "$PGBACKREST_REPO_PATH_MARKER" || { rm -f "$tmp"; return 1; }
+}
+
+# Replace the backup watcher's state file with nothing but the migration gate
+# (`archive_migration_pending_new_path`, empty to release it).
+#
+# Replaced rather than edited because every field in it describes backups at
+# the OLD path. Clearing last_full_at is what trips the watcher's
+# NEEDS_INITIAL_BACKUP, so an immediate full fires at the new path; every other
+# field the watcher reads defaults sanely when absent.
+#
+# The gate itself is the watcher's own migration interlock (see
+# pgbackrest-backup-watcher.sh): while set, the watcher takes no backups and
+# keeps retrying the spool cleanup. Setting it BEFORE the marker flip means a
+# re-anchor that dies halfway can never leave the watcher backing up against
+# stale old-path async statuses.
+#
+# Safe to write wholesale because the watcher is forked strictly after this
+# runs — wrapper.sh has no concurrent writer at this point in the boot.
+write_backup_state_migration_gate() {
+  local new_path="$1" state_file="$PGDATA/.pgbackrest_backup_state" tmp
+  tmp=$(mktemp "${state_file}.XXXX") || return 1
+  printf 'archive_migration_pending_new_path=%s\n' "$new_path" > "$tmp" \
+    || { rm -f "$tmp"; return 1; }
+  chown postgres:postgres "$tmp" 2>/dev/null || true
+  chmod 0640 "$tmp" 2>/dev/null || true
+  mv "$tmp" "$state_file" || { rm -f "$tmp"; return 1; }
+}
+
+# Drop async status files left by the previous cluster. A stale `.ok` is the
+# dangerous one: pgBackRest treats it as proof the segment was already pushed
+# and skips the upload, so it would silently punch holes in the NEW path's WAL
+# coverage. The spool is a coordination cache, never durable data — async
+# re-pushes from pg_wal on the next archive_command.
+#
+# Unlike the watcher's mid-flight equivalent there is no async daemon to drain
+# and kill here: wrapper.sh runs exactly once per container start, before any
+# postmaster of ours exists, so nothing can be writing these files.
+clean_archive_spool_statuses() {
+  local out_dir="$PGBACKREST_SPOOL_DIR/archive/main/out"
+  [ ! -d "$out_dir" ] && return 0
+  rm -f "$out_dir"/*.ok "$out_dir"/*.error 2>/dev/null || true
+  return 0
+}
+
+# Move archiving onto $2, leaving the previous cluster's archive at $1 intact.
+# Split out from the detection so the ordering below is readable as a unit; see
+# reanchor_pgbackrest_repo_path_if_reidentified for why the order is what it is.
+reanchor_pgbackrest_repo_path() {
+  local current_path="$1" new_path="$2"
+
+  # `current_path == new_path` means an earlier attempt already flipped the
+  # marker and then died before writing the anchor. The state reset always
+  # PRECEDES the flip, so a flipped marker also implies the state was reset —
+  # do not redo it (that would re-arm a full for a path that may already have
+  # one) and just finish the tail.
+  if [ "$current_path" != "$new_path" ]; then
+    write_backup_state_migration_gate "$new_path" || {
+      echo "pgbackrest: could not reset the backup-watcher state; leaving archiving at ${current_path}" >&2
+      return 1
+    }
+    write_pgbackrest_repo_path_marker "$new_path" || {
+      echo "pgbackrest: could not write the repo-path marker for ${new_path}" >&2
+      return 1
+    }
+    # Defense-in-depth for callers that read the conf instead of the marker
+    # (operator `docker exec` shells, mono's SSH `pgbackrest info` probe when
+    # it can't export the env override). bootstrap_pgbackrest_stanza rewrites
+    # this again from the marker once Postgres is up; both are idempotent.
+    if [ -f "$PGBACKREST_CONF_FILE" ]; then
+      sed -i "s|^repo1-path=.*|repo1-path=${new_path}|" "$PGBACKREST_CONF_FILE" \
+        || echo "pgbackrest: could not rewrite repo1-path in ${PGBACKREST_CONF_FILE} (the marker is authoritative)" >&2
+    fi
+  fi
+
+  clean_archive_spool_statuses
+  # The old cluster's gap sentinel describes the old path's coverage.
+  rm -f "$PGDATA/.pgbackrest_gap_pending" 2>/dev/null || true
+  # Cleanup done: release the watcher's backup gate. Failing here is safe —
+  # the watcher retries the same cleanup and clears the gate itself.
+  write_backup_state_migration_gate "" \
+    || echo "pgbackrest: could not clear the pending-migration gate; the watcher will retry it" >&2
+  return 0
+}
+
+# Re-anchor archiving onto the current cluster's own repo path when the cluster
+# that anchored the marker is gone. Runs on EVERY boot, before stanza bootstrap
+# and before Postgres starts — the only window where the flip is free: no
+# postmaster means no archive_command in flight, and no async daemon of ours
+# exists yet.
+#
+# Detection is the anchor fingerprint, never the major-upgrade marker: a
+# pg_upgrade is only the most common way to acquire a new system_identifier,
+# the upgrade marker is deleted/aged out eventually, and any other route to a
+# re-identified cluster needs the identical response. Today's upgrade job
+# reaches the same end state by a different road — its directory swap promotes
+# a freshly initdb'd data dir, so the new PGDATA inherits none of the old
+# cluster's pgbackrest files and the path is simply DERIVED fresh. This check
+# is what keeps that from being load-bearing: any upgrade route that carries
+# $PGDATA's config forward (or the dump/restore fallback for the legacy
+# PGDATA-is-the-volume-root layout, where these files sit outside the swapped
+# directory entirely) hands us a surviving marker pointing at the previous
+# cluster's repo.
+#
+# The new path needs no uniqueness suffix — unlike the watcher's WAL_REGRESSION
+# migration, which re-points the path of a cluster whose identity did NOT
+# change and therefore has to disambiguate with an epoch. A fresh
+# system_identifier makes `cluster-<sysid>` collision-free by construction,
+# and deterministic: a crashed attempt recomputes exactly the same target
+# instead of stranding a sibling prefix per retry.
+#
+# Order is chosen so every interruption converges on the next boot:
+#   1. gate the watcher + clear its timestamps (state describes the old path)
+#   2. flip the marker (+ conf) — the instant archiving moves
+#   3. drop the old path's spool statuses, release the watcher gate
+#   4. write the new anchor LAST
+# The anchor is the commit point: while it still names the old cluster the next
+# boot re-detects and re-runs, and every step is idempotent. Nothing here can
+# fail the boot — a database that is up with degraded archiving beats a
+# database that refuses to start, which is how the rest of this file treats
+# archive failures.
+reanchor_pgbackrest_repo_path_if_reidentified() {
+  [ -z "${WAL_ARCHIVE_BUCKET:-}" ] && return 0
+  [ ! -f "$PGDATA/global/pg_control" ] && return 0
+  # No marker: nothing is anchored yet, so there is nothing to re-anchor.
+  # derive_pgbackrest_repo_path writes both files from the live cluster.
+  [ ! -f "$PGBACKREST_REPO_PATH_MARKER" ] && return 0
+
+  local live_sysid live_major
+  live_sysid=$(read_postgres_sysid)
+  live_major=$(read_postgres_major)
+  if [ -z "$live_sysid" ] || [ -z "$live_major" ]; then
+    echo "pgbackrest: could not read the cluster identity (sysid='${live_sysid}', PG_VERSION='${live_major}'); leaving the archive path as-is" >&2
+    return 0
+  fi
+
+  local anchor_sysid anchor_major
+  anchor_sysid=$(read_pgbackrest_anchor_field sysid)
+  anchor_major=$(read_pgbackrest_anchor_field pg_version)
+
+  # Volume written before the anchor existed: adopt the live identity for the
+  # path already in the marker. Backfilling is the only safe reading of a
+  # missing anchor — "no fingerprint" is not evidence of a changed cluster,
+  # and the marker's path is where this cluster's archive already lives.
+  # Re-anchoring on a missing anchor would move every existing PITR-enabled
+  # service to a new prefix on its next redeploy.
+  if [ -z "$anchor_sysid" ] || [ -z "$anchor_major" ]; then
+    if write_pgbackrest_repo_anchor "$live_sysid" "$live_major"; then
+      echo "pgbackrest: adopted repo-path anchor (sysid=${live_sysid}, pg=${live_major}) for the existing archive path"
+    else
+      echo "pgbackrest: could not write the repo-path anchor; cluster re-identification stays undetectable until it succeeds" >&2
+    fi
+    return 0
+  fi
+
+  if [ "$anchor_sysid" = "$live_sysid" ] && [ "$anchor_major" = "$live_major" ]; then
+    return 0
+  fi
+
+  local current_path new_path user_path
+  current_path=$(cat "$PGBACKREST_REPO_PATH_MARKER" 2>/dev/null || true)
+  user_path="${WAL_ARCHIVE_PATH:-/pgbackrest}"
+  new_path="${user_path%/}/cluster-${live_sysid}"
+
+  echo "pgbackrest: cluster re-identified (anchored sysid=${anchor_sysid} pg=${anchor_major}, on disk sysid=${live_sysid} pg=${live_major}); re-anchoring archiving from ${current_path} to ${new_path}"
+
+  if ! reanchor_pgbackrest_repo_path "$current_path" "$new_path"; then
+    echo "pgbackrest: re-anchor to ${new_path} did not complete; the backup watcher retries it. Archiving stays degraded until then — the database is starting regardless." >&2
+    return 0
+  fi
+
+  if ! write_pgbackrest_repo_anchor "$live_sysid" "$live_major"; then
+    echo "pgbackrest: re-anchored to ${new_path} but could not write the anchor; the next boot re-runs this (idempotent)" >&2
+    return 0
+  fi
+
+  echo "pgbackrest: re-anchored to ${new_path}; stanza-create and an immediate full backup follow there. The previous cluster's archive is untouched at ${current_path}."
+  return 0
 }
 
 # Detect the container's effective CPU allocation. Reads cgroup v2 cpu.max
@@ -1177,6 +1417,15 @@ if [ -n "${WAL_ARCHIVE_BUCKET:-}" ] && [ -f "$PGDATA/global/pg_control" ] && [ !
   echo "pgbackrest: pre-fork repo-path marker = ${_early_repo_path}"
   unset _early_repo_path
 fi
+
+# …and when a marker IS present, check it still belongs to the cluster on disk.
+# Disjoint from the block above (that one only fires with no marker at all) and
+# deliberately ahead of stanza bootstrap: a stale marker would make
+# stanza-create fail on a system-id mismatch and every archive-push fail
+# against the previous cluster's archive.info. `|| true` because this file runs
+# under `set -e` and a failed re-anchor must never stop the database from
+# starting — the watcher retries.
+reanchor_pgbackrest_repo_path_if_reidentified || true
 
 # After a major upgrade, planner statistics start empty (pg_upgrade does not
 # carry them across majors before 18). Rebuild them in stages in the

@@ -237,6 +237,15 @@ persisted in `$PGDATA/.pgbackrest_repo_path` so the archive-push
 wrapper, the backup watcher, and `pgbackrest stanza-create` all
 converge on the same value.
 
+Alongside it, `$PGDATA/.pgbackrest_repo_anchor` records the
+`system_identifier` and `PG_VERSION` the path was derived from. The
+marker wins verbatim on every boot, so this fingerprint is the only
+thing that can tell "same cluster, same path" apart from "a different
+cluster inherited this path" — see the archive re-anchoring paragraph
+under [Major version upgrades](#major-version-upgrades). A volume
+predating the file adopts its live identity on first boot and keeps
+the path it already archives to.
+
 Why per-cluster: a wipe-and-reuse-bucket cycle (operator drops the
 data volume, redeploys the service against the same `WAL_ARCHIVE_BUCKET`)
 produces a brand-new `system_identifier` from `initdb`. Without
@@ -374,5 +383,38 @@ The job tolerates the platform's ungraceful container stop: it clears a stale
 cleanly, replays WAL with the old binaries and shuts down cleanly before
 upgrading (pg_upgrade requires it).
 
+### Archive re-anchoring
+
+`pg_upgrade` initdb's the target, so an upgraded service comes back with a new
+`system_identifier` and a new `PG_VERSION` — a different cluster as far as
+pgBackRest is concerned. Archiving has to follow it to
+`${WAL_ARCHIVE_PATH}/cluster-<new_sysid>`: the previous prefix records the old
+system id in its `archive.info`, so every `archive-push` against it fails and
+`stanza-create` refuses the mismatch outright.
+
+On every boot `wrapper.sh` compares `.pgbackrest_repo_anchor` against the
+cluster on disk. On a mismatch in either component, and only when
+`WAL_ARCHIVE_BUCKET` is set, it moves archiving before Postgres starts: flip the
+repo-path marker to the new cluster's prefix, drop the old path's async spool
+statuses (a stale `.ok` would make pgBackRest skip an upload the new path never
+received), reset the backup-watcher state so a full lands immediately at the new
+prefix, and `stanza-create` there. No epoch suffix is needed — a fresh system
+identifier makes the path collision-free and deterministic, so an interrupted
+attempt recomputes the same target. The previous cluster's archive is untouched
+and stays restorable as its own history in the bucket.
+
+Detection is the fingerprint, never the upgrade marker: that marker is deleted
+eventually, and a PITR-restored or otherwise re-identified cluster needs the
+identical response. The job's directory swap promotes a freshly initdb'd data
+directory, so today an upgraded `$PGDATA` usually inherits none of the old
+cluster's pgbackrest files and the path is simply derived fresh; the check is
+what keeps that from being load-bearing for any upgrade route that carries
+`$PGDATA` forward. Nothing here can fail the boot — an incomplete re-anchor is
+logged loudly and retried by the backup watcher, because a database that is up
+with degraded archiving beats one that refuses to start.
+
 Tests: `./test/e2e-upgrade.sh` (add `FROM_VERSION=14 TO_VERSION=17` to cover a
-pre-16 source, where pg_upgrade's `reg*`/`aclitem` checks fire).
+pre-16 source, where pg_upgrade's `reg*`/`aclitem` checks fire). The re-anchor
+tests need a bucket, so they live in the archive harness instead:
+`./test/e2e.sh t_upgrade_archive_reanchors_to_new_cluster_path
+t_reanchor_stale_marker_after_upgrade t_reanchor_backfills_missing_anchor`.

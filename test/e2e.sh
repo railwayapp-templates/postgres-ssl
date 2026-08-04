@@ -28,6 +28,18 @@ BUCKET="pgbackrest"
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DOCKERFILE="${REPO_ROOT}/Dockerfile.${PG_VERSION}"
 
+# Major-upgrade re-anchor tests: $PG_VERSION is the TARGET major (so they use
+# the suite's own $IMAGE for the upgraded side) and one major below is the
+# source. Those tests use the Railway data layout — PGDATA a subdirectory of
+# the volume — because upgrade-job.sh refuses a PGDATA that IS the volume root
+# (--link needs a sibling directory on the same filesystem). Every other test
+# in this file leaves PGDATA at the image default, which is the volume root.
+UPG_FROM_VERSION="${UPG_FROM_VERSION:-$((PG_VERSION - 1))}"
+UPG_FROM_IMAGE="postgres-ssl-pitr:${UPG_FROM_VERSION}"
+UPG_JOB_IMAGE="postgres-upgrade-e2e:${UPG_FROM_VERSION}-${PG_VERSION}"
+PGDATA_IN_VOLUME="/var/lib/postgresql/data/pgdata"
+UPGRADE_MARKER_IN_VOLUME="/var/lib/postgresql/data/.railway-major-upgrade.json"
+
 PASS=0
 FAIL=0
 FAILED_TESTS=()
@@ -102,6 +114,32 @@ ensure_image() {
   fi
   log "building $IMAGE from $DOCKERFILE"
   docker build -q -f "$DOCKERFILE" -t "$IMAGE" "$REPO_ROOT" >/dev/null
+}
+
+# Rebuild $IMAGE unconditionally. ensure_image above skips the build when the
+# tag already exists, which silently tests a stale copy of wrapper.sh /
+# pgbackrest-init.sh / the watcher — those are COPY'd in, so the tag says
+# nothing about which version of them the image holds. Tests that assert on
+# entrypoint behavior call this instead. Docker's layer cache keeps the repeat
+# cheap: only the COPY layers re-run.
+rebuild_image() {
+  log "rebuilding $IMAGE from $DOCKERFILE"
+  docker build -q -f "$DOCKERFILE" -t "$IMAGE" "$REPO_ROOT" >/dev/null
+}
+
+# Images for the major-upgrade re-anchor tests: the source major's runtime image
+# and the dual-binary job image, plus the rebuild above. Always builds, for the
+# same reason — upgrade-job.sh is COPY'd into the job image.
+ensure_upgrade_images() {
+  rebuild_image || return 1
+  log "building $UPG_FROM_IMAGE (upgrade source major)"
+  docker build -q -f "${REPO_ROOT}/Dockerfile.${UPG_FROM_VERSION}" \
+    -t "$UPG_FROM_IMAGE" "$REPO_ROOT" >/dev/null || return 1
+  log "building $UPG_JOB_IMAGE"
+  docker build -q -f "${REPO_ROOT}/Dockerfile.upgrade" \
+    --build-arg "FROM_VERSION=${UPG_FROM_VERSION}" \
+    --build-arg "TO_VERSION=${PG_VERSION}" \
+    -t "$UPG_JOB_IMAGE" "$REPO_ROOT" >/dev/null || return 1
 }
 
 ensure_network() {
@@ -182,6 +220,12 @@ gosu postgres pgbackrest --stanza=main --pg1-path=/var/lib/postgresql/data \
 
 # Common runner for an archiving service. All test containers carry the
 # postgres-ssl-e2e=1 label so the trap can find and clean them up.
+#
+# Defaults to the suite's own $IMAGE. Prefix a call with
+# `ARCHIVING_PG_IMAGE=<image>` to boot a different major against the same
+# bucket — the major-upgrade re-anchor tests need both sides of a version pair.
+# A prefix assignment on a bash function call is scoped to that call, so the
+# override cannot leak into later ones.
 run_archiving_pg() {
   local name="$1" vol="$2"; shift 2
   docker run -d --name "$name" --label postgres-ssl-e2e=1 --network "$NET" \
@@ -195,7 +239,7 @@ run_archiving_pg() {
     -e "PGBACKREST_REPO1_S3_URI_STYLE=path" \
     "$@" \
     -v "$vol:/var/lib/postgresql/data" \
-    "$IMAGE" >/dev/null
+    "${ARCHIVING_PG_IMAGE:-$IMAGE}" >/dev/null
 }
 
 # Wait for postgres to accept connections. 120 s default — restored
@@ -1199,6 +1243,71 @@ wait_for_watcher_backup() {
   return 1
 }
 
+# Count backups of a type in an EXPLICIT repo path, rather than in whatever the
+# container's marker currently points at (count_backups_of_type). Two things
+# need this: asserting a previous cluster's prefix still holds its backups after
+# archiving moved off it, and probing at all from a container whose PGDATA is
+# not the volume root. This is the same per-call PGBACKREST_REPO1_PATH override
+# mono's usePitrHistories uses to enumerate a bucket's histories.
+count_backups_at_path() {
+  local container="$1" want_type="$2" path="$3"
+  docker exec -u postgres "$container" bash -c "
+    export PGBACKREST_REPO1_S3_BUCKET=\"\$WAL_ARCHIVE_BUCKET\"
+    export PGBACKREST_REPO1_S3_KEY=\"\$WAL_ARCHIVE_KEY\"
+    export PGBACKREST_REPO1_S3_KEY_SECRET=\"\$WAL_ARCHIVE_SECRET\"
+    export PGBACKREST_REPO1_S3_REGION=\"\$WAL_ARCHIVE_REGION\"
+    export PGBACKREST_REPO1_S3_ENDPOINT=\"\$WAL_ARCHIVE_ENDPOINT\"
+    export PGBACKREST_REPO1_PATH=\"$path\"
+    pgbackrest --stanza=main info 2>/dev/null | grep -cE '^[[:space:]]+${want_type} backup: ' || true
+  " 2>/dev/null | tail -1
+}
+
+# Objects under a repo path (a leading-slash path concatenates onto the bucket).
+# Used as the "the previous cluster's prefix was not touched" measurement.
+bucket_objects_under() {
+  mc "mc ls --recursive local/${BUCKET}${1} 2>/dev/null | wc -l" | tail -1 | tr -d ' '
+}
+
+# The cluster's live system_identifier, read from pg_control rather than from
+# the repo-path marker — the assertions have to compare the marker against an
+# independently-derived identity, not against itself.
+cluster_sysid() {
+  local container="$1" pgdata="${2:-/var/lib/postgresql/data}"
+  docker exec "$container" pg_controldata "$pgdata" 2>/dev/null \
+    | awk -F: '/Database system identifier/ { gsub(/[ \t]/,"",$2); print $2 }'
+}
+
+# Shut postgres down through pg_ctl so pg_control records "shut down", then drop
+# the container. `docker rm -f` alone is not clean on this image — bash as PID 1
+# never forwards the signal, so postgres is SIGKILLed and the cluster is left
+# "in production" (upgrade-job.sh recovers from that, but a test asserting the
+# archive path should not also be exercising crash recovery).
+stop_pg_clean() {
+  local name="$1" pgdata="${2:-/var/lib/postgresql/data}"
+  docker exec "$name" gosu postgres pg_ctl -D "$pgdata" -w -t 60 -m fast stop >/dev/null 2>&1 || true
+  docker rm -f "$name" >/dev/null 2>&1 || true
+}
+
+# Run the one-shot upgrade job against a volume. No network: the job never
+# touches S3. Sets JOB_OUT / JOB_RC like test/e2e-upgrade.sh's run_job.
+run_upgrade_job() {
+  local vol="$1" mode="${2:-upgrade}"
+  JOB_OUT=$(docker run --rm --label postgres-ssl-e2e=1 \
+    -e "PGDATA=$PGDATA_IN_VOLUME" \
+    -v "$vol:/var/lib/postgresql/data" \
+    "$UPG_JOB_IMAGE" "$mode" 2>&1)
+  JOB_RC=$?
+}
+
+# Run a shell snippet against a stopped volume (planting or reading state
+# between two containers' lifetimes). Uses the job image because it is the one
+# image guaranteed to exist for both majors in the pair.
+in_stopped_volume() {
+  local vol="$1" snippet="$2"
+  docker run --rm --label postgres-ssl-e2e=1 \
+    -v "$vol:/var/lib/postgresql/data" --entrypoint /bin/sh "$UPG_JOB_IMAGE" -c "$snippet"
+}
+
 t_watcher_initial_full() {
   local name=t-init-full-${PG_VERSION}
   local vol=${name}-vol
@@ -2022,7 +2131,7 @@ EOF
   # migration log by a few seconds on a loaded CI runner.
   local kick_deadline=$(($(date +%s) + 15)) hit_kick=0
   while [ "$(date +%s)" -lt "$kick_deadline" ]; do
-    if docker logs "$name" 2>&1 | grep -q "wal-regression: kicking async daemon"; then
+    if docker logs "$name" 2>&1 | grep -q "archive-migration: kicking async daemon"; then
       hit_kick=1; break
     fi
     sleep 1
@@ -2049,10 +2158,10 @@ EOF
   # State file must record the pre-migration path so successive migrations
   # land at cluster-X-<e2> rather than chaining suffixes (cluster-X-<e1>-<e2>).
   local orig_in_state
-  orig_in_state=$(docker exec "$name" grep -E "^wal_regression_orig_path=" \
+  orig_in_state=$(docker exec "$name" grep -E "^archive_migration_orig_path=" \
     /var/lib/postgresql/data/.pgbackrest_backup_state 2>/dev/null | cut -d= -f2-)
   if [ "$orig_in_state" != "$orig_path" ]; then
-    ko t_watcher_wal_regression_async_spool_probe "wal_regression_orig_path expected '${orig_path}', got '${orig_in_state}'"
+    ko t_watcher_wal_regression_async_spool_probe "archive_migration_orig_path expected '${orig_path}', got '${orig_in_state}'"
     fail_dump t_watcher_wal_regression_async_spool_probe "$name"
     return
   fi
@@ -2061,10 +2170,10 @@ EOF
   # finalize successfully. If this sticks, a later iteration is expected to
   # retry finalization rather than trusting stale old-path .ok/.error files.
   local pending_in_state
-  pending_in_state=$(docker exec "$name" grep -E "^wal_regression_pending_new_path=" \
+  pending_in_state=$(docker exec "$name" grep -E "^archive_migration_pending_new_path=" \
     /var/lib/postgresql/data/.pgbackrest_backup_state 2>/dev/null | cut -d= -f2-)
   if [ -n "$pending_in_state" ]; then
-    ko t_watcher_wal_regression_async_spool_probe "wal_regression_pending_new_path should be clear after finalize, got '${pending_in_state}'"
+    ko t_watcher_wal_regression_async_spool_probe "archive_migration_pending_new_path should be clear after finalize, got '${pending_in_state}'"
     fail_dump t_watcher_wal_regression_async_spool_probe "$name"
     return
   fi
@@ -2476,6 +2585,509 @@ t_volume_wipe_same_bucket_preserves_both() {
 
   ok t_volume_wipe_same_bucket_preserves_both
   note "A=cluster-${sysid_a} (${a_fulls} full), C=cluster-${sysid_c} (${c_fulls} full); both in bucket"
+  docker rm -f "$name" >/dev/null
+  docker volume rm "$vol" >/dev/null
+}
+
+# Bring an archiving cluster on the source major up to "has a full backup at
+# cluster-<sysid>", then shut it down cleanly and upgrade the volume in place.
+# Shared by the two re-anchor tests below; exports SYSID_A / PATH_A /
+# OLD_OBJECTS_BEFORE for their assertions. Returns non-zero after recording its
+# own ko(), so callers just `return`.
+seed_upgraded_volume() {
+  local test_name="$1" name="$2" vol="$3"
+  reset_bucket
+  new_volume "$vol"
+  docker rm -f "$name" >/dev/null 2>&1 || true
+
+  ARCHIVING_PG_IMAGE="$UPG_FROM_IMAGE" run_archiving_pg_fast_watcher "$name" "$vol" \
+    -e "PGDATA=$PGDATA_IN_VOLUME"
+  if ! wait_for_pg "$name"; then
+    ko "$test_name" "source major (${UPG_FROM_VERSION}) did not start"
+    fail_dump "$test_name" "$name"
+    return 1
+  fi
+  # Wait for the stanza before generating WAL: archive-push against a repo with
+  # no stanza fails, and this test has no business exercising that race.
+  for _ in $(seq 1 20); do
+    docker logs "$name" 2>&1 | grep -q "stanza-create completed" && break
+    sleep 1
+  done
+  docker exec "$name" psql -U postgres -c \
+    "CREATE TABLE upgrade_canary(id int); INSERT INTO upgrade_canary SELECT generate_series(1,1000); SELECT pg_switch_wal();" >/dev/null
+  if ! wait_for_watcher_backup "$name" full 90; then
+    ko "$test_name" "no initial full on the source major"
+    fail_dump "$test_name" "$name"
+    return 1
+  fi
+
+  SYSID_A=$(cluster_sysid "$name" "$PGDATA_IN_VOLUME")
+  PATH_A=$(docker exec "$name" cat "$PGDATA_IN_VOLUME/.pgbackrest_repo_path" 2>/dev/null)
+  local anchor_a
+  anchor_a=$(docker exec "$name" cat "$PGDATA_IN_VOLUME/.pgbackrest_repo_anchor" 2>/dev/null | tr '\n' ' ')
+
+  if [ -z "$SYSID_A" ] || [ "$PATH_A" != "/pgbackrest/cluster-${SYSID_A}" ]; then
+    ko "$test_name" "source cluster's marker is not its own per-cluster path: sysid=${SYSID_A}, marker=${PATH_A}"
+    fail_dump "$test_name" "$name"
+    return 1
+  fi
+  # The anchor must be seeded by initdb (pgbackrest-init.sh), not adopted later:
+  # a fresh cluster's fingerprint has to be the derived one.
+  case "$anchor_a" in
+    *"sysid=${SYSID_A}"*"pg_version=${UPG_FROM_VERSION}"*) ;;
+    *)
+      ko "$test_name" "source anchor should name sysid=${SYSID_A} pg_version=${UPG_FROM_VERSION}, got '${anchor_a}'"
+      fail_dump "$test_name" "$name"
+      return 1 ;;
+  esac
+
+  local src_objects
+  src_objects=$(bucket_objects_under "$PATH_A")
+  if [ "${src_objects:-0}" -lt 1 ]; then
+    ko "$test_name" "source cluster archived nothing under ${PATH_A}"
+    fail_dump "$test_name" "$name"
+    return 1
+  fi
+
+  stop_pg_clean "$name" "$PGDATA_IN_VOLUME"
+
+  run_upgrade_job "$vol" upgrade
+  if [ "$JOB_RC" != "0" ]; then
+    ko "$test_name" "upgrade job failed (rc=${JOB_RC})"
+    echo "$JOB_OUT" | tail -20
+    return 1
+  fi
+
+  # Baseline for "the upgraded cluster never wrote to the previous cluster's
+  # prefix" — taken here, with the source stopped and the upgrade done, not
+  # before the shutdown: a clean `pg_ctl stop` switches WAL and archives the
+  # shutdown checkpoint's segment, so a pre-shutdown count is one object short
+  # of the real starting state through no fault of the upgraded cluster. The
+  # upgrade job itself never touches S3.
+  OLD_OBJECTS_BEFORE=$(bucket_objects_under "$PATH_A")
+  return 0
+}
+
+# After the upgraded database boots, wait for a full backup to land and assert
+# the whole end state: WAL and a full under the NEW cluster prefix, the previous
+# cluster's prefix untouched, marker + anchor naming the new identity, data
+# intact. Shared by both re-anchor tests. Returns non-zero after its own ko().
+assert_reanchored_end_state() {
+  local test_name="$1" name="$2" sysid_b="$3"
+  local path_b="/pgbackrest/cluster-${sysid_b}"
+
+  # A successful full is the end-to-end proof that archiving works at the new
+  # path: `pgbackrest backup` brackets pg_backup_start/stop and waits for the
+  # closing WAL segment to be archived before reporting success, so it cannot
+  # succeed while archive-push is failing. Keep switching WAL while we wait —
+  # an idle cluster only produces a segment per archive_timeout.
+  local deadline=$(($(date +%s) + 150)) got_full=0
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if docker logs "$name" 2>&1 | grep -q "pgbackrest-watcher: backup --type=full completed"; then
+      got_full=1; break
+    fi
+    docker exec "$name" psql -U postgres -c "SELECT pg_switch_wal();" >/dev/null 2>&1
+    sleep 3
+  done
+  if [ "$got_full" != "1" ]; then
+    ko "$test_name" "no full backup landed after the upgrade"
+    fail_dump "$test_name" "$name"
+    return 1
+  fi
+
+  local wal_objects
+  wal_objects=$(bucket_objects_under "${path_b}/archive/main")
+  if [ "${wal_objects:-0}" -lt 1 ]; then
+    ko "$test_name" "no WAL under the new cluster prefix ${path_b}/archive/main"
+    fail_dump "$test_name" "$name"
+    return 1
+  fi
+
+  local new_fulls
+  new_fulls=$(count_backups_at_path "$name" full "$path_b")
+  if [ "${new_fulls:-0}" -lt 1 ]; then
+    ko "$test_name" "no full visible at ${path_b}; got ${new_fulls}"
+    fail_dump "$test_name" "$name"
+    return 1
+  fi
+
+  # The previous cluster's history is untouched — same object count as before
+  # the upgrade, and its own full still browsable. This is what keeps the
+  # pre-upgrade PITR window restorable from mono's history picker.
+  local old_objects_after old_fulls
+  old_objects_after=$(bucket_objects_under "$PATH_A")
+  if [ "${old_objects_after:-0}" != "${OLD_OBJECTS_BEFORE:-0}" ]; then
+    ko "$test_name" "previous cluster's prefix ${PATH_A} changed: ${OLD_OBJECTS_BEFORE} objects before, ${old_objects_after} after"
+    fail_dump "$test_name" "$name"
+    return 1
+  fi
+  old_fulls=$(count_backups_at_path "$name" full "$PATH_A")
+  if [ "${old_fulls:-0}" -lt 1 ]; then
+    ko "$test_name" "previous cluster's full no longer visible at ${PATH_A}; got ${old_fulls}"
+    fail_dump "$test_name" "$name"
+    return 1
+  fi
+
+  local canary
+  canary=$(docker exec "$name" psql -U postgres -At -c "SELECT count(*) FROM upgrade_canary" 2>/dev/null)
+  if [ "$canary" != "1000" ]; then
+    ko "$test_name" "upgraded data missing: expected 1000 canary rows, got '${canary}'"
+    fail_dump "$test_name" "$name"
+    return 1
+  fi
+  return 0
+}
+
+# A major upgrade REPLACES the cluster: pg_upgrade initdb's the target and the
+# job swaps it into place, so the service comes back with a new
+# system_identifier and a new PG_VERSION. Archiving has to follow it onto
+# `cluster-<new_sysid>` — the previous cluster's repo records the old system id
+# in its archive.info, so every archive-push against it fails and stanza-create
+# refuses the mismatch outright.
+#
+# This is the natural path (the job's directory swap promotes a freshly initdb'd
+# data dir, so the upgraded PGDATA inherits none of the old cluster's pgbackrest
+# files and the path is derived fresh). t_reanchor_stale_marker_after_upgrade
+# below covers the same upgrade with the old cluster's marker surviving into it.
+t_upgrade_archive_reanchors_to_new_cluster_path() {
+  local name=t-upg-reanchor-${PG_VERSION}
+  local vol=${name}-vol
+  if ! ensure_upgrade_images; then
+    ko "${FUNCNAME[0]}" "could not build the upgrade-pair images"
+    return
+  fi
+  seed_upgraded_volume "${FUNCNAME[0]}" "$name" "$vol" || return
+
+  run_archiving_pg_fast_watcher "$name" "$vol" -e "PGDATA=$PGDATA_IN_VOLUME"
+  if ! wait_for_pg "$name"; then
+    ko "${FUNCNAME[0]}" "upgraded database (${PG_VERSION}) did not start"
+    fail_dump "${FUNCNAME[0]}" "$name"
+    return
+  fi
+  for _ in $(seq 1 20); do
+    docker logs "$name" 2>&1 | grep -q "stanza-create completed" && break
+    sleep 1
+  done
+
+  local sysid_b path_b anchor_b
+  sysid_b=$(cluster_sysid "$name" "$PGDATA_IN_VOLUME")
+  path_b=$(docker exec "$name" cat "$PGDATA_IN_VOLUME/.pgbackrest_repo_path" 2>/dev/null)
+  anchor_b=$(docker exec "$name" cat "$PGDATA_IN_VOLUME/.pgbackrest_repo_anchor" 2>/dev/null | tr '\n' ' ')
+
+  if [ -z "$sysid_b" ] || [ "$sysid_b" = "$SYSID_A" ]; then
+    ko "${FUNCNAME[0]}" "pg_upgrade should have produced a new system_identifier; got '${sysid_b}' (was '${SYSID_A}')"
+    fail_dump "${FUNCNAME[0]}" "$name"
+    return
+  fi
+  if [ "$path_b" != "/pgbackrest/cluster-${sysid_b}" ]; then
+    ko "${FUNCNAME[0]}" "marker should be /pgbackrest/cluster-${sysid_b}, got '${path_b}'"
+    fail_dump "${FUNCNAME[0]}" "$name"
+    return
+  fi
+  case "$anchor_b" in
+    *"sysid=${sysid_b}"*"pg_version=${PG_VERSION}"*) ;;
+    *)
+      ko "${FUNCNAME[0]}" "anchor should name sysid=${sysid_b} pg_version=${PG_VERSION}, got '${anchor_b}'"
+      fail_dump "${FUNCNAME[0]}" "$name"
+      return ;;
+  esac
+
+  assert_reanchored_end_state "${FUNCNAME[0]}" "$name" "$sysid_b" || return
+
+  ok "${FUNCNAME[0]}"
+  note "upgrade ${UPG_FROM_VERSION}→${PG_VERSION} moved archiving ${PATH_A} → ${path_b}; old prefix untouched (${OLD_OBJECTS_BEFORE} objects)"
+  docker rm -f "$name" >/dev/null
+  docker volume rm "$vol" >/dev/null
+}
+
+# The same upgrade, but with the previous cluster's pgbackrest state surviving
+# into the upgraded data directory: a stale repo-path marker, its anchor, a
+# backup state claiming a recent full, and a stale async spool status.
+#
+# Today's job reaches the upgraded state by swapping in a fresh data directory,
+# which drops all of that — so this plants it deliberately. That is not a
+# hypothetical shape: it is what any upgrade route that carries $PGDATA's
+# configuration forward produces, and what the legacy PGDATA-is-the-volume-root
+# layout produces by construction (those files live outside the swapped
+# directory). With the marker winning verbatim, the upgraded cluster would
+# archive into the previous cluster's repo forever.
+#
+# Everything asserted here is boot-time behavior: the flip happens before
+# postgres starts, so no WAL is ever pushed at the stale path.
+t_reanchor_stale_marker_after_upgrade() {
+  local name=t-upg-stalemarker-${PG_VERSION}
+  local vol=${name}-vol
+  if ! ensure_upgrade_images; then
+    ko "${FUNCNAME[0]}" "could not build the upgrade-pair images"
+    return
+  fi
+  seed_upgraded_volume "${FUNCNAME[0]}" "$name" "$vol" || return
+
+  # Plant the previous cluster's state into the upgraded data directory.
+  # last_full_at/last_diff_at are far-future so that a full backup can only
+  # come from the re-anchor resetting this file — not from the periodic
+  # schedule and not from NEEDS_INITIAL_BACKUP on empty state.
+  local stale_ok="000000010000000000000009.ok"
+  if ! in_stopped_volume "$vol" "
+    set -e
+    D=$PGDATA_IN_VOLUME
+    echo '${PATH_A}' > \$D/.pgbackrest_repo_path
+    printf 'sysid=%s\npg_version=%s\n' '${SYSID_A}' '${UPG_FROM_VERSION}' > \$D/.pgbackrest_repo_anchor
+    printf 'last_full_at=%s\nlast_diff_at=%s\n' 9999999999 9999999999 > \$D/.pgbackrest_backup_state
+    mkdir -p \$D/pgbackrest-spool/archive/main/out
+    printf '0\nstale ok from the previous cluster\n' > \$D/pgbackrest-spool/archive/main/out/${stale_ok}
+    chown -R postgres:postgres \$D/.pgbackrest_repo_path \$D/.pgbackrest_repo_anchor \
+      \$D/.pgbackrest_backup_state \$D/pgbackrest-spool
+  " >/dev/null 2>&1; then
+    ko "${FUNCNAME[0]}" "could not plant the previous cluster's pgbackrest state"
+    return
+  fi
+
+  run_archiving_pg_fast_watcher "$name" "$vol" -e "PGDATA=$PGDATA_IN_VOLUME"
+  if ! wait_for_pg "$name"; then
+    ko "${FUNCNAME[0]}" "upgraded database (${PG_VERSION}) did not start"
+    fail_dump "${FUNCNAME[0]}" "$name"
+    return
+  fi
+
+  local sysid_b path_b anchor_b
+  sysid_b=$(cluster_sysid "$name" "$PGDATA_IN_VOLUME")
+  local expected_path="/pgbackrest/cluster-${sysid_b}"
+
+  # The re-anchor must be reported, and must name both identities — this line is
+  # the only signal an operator gets that a service's archive prefix moved.
+  if ! wait_for_log_line "$name" "cluster re-identified" 30; then
+    ko "${FUNCNAME[0]}" "boot did not detect the re-identified cluster"
+    fail_dump "${FUNCNAME[0]}" "$name"
+    return
+  fi
+  if ! wait_for_log_line "$name" "re-anchored to ${expected_path}" 30; then
+    ko "${FUNCNAME[0]}" "boot did not report re-anchoring to ${expected_path}"
+    fail_dump "${FUNCNAME[0]}" "$name"
+    return
+  fi
+
+  path_b=$(docker exec "$name" cat "$PGDATA_IN_VOLUME/.pgbackrest_repo_path" 2>/dev/null)
+  anchor_b=$(docker exec "$name" cat "$PGDATA_IN_VOLUME/.pgbackrest_repo_anchor" 2>/dev/null | tr '\n' ' ')
+  if [ "$path_b" != "$expected_path" ]; then
+    ko "${FUNCNAME[0]}" "marker should have flipped to ${expected_path}, got '${path_b}'"
+    fail_dump "${FUNCNAME[0]}" "$name"
+    return
+  fi
+  case "$anchor_b" in
+    *"sysid=${sysid_b}"*"pg_version=${PG_VERSION}"*) ;;
+    *)
+      ko "${FUNCNAME[0]}" "anchor should name sysid=${sysid_b} pg_version=${PG_VERSION}, got '${anchor_b}'"
+      fail_dump "${FUNCNAME[0]}" "$name"
+      return ;;
+  esac
+
+  # The rendered conf follows the marker, for `pgbackrest info` callers that
+  # don't go through the PGBACKREST_REPO1_PATH override.
+  local conf_path
+  conf_path=$(docker exec "$name" grep -E "^repo1-path=" /etc/pgbackrest/pgbackrest.conf 2>/dev/null | cut -d= -f2-)
+  if [ "$conf_path" != "$expected_path" ]; then
+    ko "${FUNCNAME[0]}" "pgbackrest.conf repo1-path should be ${expected_path}, got '${conf_path}'"
+    fail_dump "${FUNCNAME[0]}" "$name"
+    return
+  fi
+
+  # A stale `.ok` is the dangerous leftover: pgBackRest reads it as proof the
+  # segment was already pushed and skips the upload, silently punching a hole in
+  # the new path's WAL coverage.
+  if docker exec "$name" test -e "$PGDATA_IN_VOLUME/pgbackrest-spool/archive/main/out/${stale_ok}"; then
+    ko "${FUNCNAME[0]}" "stale async status ${stale_ok} survived the re-anchor"
+    fail_dump "${FUNCNAME[0]}" "$name"
+    return
+  fi
+
+  # The migration gate must end up released, or the watcher never backs up again.
+  local pending
+  pending=$(docker exec "$name" grep -E "^archive_migration_pending_new_path=" \
+    "$PGDATA_IN_VOLUME/.pgbackrest_backup_state" 2>/dev/null | cut -d= -f2-)
+  if [ -n "$pending" ]; then
+    ko "${FUNCNAME[0]}" "archive_migration_pending_new_path should be clear after the re-anchor, got '${pending}'"
+    fail_dump "${FUNCNAME[0]}" "$name"
+    return
+  fi
+
+  assert_reanchored_end_state "${FUNCNAME[0]}" "$name" "$sysid_b" || return
+
+  ok "${FUNCNAME[0]}"
+  note "stale marker at ${PATH_A} re-anchored to ${expected_path} before postgres started; planted state reset, spool cleaned"
+  docker rm -f "$name" >/dev/null
+  docker volume rm "$vol" >/dev/null
+}
+
+# Fleet safety for the rollout itself: a volume that predates the anchor file
+# has a marker and no fingerprint. That must ADOPT the live identity for the
+# path it already archives to, never re-anchor — "no fingerprint" is not
+# evidence of a changed cluster, and treating it as one would move every
+# existing PITR-enabled service to a fresh prefix on its next redeploy,
+# orphaning its whole restore history.
+t_reanchor_backfills_missing_anchor() {
+  local name=t-anchor-backfill-${PG_VERSION}
+  local vol=${name}-vol
+  if ! rebuild_image; then
+    ko "${FUNCNAME[0]}" "could not rebuild $IMAGE"
+    return
+  fi
+  reset_bucket
+  new_volume "$vol"
+  docker rm -f "$name" >/dev/null 2>&1 || true
+
+  run_archiving_pg_fast_watcher "$name" "$vol"
+  if ! wait_for_pg "$name"; then
+    ko "${FUNCNAME[0]}" "no startup"
+    fail_dump "${FUNCNAME[0]}" "$name"
+    return
+  fi
+  local path_before
+  path_before=$(docker exec "$name" cat /var/lib/postgresql/data/.pgbackrest_repo_path 2>/dev/null)
+  if [ -z "$path_before" ]; then
+    ko "${FUNCNAME[0]}" "no repo-path marker after first boot"
+    fail_dump "${FUNCNAME[0]}" "$name"
+    return
+  fi
+
+  # Reproduce a pre-anchor volume: marker present, fingerprint absent.
+  docker exec "$name" rm -f /var/lib/postgresql/data/.pgbackrest_repo_anchor
+  docker restart "$name" >/dev/null
+  if ! wait_for_pg "$name"; then
+    ko "${FUNCNAME[0]}" "no startup after removing the anchor"
+    fail_dump "${FUNCNAME[0]}" "$name"
+    return
+  fi
+
+  if ! wait_for_log_line "$name" "adopted repo-path anchor" 30; then
+    ko "${FUNCNAME[0]}" "boot did not adopt an anchor for the existing marker"
+    fail_dump "${FUNCNAME[0]}" "$name"
+    return
+  fi
+  if docker logs "$name" 2>&1 | grep -q "cluster re-identified"; then
+    ko "${FUNCNAME[0]}" "a missing anchor was treated as a re-identified cluster"
+    fail_dump "${FUNCNAME[0]}" "$name"
+    return
+  fi
+
+  local path_after anchor_after sysid
+  path_after=$(docker exec "$name" cat /var/lib/postgresql/data/.pgbackrest_repo_path 2>/dev/null)
+  anchor_after=$(docker exec "$name" cat /var/lib/postgresql/data/.pgbackrest_repo_anchor 2>/dev/null | tr '\n' ' ')
+  sysid=$(cluster_sysid "$name")
+  if [ "$path_after" != "$path_before" ]; then
+    ko "${FUNCNAME[0]}" "archive path moved on a missing anchor: '${path_before}' → '${path_after}'"
+    fail_dump "${FUNCNAME[0]}" "$name"
+    return
+  fi
+  case "$anchor_after" in
+    *"sysid=${sysid}"*"pg_version=${PG_VERSION}"*) ;;
+    *)
+      ko "${FUNCNAME[0]}" "adopted anchor should name sysid=${sysid} pg_version=${PG_VERSION}, got '${anchor_after}'"
+      fail_dump "${FUNCNAME[0]}" "$name"
+      return ;;
+  esac
+
+  ok "${FUNCNAME[0]}"
+  note "missing anchor adopted (sysid=${sysid}); archive path stayed at ${path_after}"
+  docker rm -f "$name" >/dev/null
+  docker volume rm "$vol" >/dev/null
+}
+
+# The migration machinery's state fields were wal_regression_* before the
+# boot-time re-anchor started sharing them. A volume that redeploys onto the
+# renaming image carries the old names, and the in-flight case is the one that
+# matters: a pending migration recorded under the old name must keep gating
+# backups and still finalize, not silently read as "nothing pending" and let the
+# watcher back up against stale old-path spool statuses.
+#
+# Plants a pending migration equal to the live marker — the shape left by an
+# attempt that flipped the marker and died before cleanup — so the watcher's
+# finalize path has to pick it up through the renamed field.
+t_legacy_wal_regression_state_fields_migrate() {
+  local name=t-legacy-state-${PG_VERSION}
+  local vol=${name}-vol
+  if ! rebuild_image; then
+    ko "${FUNCNAME[0]}" "could not rebuild $IMAGE"
+    return
+  fi
+  reset_bucket
+  new_volume "$vol"
+  docker rm -f "$name" >/dev/null 2>&1 || true
+
+  run_archiving_pg_fast_watcher "$name" "$vol"
+  if ! wait_for_pg "$name"; then
+    ko "${FUNCNAME[0]}" "no startup"
+    fail_dump "${FUNCNAME[0]}" "$name"
+    return
+  fi
+  for _ in $(seq 1 20); do
+    docker logs "$name" 2>&1 | grep -q "stanza-create completed" && break
+    sleep 1
+  done
+  docker exec "$name" psql -U postgres -c "CREATE TABLE t(id int); SELECT pg_switch_wal();" >/dev/null
+  if ! wait_for_watcher_backup "$name" full 90; then
+    ko "${FUNCNAME[0]}" "no initial full"
+    fail_dump "${FUNCNAME[0]}" "$name"
+    return
+  fi
+
+  local marker_path legacy_orig
+  marker_path=$(docker exec "$name" cat /var/lib/postgresql/data/.pgbackrest_repo_path 2>/dev/null)
+  legacy_orig="/pgbackrest/cluster-legacy-orig"
+  if ! docker exec -u postgres "$name" sh -c "
+    printf 'wal_regression_orig_path=%s\nwal_regression_pending_new_path=%s\n' \
+      '${legacy_orig}' '${marker_path}' >> /var/lib/postgresql/data/.pgbackrest_backup_state
+  "; then
+    ko "${FUNCNAME[0]}" "could not plant legacy state fields"
+    return
+  fi
+
+  docker restart "$name" >/dev/null
+  if ! wait_for_pg "$name"; then
+    ko "${FUNCNAME[0]}" "no startup after planting legacy state fields"
+    fail_dump "${FUNCNAME[0]}" "$name"
+    return
+  fi
+
+  if ! wait_for_log_line "$name" "state: renamed wal_regression_pending_new_path" 60; then
+    ko "${FUNCNAME[0]}" "watcher did not rename the legacy pending field"
+    fail_dump "${FUNCNAME[0]}" "$name"
+    return
+  fi
+
+  # The renamed field must carry its VALUE, and must be the field the finalize
+  # path actually reads — a rename that missed a reader would leave the gate
+  # stuck and the watcher permanently silent.
+  if ! wait_for_log_line "$name" "archive-migration: finalizing pending archive-path migration at ${marker_path}" 60; then
+    ko "${FUNCNAME[0]}" "planted pending migration was not finalized through the renamed field"
+    fail_dump "${FUNCNAME[0]}" "$name"
+    return
+  fi
+
+  local leftover orig_after pending_after
+  leftover=$(docker exec "$name" grep -cE "^wal_regression_" /var/lib/postgresql/data/.pgbackrest_backup_state 2>/dev/null || true)
+  if [ "${leftover:-0}" != "0" ]; then
+    ko "${FUNCNAME[0]}" "legacy wal_regression_* lines survived the rename (${leftover} left)"
+    fail_dump "${FUNCNAME[0]}" "$name"
+    return
+  fi
+  orig_after=$(docker exec "$name" grep -E "^archive_migration_orig_path=" \
+    /var/lib/postgresql/data/.pgbackrest_backup_state 2>/dev/null | cut -d= -f2-)
+  if [ "$orig_after" != "$legacy_orig" ]; then
+    ko "${FUNCNAME[0]}" "archive_migration_orig_path should carry '${legacy_orig}', got '${orig_after}'"
+    fail_dump "${FUNCNAME[0]}" "$name"
+    return
+  fi
+  pending_after=$(docker exec "$name" grep -E "^archive_migration_pending_new_path=" \
+    /var/lib/postgresql/data/.pgbackrest_backup_state 2>/dev/null | cut -d= -f2-)
+  if [ -n "$pending_after" ]; then
+    ko "${FUNCNAME[0]}" "the migration gate should be released after finalize, got '${pending_after}'"
+    fail_dump "${FUNCNAME[0]}" "$name"
+    return
+  fi
+
+  ok "${FUNCNAME[0]}"
+  note "legacy wal_regression_* fields renamed in place; pending migration at ${marker_path} finalized through the new name"
   docker rm -f "$name" >/dev/null
   docker volume rm "$vol" >/dev/null
 }
@@ -3836,6 +4448,11 @@ ALL_TESTS=(
   t_retention_expire_cascades_to_wal
   t_empty_volume_restore_refuses_on_bad_creds
   t_volume_wipe_same_bucket_preserves_both
+  # major-upgrade archive re-anchor (these build their own version-pair images)
+  t_upgrade_archive_reanchors_to_new_cluster_path
+  t_reanchor_stale_marker_after_upgrade
+  t_reanchor_backfills_missing_anchor
+  t_legacy_wal_regression_state_fields_migrate
   t_restore_change_target_after_promote_noop
   t_restore_then_wipe_volume_redoes_restore
   t_restored_service_can_enable_archive_after_promote
