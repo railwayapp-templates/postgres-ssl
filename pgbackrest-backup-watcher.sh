@@ -793,11 +793,38 @@ finalize_archive_path_migration() {
 # migrate_to_new_archive_path again. Retry finalization directly whenever the
 # active marker already equals the pending target; suppress other gap work for
 # this iteration so failures keep retrying cleanly on the next poll.
+#
+# When the active path does NOT equal the pending target, the migration is
+# half-APPLIED: the gate was set but the marker never flipped — the shape
+# wrapper.sh's boot-time re-anchor leaves when its marker write fails after
+# the gate write succeeded. Nothing else retries that in-container (the boot
+# path only re-runs on the next deploy), so without this branch the gate
+# would block every backup until a redeploy. Complete the flip here: re-run
+# the state resets (idempotent — the gate writer already cleared them for a
+# wrapper-produced pending, and re-clearing closes the crash window where a
+# watcher-produced pending landed before its own resets), then
+# apply_active_path + finalize, the same steps the producer would have run.
 finalize_pending_archive_path_migration_if_needed() {
   local pending
   pending=$(read_state archive_migration_pending_new_path)
   [ -z "$pending" ] && return 1
-  [ "${PGBACKREST_REPO1_PATH:-}" != "$pending" ] && return 1
+
+  if [ "${PGBACKREST_REPO1_PATH:-}" != "$pending" ]; then
+    GAP_STATE_DIAG="archive-migration-completing"
+    log "archive-migration: completing half-applied migration to ${pending} (active path is still ${PGBACKREST_REPO1_PATH:-unset})"
+    refresh_archiver_stats || true
+    write_state_field_required last_full_failed_count "${FAILED_COUNT:-0}" || return 0
+    write_state_field_required last_full_at "" || return 0
+    write_state_field_required last_diff_at "" || return 0
+    write_state_field_required last_lag_detected_at 0 || return 0
+    write_state_field_required catalog_max_at_detection "" || return 0
+    write_state_field_required last_force_recovery_at 0 || return 0
+    write_state_field_required force_attempts 0 || return 0
+    if ! apply_active_path "$pending"; then
+      log "archive-migration: could not flip the repo-path marker to ${pending}; will retry"
+      return 0
+    fi
+  fi
 
   GAP_STATE_DIAG="archive-migration-finalizing"
   log "archive-migration: finalizing pending archive-path migration at ${pending}"

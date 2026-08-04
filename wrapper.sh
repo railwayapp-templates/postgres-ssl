@@ -563,11 +563,26 @@ write_pgbackrest_repo_path_marker() {
 #
 # Safe to write wholesale because the watcher is forked strictly after this
 # runs — wrapper.sh has no concurrent writer at this point in the boot.
+#
+# One field survives the wholesale replace: archive_migration_orig_path.
+# The watcher composes successive WAL_REGRESSION migration suffixes off that
+# ORIGINAL path (cluster-X-e1, cluster-X-e2 — flat siblings) precisely so
+# they never chain (cluster-X-e1-e2); recreating the state file without it
+# would resurrect the deepening-chain bug its docblock warns about.
 write_backup_state_migration_gate() {
-  local new_path="$1" state_file="$PGDATA/.pgbackrest_backup_state" tmp
+  local new_path="$1" state_file="$PGDATA/.pgbackrest_backup_state" tmp orig_path=""
+  if [ -f "$state_file" ]; then
+    orig_path=$(grep -E "^archive_migration_orig_path=" "$state_file" 2>/dev/null | tail -1 | cut -d= -f2-)
+  fi
   tmp=$(mktemp "${state_file}.XXXX") || return 1
-  printf 'archive_migration_pending_new_path=%s\n' "$new_path" > "$tmp" \
-    || { rm -f "$tmp"; return 1; }
+  if ! printf 'archive_migration_pending_new_path=%s\n' "$new_path" > "$tmp"; then
+    rm -f "$tmp"; return 1
+  fi
+  if [ -n "$orig_path" ]; then
+    if ! printf 'archive_migration_orig_path=%s\n' "$orig_path" >> "$tmp"; then
+      rm -f "$tmp"; return 1
+    fi
+  fi
   chown postgres:postgres "$tmp" 2>/dev/null || true
   chmod 0640 "$tmp" 2>/dev/null || true
   mv "$tmp" "$state_file" || { rm -f "$tmp"; return 1; }

@@ -472,7 +472,12 @@ t_upgrade_happy_path() {
   run_job "$vol" upgrade
   assert_eq "$JOB_RC" 0 "upgrade exit code" || { echo "$JOB_OUT" | tail -30; return 1; }
   assert_eq "$(marker_field "$vol" phase)" "completed" "marker phase" || return 1
+  assert_eq "$(marker_field "$vol" needsReindex)" "true" "collation-reindex flag recorded" || return 1
   assert_eq "$(volume_data_major "$vol")" "$TO_VERSION" "on-disk major is now TO" || return 1
+  # The rollback body must survive the upgrade itself (reclaim is a separate,
+  # grace-gated path — see t_old_datadir_reclaimed).
+  in_volume "$vol" "test -f ${PGDATA_IN_VOLUME}.old-${FROM_VERSION}/PG_VERSION" \
+    || { echo "  pgdata.old-${FROM_VERSION} missing right after the upgrade"; return 1; }
 
   run_pg happy-pg "$vol" "$TO_IMAGE" || return 1
   wait_for_pg happy-pg || { fail_dump happy happy-pg; return 1; }

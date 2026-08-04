@@ -431,9 +431,16 @@ finish_swap() {
     mv "$NEW_DATA_DIR" "$PGDATA" || die 3 "failed to promote new data dir"
   fi
 
+  # needsReindex: pg_upgrade preserves index FILES verbatim, but any index on
+  # collatable columns (text/varchar btree) is only valid for the glibc that
+  # built it — and the source cluster may have run on an older base image.
+  # We can't read the OLD runtime image's glibc from here, so record the flag
+  # unconditionally and let the operator/dashboard drive the REINDEX; an
+  # automatic REINDEX of an arbitrarily large database inside the upgrade
+  # window is the wrong default (documented follow-up in the README).
   write_marker "$(jq -nc \
     --arg from "$FROM_MAJOR" --arg to "$TO_MAJOR" --arg old "$(basename "$OLD_KEEP_DIR")" \
-    '{phase: "completed", from: $from, to: $to, oldDataDir: $old, needsAnalyze: true, completedAt: (now | todate)}')"
+    '{phase: "completed", from: $from, to: $to, oldDataDir: $old, needsAnalyze: true, needsReindex: true, completedAt: (now | todate)}')"
   log "upgrade $FROM_MAJOR -> $TO_MAJOR complete"
   result "{\"ok\": true, \"mode\": \"upgrade\", \"phase\": \"completed\", \"from\": \"$FROM_MAJOR\", \"to\": \"$TO_MAJOR\"}"
   exit 0
