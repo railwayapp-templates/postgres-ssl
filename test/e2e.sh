@@ -321,6 +321,38 @@ t_vanilla_boot() {
   docker volume rm "$vol" >/dev/null
 }
 
+t_collation_refresh_no_permission_error() {
+  # Regression: fork_collation_refresh's mktemp ran as root (mode 0600,
+  # root-owned) while the gosu postgres psql call read it as the postgres
+  # user — a deterministic "Permission denied" on every PG15+ boot. Central
+  # Station thread production-postgres-crash-looping-after-b350b460
+  # (2026-08-04) reported a crash loop on a service that hit this.
+  local name=t-collation-${PG_VERSION}
+  local vol=${name}-vol
+  new_volume "$vol"
+  docker rm -f "$name" >/dev/null 2>&1 || true
+  docker run -d --name "$name" --label postgres-ssl-e2e=1 --network "$NET" \
+    -e POSTGRES_PASSWORD=test \
+    -v "$vol:/var/lib/postgresql/data" \
+    "$IMAGE" >/dev/null
+  wait_for_pg "$name" || { ko t_collation_refresh_no_permission_error "postgres did not start"; fail_dump t_collation_refresh_no_permission_error "$name"; return; }
+
+  # fork_collation_refresh's pg_isready poll succeeds on its first 2s tick
+  # since postgres is already up; give psql a few seconds to run and its
+  # output to flush before reading logs.
+  sleep 5
+  local logs
+  logs=$(docker logs "$name" 2>&1)
+  if echo "$logs" | grep -q "collation-refresh:.*Permission denied"; then
+    ko t_collation_refresh_no_permission_error "collation-refresh temp file was not readable by postgres"
+    fail_dump t_collation_refresh_no_permission_error "$name"
+    return
+  fi
+  ok t_collation_refresh_no_permission_error
+  docker rm -f "$name" >/dev/null
+  docker volume rm "$vol" >/dev/null
+}
+
 t_invalid_bucket_skips_archive() {
   # Sets WAL_ARCHIVE_BUCKET to junk shapes the upstream resolver might leak
   # (unresolved Railway template ref + bucket-id UUID). The image guard must
@@ -3810,6 +3842,7 @@ t_invalid_bucket_sentinel_cleared_on_disable() {
 
 ALL_TESTS=(
   t_vanilla_boot
+  t_collation_refresh_no_permission_error
   t_invalid_bucket_skips_archive
   t_archiving_boot
   t_alter_system_survives_restart

@@ -1042,6 +1042,11 @@ fork_collation_refresh() {
 
     local tmpfile
     tmpfile=$(mktemp /tmp/collation-refresh.XXXXXX.sql)
+    # mktemp runs as root (this subshell isn't gosu'd) and defaults to mode
+    # 0600 — unreadable by the postgres user that the psql call below drops
+    # to. Hand ownership over before writing the SQL body, or every boot on
+    # PG15+ logs "collation-refresh: psql: error: ...: Permission denied".
+    chown postgres:postgres "$tmpfile"
     cat > "$tmpfile" << 'ENDSQL'
 DO $body$
 DECLARE
