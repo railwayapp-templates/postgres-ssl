@@ -54,6 +54,15 @@ TO_MAJOR="${PG_UPGRADE_TO:?PG_UPGRADE_TO not set}"
 
 EXPECTED_VOLUME_MOUNT_PATH="/var/lib/postgresql/data"
 VOLUME_ROOT="$EXPECTED_VOLUME_MOUNT_PATH"
+# The dispatcher must pass the SERVICE's own PGDATA to this container. The
+# `:-` default below never applies in practice: the official postgres base
+# image this job is built FROM exports PGDATA=/var/lib/postgresql/data — the
+# volume ROOT — so a dispatch that doesn't set PGDATA is refused by
+# check_mount ("PGDATA is the volume root") rather than defaulting to the
+# pgdata subdir. In production the job runs as a deployment of the database
+# service and inherits its variables, which include the real PGDATA; any
+# ad-hoc `docker run` (harnesses, manual recovery) needs `-e PGDATA=…` —
+# postgres-ha's t_ha_major_upgrade_full_choreography hit exactly this.
 PGDATA="${PGDATA:-$VOLUME_ROOT/pgdata}"
 # Strip trailing slashes. Every sibling path below is built by appending a
 # suffix to $PGDATA, so "…/pgdata/" would put the new cluster INSIDE the data
