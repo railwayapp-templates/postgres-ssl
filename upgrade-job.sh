@@ -289,7 +289,18 @@ detect_cpus() {
 init_new_cluster() {
   local target_dir="$1"
   rm -rf "$target_dir"
-  as_postgres mkdir -p "$target_dir"
+  # target_dir is a SIBLING of PGDATA under the volume root, and on a real
+  # Railway volume only PGDATA itself is postgres-owned (the entrypoint chowns
+  # exactly that path) — the volume root is root:root. `as_postgres mkdir`
+  # would run the mkdir AS postgres, which can't create an entry in a
+  # root-owned parent. Create it as whatever user we already are (root in
+  # every real deployment), then hand ownership to postgres so everything
+  # written INTO it from here on can run unprivileged.
+  mkdir -p "$target_dir" || die 3 "failed to create the target cluster directory"
+  if [ "$(id -u)" = "0" ]; then
+    chown postgres:postgres "$target_dir" \
+      || die 3 "failed to chown the target cluster directory to postgres"
+  fi
   # Locale/encoding inherit the image defaults, which match how the runtime
   # image initdb'd the old cluster; pg_upgrade --check verifies the pairing
   # and aborts on any mismatch before anything is touched.

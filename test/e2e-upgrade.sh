@@ -914,6 +914,38 @@ t_trailing_slash_pgdata() {
   stop_pg slash-pg
 }
 
+# A real Railway volume's ROOT is root:root drwxr-xr-x — only PGDATA itself
+# is chowned to postgres (verified against a real deployment). A fresh docker
+# volume does NOT reproduce this: on first mount, docker copies the image's
+# own directory entry for the mount path onto the empty volume, and the
+# official postgres image's own /var/lib/postgresql/data is postgres-owned
+# and world-writable — so every other test in this file runs against a volume
+# root the real platform never produces. `init_new_cluster` used to `mkdir`
+# the sibling `.upgrade-<major>` directory AS postgres (`as_postgres mkdir`),
+# which needs write access to the PARENT — the volume root. That parent is
+# writable by postgres in every local test and by nobody but root in
+# production, so the job passed here and failed exit 3 on every real upgrade.
+# Force the real shape before running the job, so this stays caught.
+t_upgrade_survives_root_owned_volume_root() {
+  local vol="upg-e2e-rootvol"
+  seed_from_cluster "$vol" || return 1
+  in_volume "$vol" "chown root:root /var/lib/postgresql/data && chmod 0755 /var/lib/postgresql/data" \
+    || { echo "  could not force the volume root to root:root"; return 1; }
+  assert_eq "$(in_volume "$vol" 'stat -c "%U:%G %a" /var/lib/postgresql/data')" "root:root 755" \
+    "volume root forced to the production shape" || return 1
+
+  run_job "$vol" upgrade
+  assert_eq "$JOB_RC" 0 "upgrade exit code against a root-owned volume root" \
+    || { echo "$JOB_OUT" | tail -30; return 1; }
+  assert_eq "$(marker_field "$vol" phase)" "completed" "marker phase" || return 1
+  assert_eq "$(volume_data_major "$vol")" "$TO_VERSION" "on-disk major is now TO" || return 1
+
+  run_pg rootvol-pg "$vol" "$TO_IMAGE" || return 1
+  wait_for_pg rootvol-pg || { fail_dump rootvol rootvol-pg; return 1; }
+  assert_eq "$(psql_in rootvol-pg 'SELECT count(*) FROM upgrade_canary')" "1000" "rows survived" || return 1
+  stop_pg rootvol-pg
+}
+
 # ----- runner -----------------------------------------------------------------
 ALL_TESTS=(
   t_vanilla_boot
@@ -943,6 +975,7 @@ ALL_TESTS=(
   t_marker_lost_after_pg_upgrade_resumes
   t_old_datadir_reclaimed
   t_trailing_slash_pgdata
+  t_upgrade_survives_root_owned_volume_root
 )
 
 TESTS=("${@:-}")
