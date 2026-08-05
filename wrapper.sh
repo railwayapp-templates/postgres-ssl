@@ -52,7 +52,14 @@ fi
 UPGRADE_LOCK_FILE="$EXPECTED_VOLUME_MOUNT_PATH/.railway-major-upgrade.lock"
 if command -v flock >/dev/null 2>&1 && [ -d "$EXPECTED_VOLUME_MOUNT_PATH" ] \
   && ! { [ "$PGDATA" = "$EXPECTED_VOLUME_MOUNT_PATH" ] && [ ! -f "$PGDATA/PG_VERSION" ]; }; then
-  if exec 8>>"$UPGRADE_LOCK_FILE" 2>/dev/null; then
+  # The 2>/dev/null MUST be scoped by the brace group, never put on the exec
+  # itself: redirections on a bare `exec` are permanent for the shell, so
+  # `exec 8>>file 2>/dev/null` would silence stderr for THIS SHELL AND
+  # EVERYTHING IT SPAWNS — postgres's entire log stream and pgBackRest's
+  # archive errors would vanish from `docker logs`. The brace group scopes
+  # the stderr redirect to the open attempt; the fd opened by exec is
+  # permanent either way.
+  if { exec 8>>"$UPGRADE_LOCK_FILE"; } 2>/dev/null; then
     if ! flock -n -s 8; then
       echo "A major version upgrade job is currently running against this volume."
       echo "The database must not start until it finishes; retry the deploy once the upgrade completes."
