@@ -2942,8 +2942,16 @@ t_reanchor_backfills_missing_anchor() {
     fail_dump "${FUNCNAME[0]}" "$name"
     return
   fi
-  local path_before
-  path_before=$(docker exec "$name" cat /var/lib/postgresql/data/.pgbackrest_repo_path 2>/dev/null)
+  # Poll rather than single-shot: wait_for_pg's socket probe also answers for
+  # docker-entrypoint's TEMPORARY initdb-time server, so under suite load this
+  # read can land before 99-pgbackrest-init.sh has written the marker. The
+  # marker is guaranteed by END of init; give it a bounded window.
+  local path_before="" _deadline=$(($(date +%s) + 30))
+  while [ "$(date +%s)" -lt "$_deadline" ]; do
+    path_before=$(docker exec "$name" cat /var/lib/postgresql/data/.pgbackrest_repo_path 2>/dev/null)
+    [ -n "$path_before" ] && break
+    sleep 1
+  done
   if [ -z "$path_before" ]; then
     ko "${FUNCNAME[0]}" "no repo-path marker after first boot"
     fail_dump "${FUNCNAME[0]}" "$name"
