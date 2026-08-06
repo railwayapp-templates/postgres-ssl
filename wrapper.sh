@@ -1042,11 +1042,6 @@ fork_collation_refresh() {
 
     local tmpfile
     tmpfile=$(mktemp /tmp/collation-refresh.XXXXXX.sql)
-    # mktemp runs as root (this subshell isn't gosu'd) and defaults to mode
-    # 0600 — unreadable by the postgres user that the psql call below drops
-    # to. Hand ownership over before writing the SQL body, or every boot on
-    # PG15+ logs "collation-refresh: psql: error: ...: Permission denied".
-    chown postgres:postgres "$tmpfile"
     cat > "$tmpfile" << 'ENDSQL'
 DO $body$
 DECLARE
@@ -1065,6 +1060,12 @@ BEGIN
 END
 $body$;
 ENDSQL
+    # mktemp runs as root (this subshell isn't gosu'd) and defaults to mode
+    # 0600, unreadable by the postgres user the psql call below drops to.
+    # Ownership must be handed over only AFTER writing the body: the
+    # container's root has CAP_CHOWN but not CAP_DAC_OVERRIDE, so the moment
+    # the file belongs to postgres, root itself can no longer write it.
+    chown postgres:postgres "$tmpfile"
     gosu postgres psql -v ON_ERROR_STOP=0 -q -f "$tmpfile" 2>&1 | \
       while IFS= read -r line; do [ -n "$line" ] && echo "collation-refresh: $line"; done
     rm -f "$tmpfile"
