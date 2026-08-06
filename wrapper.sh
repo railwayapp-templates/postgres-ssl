@@ -614,24 +614,22 @@ write_pgbackrest_repo_path_marker() {
 # Safe to write wholesale because the watcher is forked strictly after this
 # runs — wrapper.sh has no concurrent writer at this point in the boot.
 #
-# One field survives the wholesale replace: archive_migration_orig_path.
-# The watcher composes successive WAL_REGRESSION migration suffixes off that
-# ORIGINAL path (cluster-X-e1, cluster-X-e2 — flat siblings) precisely so
-# they never chain (cluster-X-e1-e2); recreating the state file without it
-# would resurrect the deepening-chain bug its docblock warns about.
+# Every call here follows a genuine re-identification (this function's only
+# caller, reanchor_pgbackrest_repo_path_if_reidentified, returns early unless
+# anchor_sysid/anchor_major mismatched the live cluster) — never the
+# watcher's own same-cluster WAL_REGRESSION retries, which manage
+# archive_migration_orig_path entirely on their own (read_state /
+# write_state_field_required) and never call this function. So any
+# archive_migration_orig_path already on disk belongs to the OLD identity's
+# suffix chain: carrying it into the new one would compose the new cluster's
+# next WAL_REGRESSION migration off the old family (cluster-<OLD
+# SYSID>-<epoch>) instead of the new one. Wholesale-replace really does mean
+# wholesale — there is no field to preserve.
 write_backup_state_migration_gate() {
-  local new_path="$1" state_file="$PGDATA/.pgbackrest_backup_state" tmp orig_path=""
-  if [ -f "$state_file" ]; then
-    orig_path=$(grep -E "^archive_migration_orig_path=" "$state_file" 2>/dev/null | tail -1 | cut -d= -f2-)
-  fi
+  local new_path="$1" state_file="$PGDATA/.pgbackrest_backup_state" tmp
   tmp=$(mktemp "${state_file}.XXXX") || return 1
   if ! printf 'archive_migration_pending_new_path=%s\n' "$new_path" > "$tmp"; then
     rm -f "$tmp"; return 1
-  fi
-  if [ -n "$orig_path" ]; then
-    if ! printf 'archive_migration_orig_path=%s\n' "$orig_path" >> "$tmp"; then
-      rm -f "$tmp"; return 1
-    fi
   fi
   chown postgres:postgres "$tmp" 2>/dev/null || true
   chmod 0640 "$tmp" 2>/dev/null || true

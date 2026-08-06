@@ -539,8 +539,11 @@ t_ssl_survives_upgrade() {
   run_pg ssl-after "$vol" "$TO_IMAGE" || return 1
   wait_for_pg ssl-after || { fail_dump ssl-after ssl-after; return 1; }
   assert_eq "$(psql_in ssl-after 'SHOW ssl')" "on" "ssl still on after upgrade" || return 1
-  # And a TLS connection actually completes, not just the setting being present.
-  assert_contains "$(docker exec ssl-after psql 'sslmode=require host=localhost user=postgres dbname=postgres' -tAc 'SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()' 2>&1)" "t" "sslmode=require connection is encrypted" || return 1
+  # And a TLS connection actually completes, not just the setting being
+  # present. assert_eq, not assert_contains: pg_stat_ssl.ssl is boolean ('t'
+  # or 'f'), and with stderr captured too, a contains-"t" check would pass on
+  # almost any connection error message as well as the real answer.
+  assert_eq "$(docker exec ssl-after psql 'sslmode=require host=localhost user=postgres dbname=postgres' -tAc 'SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()' 2>&1)" "t" "sslmode=require connection is encrypted" || return 1
   stop_pg ssl-after
 }
 
@@ -1318,17 +1321,67 @@ t_railway_private_domain_pghost_ignored() {
 
   JOB_OUT=$(docker run --rm --label postgres-upgrade-e2e=1 \
     -e "PGDATA=$PGDATA_IN_VOLUME" -e "PGHOST=postgres.railway.internal" -e "PGPORT=5432" \
+    -e "PGHOSTADDR=10.0.0.5" \
     -v "$vol:/var/lib/postgresql/data" "$JOB_IMAGE" check 2>&1)
   JOB_RC=$?
-  assert_eq "$JOB_RC" 0 "check succeeds despite an inherited private-domain PGHOST" || { echo "$JOB_OUT" | tail -30; return 1; }
+  assert_eq "$JOB_RC" 0 "check succeeds despite inherited private-domain PGHOST/PGHOSTADDR" || { echo "$JOB_OUT" | tail -30; return 1; }
   assert_contains "$JOB_OUT" '"ok":true' "check result reports ok" || return 1
 
   JOB_OUT=$(docker run --rm --label postgres-upgrade-e2e=1 \
     -e "PGDATA=$PGDATA_IN_VOLUME" -e "PGHOST=postgres.railway.internal" -e "PGPORT=5432" \
+    -e "PGHOSTADDR=10.0.0.5" \
     -v "$vol:/var/lib/postgresql/data" "$JOB_IMAGE" upgrade 2>&1)
   JOB_RC=$?
-  assert_eq "$JOB_RC" 0 "upgrade succeeds despite an inherited private-domain PGHOST" || { echo "$JOB_OUT" | tail -30; return 1; }
+  assert_eq "$JOB_RC" 0 "upgrade succeeds despite inherited private-domain PGHOST/PGHOSTADDR" || { echo "$JOB_OUT" | tail -30; return 1; }
   assert_eq "$(volume_data_major "$vol")" "$TO_VERSION" "data major is TO" || return 1
+}
+
+# The positional-arg fallback is reachable only from manual/incident-response
+# invocation (production always sets UPGRADE_JOB_MODE), which is exactly
+# where a typo happens. An unrecognized arg must refuse loudly — silently
+# falling through to the "upgrade" default would turn a typo'd read-only
+# check into the destructive path.
+t_unrecognized_positional_arg_refused() {
+  local vol="upg-e2e-badarg"
+  seed_from_cluster "$vol" || return 1
+  JOB_OUT=$(docker run --rm --label postgres-upgrade-e2e=1 \
+    -e "PGDATA=$PGDATA_IN_VOLUME" \
+    -v "$vol:/var/lib/postgresql/data" "$JOB_IMAGE" cehck 2>&1)
+  JOB_RC=$?
+  assert_eq "$JOB_RC" 2 "unrecognized positional arg refused, not silently upgraded" || { echo "$JOB_OUT" | tail -20; return 1; }
+  assert_contains "$JOB_OUT" "no recognized mode" "refusal names the problem" || return 1
+  assert_eq "$(volume_data_major "$vol")" "$FROM_VERSION" "volume untouched — did not silently upgrade" || return 1
+}
+
+# The production dispatch path selects the mode via UPGRADE_JOB_MODE alone,
+# with NO positional arg — Railway never sends one (see the doc comment on
+# the MODE block in upgrade-job.sh). Every other test in this suite drives
+# the mode through a positional arg via run_job, so without this one the
+# actual production mechanism has zero coverage here: a rename or a broken
+# read of UPGRADE_JOB_MODE would go unnoticed by the whole suite while
+# breaking every real dispatch.
+t_upgrade_job_mode_env_var_selects_mode() {
+  local vol="upg-e2e-modeenv"
+  seed_from_cluster "$vol" || return 1
+
+  JOB_OUT=$(docker run --rm --label postgres-upgrade-e2e=1 \
+    -e "PGDATA=$PGDATA_IN_VOLUME" -e "UPGRADE_JOB_MODE=check" \
+    -v "$vol:/var/lib/postgresql/data" "$JOB_IMAGE" 2>&1)
+  JOB_RC=$?
+  assert_eq "$JOB_RC" 0 "UPGRADE_JOB_MODE=check with no positional arg runs check" || { echo "$JOB_OUT" | tail -20; return 1; }
+  assert_contains "$JOB_OUT" '"mode":"check"' "result reports check mode" || return 1
+  assert_eq "$(volume_data_major "$vol")" "$FROM_VERSION" "check is read-only — data untouched" || return 1
+
+  # Defense in depth: Railway never sends a positional arg alongside the env
+  # var, but nothing about the dispatch contract should rely on that — the
+  # env var must win over a conflicting one anyway.
+  JOB_OUT=$(docker run --rm --label postgres-upgrade-e2e=1 \
+    -e "PGDATA=$PGDATA_IN_VOLUME" -e "UPGRADE_JOB_MODE=status" \
+    -v "$vol:/var/lib/postgresql/data" "$JOB_IMAGE" upgrade 2>&1)
+  JOB_RC=$?
+  assert_eq "$JOB_RC" 0 "UPGRADE_JOB_MODE wins over a conflicting positional arg" || { echo "$JOB_OUT" | tail -20; return 1; }
+  assert_contains "$JOB_OUT" '"mode":"status"' "env var mode used, not the positional upgrade" || return 1
+  assert_eq "$(volume_data_major "$vol")" "$FROM_VERSION" "status is read-only — data untouched" || return 1
 }
 
 # ----- runner -----------------------------------------------------------------
@@ -1374,6 +1427,8 @@ ALL_TESTS=(
   t_unknown_marker_phase_refused
   t_pg_major_env_override_ignored
   t_railway_private_domain_pghost_ignored
+  t_unrecognized_positional_arg_refused
+  t_upgrade_job_mode_env_var_selects_mode
 )
 
 TESTS=("${@:-}")

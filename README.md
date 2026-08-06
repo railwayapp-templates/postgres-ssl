@@ -368,7 +368,14 @@ docker build -f Dockerfile.upgrade \
 ```
 
 It runs against the database's own volume while the service is stopped, and
-takes a mode as its argument:
+selects its mode from the `UPGRADE_JOB_MODE` env var — never `startCommand`
+or a positional arg, which the dispatcher (railwayapp/mono#34384) can't rely
+on: Railway's two container runtimes disagree on how a deployment's
+`startCommand` composes with the image's own `ENTRYPOINT`. A positional arg
+still works for local/manual runs and the e2e harness, which invoke the
+script directly, but only as a fallback — an env var takes priority, and an
+unrecognized positional arg refuses rather than silently defaulting to
+`upgrade`:
 
 | Mode | Effect |
 |------|--------|
@@ -484,6 +491,16 @@ the marker's `completedAt`; `UPGRADE_OLD_DIR_RETENTION_SECONDS` overrides),
 `wrapper.sh` removes it in the background and stamps `oldDataDirRemovedAt`
 in the marker. Until then it is the instant-rollback path; after that,
 rollback means restoring the pre-upgrade backup.
+
+Manual rollback is not a plain rename: pg_upgrade disables the old cluster
+by renaming its `global/pg_control` to `.old` before linking, specifically
+so it can't be started by accident while its files are shared via hardlinks
+with the new cluster — restoring it means restoring that file too, not just
+moving the directory back to `$PGDATA`. And if the job ever refuses because
+a leftover `${PGDATA}.old-<from>` is already there, don't rename it to
+another `${PGDATA}.old-*` name to get it out of the way — the background
+reclaim above matches that whole glob and would delete it once the grace
+period passes; move it outside the prefix entirely.
 
 #### Collation caveat (known follow-up)
 

@@ -63,12 +63,14 @@ TO_MAJOR="${PG_UPGRADE_TO:?PG_UPGRADE_TO not set}"
 # The job inherits the service's own variables (that's how it gets PGDATA),
 # and both the postgres-ha and standalone postgres templates default
 # PGHOST=${{ RAILWAY_PRIVATE_DOMAIN }} — a common app-side pattern. pg_upgrade
-# reads libpq env vars directly and REFUSES outright on a non-local PGHOST
-# ("libpq environment variable PGHOST has a non-local server value"),
-# blocking --check before anything is touched. Same hazard wrapper.sh already
-# unsets for pgbackrest's libpq calls; this job only ever talks to Postgres
-# over the local socket, so clear both unconditionally.
+# reads libpq env vars directly and REFUSES outright on a non-local PGHOST OR
+# PGHOSTADDR ("libpq environment variable PG{HOST,HOSTADDR} has a non-local
+# server value" — verified against the binary for both), blocking --check
+# before anything is touched. Same hazard wrapper.sh already unsets for
+# pgbackrest's libpq calls; this job only ever talks to Postgres over the
+# local socket, so clear all three unconditionally.
 unset PGHOST
+unset PGHOSTADDR
 unset PGPORT
 
 # PG_SUPERUSER (the cluster's INSTALL user) is resolved below, after PGDATA
@@ -136,27 +138,6 @@ NEW_BINDIR="/usr/lib/postgresql/${TO_MAJOR}/bin"
 NEW_DATA_DIR="${PGDATA}.upgrade-${TO_MAJOR}"
 OLD_KEEP_DIR="${PGDATA}.old-${FROM_MAJOR}"
 
-# The dispatcher selects the mode via a real Railway variable, not
-# startCommand or argv: this repo's two container runtimes disagree on how a
-# deployment's startCommand combines with the image's own ENTRYPOINT (one
-# REPLACES the entrypoint outright, so a bare mode string tries to exec a
-# nonexistent program named "check"/"upgrade"; the other KEEPS the entrypoint
-# and appends startCommand as further args), so no single startCommand value
-# selects a mode on both. UPGRADE_JOB_MODE sidesteps that entirely — it
-# reaches the container the same way every other service variable already
-# does, regardless of which runtime or image is in play. Positional args are
-# kept only as a fallback for local/manual runs and the e2e harness, which
-# invoke this script directly (`upgrade-job.sh <mode>`) rather than through a
-# Railway deployment.
-MODE="${UPGRADE_JOB_MODE:-upgrade}"
-if [ -z "${UPGRADE_JOB_MODE:-}" ]; then
-  for _arg in "$@"; do
-    case "$_arg" in
-      check | upgrade | status | manifest) MODE="$_arg" ;;
-    esac
-  done
-fi
-
 log() { echo "upgrade-job: $*"; }
 # pg_upgrade's own combined output is forwarded verbatim for diagnosability,
 # and it can embed attacker-chosen bytes: a database/role/tablespace name a
@@ -188,6 +169,32 @@ die() {
   result "$(jq -nc --arg mode "$MODE" --arg error "$*" '{ok: false, mode: $mode, error: $error}')"
   exit "$code"
 }
+
+# The dispatcher selects the mode via a real Railway variable, not
+# startCommand or argv: this repo's two container runtimes disagree on how a
+# deployment's startCommand combines with the image's own ENTRYPOINT (one
+# REPLACES the entrypoint outright, so a bare mode string tries to exec a
+# nonexistent program named "check"/"upgrade"; the other KEEPS the entrypoint
+# and appends startCommand as further args), so no single startCommand value
+# selects a mode on both. UPGRADE_JOB_MODE sidesteps that entirely — it
+# reaches the container the same way every other service variable already
+# does, regardless of which runtime or image is in play. Positional args are
+# kept only as a fallback for local/manual runs and the e2e harness, which
+# invoke this script directly (`upgrade-job.sh <mode>`) rather than through a
+# Railway deployment — and an unrecognized one dies rather than falling
+# through to the "upgrade" default: silently running the destructive path on
+# a typo'd read-only mode is exactly the failure this fallback must not have,
+# since manual/incident-response invocation is the only place it's reachable.
+MODE="${UPGRADE_JOB_MODE:-}"
+if [ -z "$MODE" ] && [ "$#" -gt 0 ]; then
+  for _arg in "$@"; do
+    case "$_arg" in
+      check | upgrade | status | manifest) MODE="$_arg" ;;
+    esac
+  done
+  [ -n "$MODE" ] || die 2 "no recognized mode among arguments: $* (expected one of: check, upgrade, status, manifest)"
+fi
+MODE="${MODE:-upgrade}"
 
 # Plain `.field` with an explicit null map, not `// empty`: jq's `//` treats a
 # literal `false` as absent, so a boolean field would read back as missing.
@@ -589,7 +596,7 @@ mode_check() {
   # Mirror upgrade mode's stale-rollback-body refusal: a green check must
   # mean the real run won't refuse on a condition check could see.
   if [ -e "$OLD_KEEP_DIR" ]; then
-    die 2 "$OLD_KEEP_DIR already exists next to $FROM_MAJOR-major data — a previous upgrade's rollback body was left in place; remove or rename it, then re-run"
+    die 2 "$OLD_KEEP_DIR already exists next to $FROM_MAJOR-major data — a previous upgrade's rollback body was left in place; remove it or move it OUTSIDE ${PGDATA}.old-* (a rename within that prefix still matches the background reclaim's glob), then re-run"
   fi
   refuse_recovery_shapes
   # Before the quiesce, so an unwritable volume root gets the precise
@@ -708,7 +715,7 @@ finish_swap() {
     # nests the source inside it instead of renaming — pgdata would end up at
     # .old-<from>/pgdata, silently mangling the rollback body.
     if [ -e "$OLD_KEEP_DIR" ]; then
-      die 3 "cannot move the old data dir aside: $OLD_KEEP_DIR already exists (a leftover rollback body) — remove or rename it, then re-run"
+      die 3 "cannot move the old data dir aside: $OLD_KEEP_DIR already exists (a leftover rollback body) — remove it or move it OUTSIDE ${PGDATA}.old-* (a rename within that prefix still matches the background reclaim's glob), then re-run"
     fi
     mv "$PGDATA" "$OLD_KEEP_DIR" || die 3 "failed to move old data dir aside"
   fi
@@ -831,7 +838,7 @@ mode_upgrade() {
   # before anything is touched, and let the operator pick the authoritative
   # copy.
   if [ -e "$OLD_KEEP_DIR" ]; then
-    die 2 "$OLD_KEEP_DIR already exists next to $FROM_MAJOR-major data — a previous upgrade's rollback body was left in place; remove or rename it, then re-run"
+    die 2 "$OLD_KEEP_DIR already exists next to $FROM_MAJOR-major data — a previous upgrade's rollback body was left in place; remove it or move it OUTSIDE ${PGDATA}.old-* (a rename within that prefix still matches the background reclaim's glob), then re-run"
   fi
   clear_stale_pidfile
   refuse_recovery_shapes
