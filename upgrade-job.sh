@@ -60,6 +60,17 @@ set -uo pipefail
 FROM_MAJOR="${PG_UPGRADE_FROM:?PG_UPGRADE_FROM not set}"
 TO_MAJOR="${PG_UPGRADE_TO:?PG_UPGRADE_TO not set}"
 
+# The job inherits the service's own variables (that's how it gets PGDATA),
+# and both the postgres-ha and standalone postgres templates default
+# PGHOST=${{ RAILWAY_PRIVATE_DOMAIN }} — a common app-side pattern. pg_upgrade
+# reads libpq env vars directly and REFUSES outright on a non-local PGHOST
+# ("libpq environment variable PGHOST has a non-local server value"),
+# blocking --check before anything is touched. Same hazard wrapper.sh already
+# unsets for pgbackrest's libpq calls; this job only ever talks to Postgres
+# over the local socket, so clear both unconditionally.
+unset PGHOST
+unset PGPORT
+
 # PG_SUPERUSER (the cluster's INSTALL user) is resolved below, after PGDATA
 # is normalized — which env var names it depends on the template family, and
 # the discriminator is on the volume itself.

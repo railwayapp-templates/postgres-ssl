@@ -1276,6 +1276,32 @@ t_pg_major_env_override_ignored() {
   stop_pg envmajor-pg
 }
 
+# Both the postgres-ha and standalone postgres templates default
+# PGHOST=${{ RAILWAY_PRIVATE_DOMAIN }} — a service variable the job inherits
+# along with everything else (that's how it gets PGDATA). pg_upgrade reads
+# libpq env vars directly and refuses outright on a non-local PGHOST/PGPORT
+# ("libpq environment variable PGHOST has a non-local server value"),
+# blocking --check before anything is touched — found against real Railway
+# infrastructure, where it fails on effectively every template deployment.
+t_railway_private_domain_pghost_ignored() {
+  local vol="upg-e2e-pghost"
+  seed_from_cluster "$vol" || return 1
+
+  JOB_OUT=$(docker run --rm --label postgres-upgrade-e2e=1 \
+    -e "PGDATA=$PGDATA_IN_VOLUME" -e "PGHOST=postgres.railway.internal" -e "PGPORT=5432" \
+    -v "$vol:/var/lib/postgresql/data" "$JOB_IMAGE" check 2>&1)
+  JOB_RC=$?
+  assert_eq "$JOB_RC" 0 "check succeeds despite an inherited private-domain PGHOST" || { echo "$JOB_OUT" | tail -30; return 1; }
+  assert_contains "$JOB_OUT" '"ok":true' "check result reports ok" || return 1
+
+  JOB_OUT=$(docker run --rm --label postgres-upgrade-e2e=1 \
+    -e "PGDATA=$PGDATA_IN_VOLUME" -e "PGHOST=postgres.railway.internal" -e "PGPORT=5432" \
+    -v "$vol:/var/lib/postgresql/data" "$JOB_IMAGE" upgrade 2>&1)
+  JOB_RC=$?
+  assert_eq "$JOB_RC" 0 "upgrade succeeds despite an inherited private-domain PGHOST" || { echo "$JOB_OUT" | tail -30; return 1; }
+  assert_eq "$(volume_data_major "$vol")" "$TO_VERSION" "data major is TO" || return 1
+}
+
 # ----- runner -----------------------------------------------------------------
 ALL_TESTS=(
   t_vanilla_boot
@@ -1317,6 +1343,7 @@ ALL_TESTS=(
   t_stale_old_keep_dir_refused
   t_unknown_marker_phase_refused
   t_pg_major_env_override_ignored
+  t_railway_private_domain_pghost_ignored
 )
 
 TESTS=("${@:-}")
