@@ -93,5 +93,15 @@ if [ ! -f "$PGDATA/.pgbackrest_repo_path" ] && [ -f "$PGDATA/global/pg_control" 
     echo "$cluster_path" > "$PGDATA/.pgbackrest_repo_path"
     chmod 0640 "$PGDATA/.pgbackrest_repo_path"
     echo "pgbackrest: per-cluster repo path = ${cluster_path}"
+    # Fingerprint the cluster that path was derived from. wrapper.sh compares
+    # it against the live cluster on every boot and re-anchors archiving to a
+    # fresh sub-path when they diverge (a pg_upgrade, or any other route to a
+    # new system_identifier) — see PGBACKREST_REPO_ANCHOR_FILE there. Seeding
+    # it here rather than letting wrapper.sh backfill it next boot means the
+    # first boot after initdb already carries a derived fingerprint instead of
+    # an adopted one.
+    printf 'sysid=%s\npg_version=%s\n' "$sysid" "$(cat "$PGDATA/PG_VERSION")" \
+      > "$PGDATA/.pgbackrest_repo_anchor"
+    chmod 0640 "$PGDATA/.pgbackrest_repo_anchor"
   fi
 fi

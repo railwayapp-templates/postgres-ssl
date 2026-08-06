@@ -187,7 +187,9 @@ recovery entirely **even if `POSTGRES_RECOVERY_TARGET_TIME` is changed
 to a different value** — the cluster has already promoted to a new
 timeline and replaying again would corrupt it. To probe a different
 target, restore from a fresh volume snapshot (or, advanced: remove
-`$PGDATA/.pitr_configured` before the next start).
+`$PGDATA/.pitr_configured` before the next start — and, if the service
+was ever major-upgraded, the volume-root `.railway-major-upgrade.json`
+too, since a completed upgrade marker is also read as "recovery done").
 
 When `POSTGRES_RECOVERY_TARGET_TIME` is set on a brand-new container
 (no `$PGDATA/PG_VERSION`), the wrapper runs `pgbackrest --repo=2 restore
@@ -236,6 +238,15 @@ Each cluster archives under a sub-prefix derived from its
 persisted in `$PGDATA/.pgbackrest_repo_path` so the archive-push
 wrapper, the backup watcher, and `pgbackrest stanza-create` all
 converge on the same value.
+
+Alongside it, `$PGDATA/.pgbackrest_repo_anchor` records the
+`system_identifier` and `PG_VERSION` the path was derived from. The
+marker wins verbatim on every boot, so this fingerprint is the only
+thing that can tell "same cluster, same path" apart from "a different
+cluster inherited this path" — see the archive re-anchoring paragraph
+under [Major version upgrades](#major-version-upgrades). A volume
+predating the file adopts its live identity on first boot and keeps
+the path it already archives to.
 
 Why per-cluster: a wipe-and-reuse-bucket cycle (operator drops the
 data volume, redeploys the service against the same `WAL_ARCHIVE_BUCKET`)
@@ -341,3 +352,227 @@ is set in the `PGPORT` environment variable. We did this to allow connections
 to the postgres service over the `RAILWAY_TCP_PROXY_PORT`. If you need to
 change this behavior, feel free to build your own image without passing the
 `--port` parameter to the `CMD` command in the Dockerfile.
+
+## Major version upgrades
+
+`Dockerfile.upgrade` builds a one-shot job image carrying two majors' server
+binaries, driven by `upgrade-job.sh`. CI publishes one image per supported
+(source → newer target) pair as
+`ghcr.io/railwayapp-templates/postgres-ssl/upgrade:<from>-<to>`, which is what
+the dashboard's upgrade workflow dispatches. Locally:
+
+```bash
+docker build -f Dockerfile.upgrade \
+  --build-arg FROM_VERSION=16 --build-arg TO_VERSION=17 \
+  -t postgres-upgrade:16-17 .
+```
+
+It runs against the database's own volume while the service is stopped, and
+selects its mode from the `UPGRADE_JOB_MODE` env var — never `startCommand`
+or a positional arg, which the dispatcher (railwayapp/mono#34384) can't rely
+on: Railway's two container runtimes disagree on how a deployment's
+`startCommand` composes with the image's own `ENTRYPOINT`. A positional arg
+still works for local/manual runs and the e2e harness, which invoke the
+script directly, but only as a fallback — an env var takes priority, and an
+unrecognized positional arg refuses rather than silently defaulting to
+`upgrade`:
+
+| Mode | Effect |
+|------|--------|
+| `check` | `pg_upgrade --check` against a throwaway target cluster. Exit 1 = blockers, exit 2 = precondition refusal, exit 3 = environment failure (the quiesce could not start or stop the old server — its log is printed). Also proves the real upgrade's sibling directory slot is creatable on the volume, so a green check can't hide a volume-root permission problem the real run would hit. **Not strictly read-only**: a cluster that wasn't shut down cleanly (the platform stops containers with SIGKILL, so that's the normal case) is first quiesced — WAL replayed with the old binaries, then a clean shutdown — exactly what the next boot would have done. Only a cleanly-shut-down volume is checked without writes. |
+| `upgrade` | `--check`, then `pg_upgrade --link`, then the completion marker and directory swap. |
+| `status` | Prints the marker phase + on-disk major as JSON, for resume decisions. |
+| `manifest` | Prints the target major's installable extensions as JSON. |
+
+The job connects as the cluster's actual install user, and initdb's the
+target cluster with the same name — pg_upgrade requires both clusters'
+install users to match. Which env var names that user depends on the
+template family, and the two disagree: on postgres-ssl the official
+entrypoint initdb's with `--username="$POSTGRES_USER"` (a custom-user
+service has no `postgres` role at all), while on postgres-ha
+`POSTGRES_USER` is the **app** user Patroni creates and the install user is
+`PATRONI_SUPERUSER_USERNAME` (default `postgres`). The job disambiguates by
+the volume itself — a Patroni-managed data dir always carries
+`patroni.dynamic.json` — so the same inherited service env resolves
+correctly on both. The target initdb also replays the service's
+`POSTGRES_INITDB_ARGS` (evaled, exactly as the official entrypoint does at
+init time), because pg_upgrade refuses any locale/encoding mismatch and a
+cluster initialized with `--locale=C` could otherwise never pair with an
+image-default target.
+Every `RAILWAY_UPGRADE_RESULT:` payload is built with `jq --arg` (compact,
+one line) so no on-disk byte a database superuser can write reaches the
+workflow's JSON parser unescaped — and every passthrough of pg_upgrade
+output, server logs, or failure lists is indented, so no
+attacker-controlled byte can start a line with the result sentinel either.
+
+Volumes with `recovery.signal` or `standby.signal` are refused outright by
+both `check` and `upgrade` (exit 2): those shapes can't be upgraded in
+place, and the quiesce would consume a mid-restore volume's recovery intent.
+Finish or promote recovery first.
+
+`.railway-major-upgrade.json` at the volume root is the commit point
+(fsynced through the parent directory, and every write checked before any
+directory is mutated): `upgraded` means pg_upgrade succeeded and recovery
+must roll **forward**; `completed` means the swap is done. Both phases are
+scoped to the marker's own version pair — a `completed` marker from a
+previous upgrade of the same volume is history, not state, so chained
+upgrades (16→17, later 17→18) work; an in-flight marker of a foreign pair
+is refused. pg_upgrade disables the old cluster (renames its `pg_control`
+to `pg_control.old`) **before** it links the first user relation file —
+verified empirically, and pg_upgrade's own output prescribes the rename-back
+as the recovery — so that rename alone never drives a roll-forward. If the
+marker is lost, the job rolls forward only when its own completion sentinel
+(written inside the target dir the moment pg_upgrade exits 0) is present;
+`pg_control.old` without the sentinel is a crash mid-link, and the job rolls
+back instead — it reverses the rename (safe while the target cluster has
+never been started) and redoes the upgrade from scratch. The same rename-back
+runs when pg_upgrade itself fails after disabling the old cluster, so that
+failure leaves a bootable FROM-major volume rather than forcing a backup
+restore. `wrapper.sh` refuses to boot while a non-completed marker exists, and
+refuses any image whose major differs from the on-disk `PG_VERSION` — so no
+mismatched boot can touch the data.
+
+Both sides also hold a `flock` on the volume-root
+`.railway-major-upgrade.lock`: the job exclusively for its run, the runtime
+container shared for its lifetime. A job dispatched against a live database
+refuses instead of corrupting the cluster, and a database deployed while a
+job is mid-flight refuses to boot — in-image backstops for the
+orchestrator's own exclusion.
+
+The job tolerates the platform's ungraceful container stop: it clears a stale
+`postmaster.pid` and, when `pg_control` says the cluster was not shut down
+cleanly, replays WAL with the old binaries and shuts down cleanly before
+upgrading (pg_upgrade requires it).
+
+Because `pg_upgrade` promotes a freshly `initdb`'d data directory, settings that
+live in `postgresql.conf` do not carry over. The certificates survive at the
+volume root, so `wrapper.sh` re-applies the `ssl` settings whenever the config
+has none while certs exist — without that, an upgraded database comes back with
+SSL off and rejects every `sslmode=require` client. `pg_hba.conf` gets the
+same two-layer treatment: the job carries the old cluster's `pg_hba.conf`
+(and `pg_ident.conf`) into the new data directory — it's the user's actual
+config, custom rules included — and `wrapper.sh` re-appends the
+`host all all all <method>` rule when (and only when) the file has been
+reset to initdb's recognizable default shape — loopback host rules and
+nothing else. A config the operator narrowed by address, database/user, or
+TLS is an authored policy and is never silently re-widened; a file with no
+host rules at all is a deliberate local-only lockdown and is left alone
+too. One residual ambiguity is accepted knowingly: a config an operator
+deliberately narrowed to *exactly* initdb's loopback-only shape is
+byte-indistinguishable from a reset and gets the rule re-appended — on
+Railway a loopback-only Postgres is unreachable by every real client
+(private networking is a remote connection), so the shape reads as a reset,
+not a policy. The PITR lifecycle sentinels (`.pitr_configured`,
+`.pitr_staging`, `.pgbackrest_restored`) are carried across the swap too,
+and a `completed` upgrade marker is itself treated as proof that recovery
+already promoted — otherwise an upgraded PITR-restored fork (whose
+`WAL_RECOVER_FROM_*` env stays set forever) would re-stage archive recovery
+against the source bucket and never become ready.
+
+`postgresql.conf` and `postgresql.auto.conf` (`ALTER SYSTEM` settings) are
+deliberately **not** carried: either file can hold a GUC the target major
+removed, and one unrecognized parameter there refuses the whole boot. The
+user's tuning must not silently evaporate either, so the job stashes both
+files at the volume root as `.pre-upgrade-<from>-postgresql.conf` /
+`.pre-upgrade-<from>-postgresql.auto.conf` (they outlive the old data dir's
+24 h reclaim) and records `needsConfigReview: true` in the completed marker —
+surfacing "re-apply your `ALTER SYSTEM` settings" is the dashboard's job,
+because the alternative is the user discovering it via a post-upgrade
+`max_connections` regression.
+
+#### Disk reclaim and rollback window
+
+The pre-upgrade cluster is kept at `${PGDATA}.old-<from>` as the rollback
+body. Because `pg_upgrade --link` hardlinks data files, that directory pins
+every pre-upgrade inode — space freed in the upgraded database is not
+returned to the volume while it exists. Once the upgrade is confirmed (the
+upgraded database up and answering past a grace period, default 24 h from
+the marker's `completedAt`; `UPGRADE_OLD_DIR_RETENTION_SECONDS` overrides),
+`wrapper.sh` removes it in the background and stamps `oldDataDirRemovedAt`
+in the marker. Until then it is the instant-rollback path; after that,
+rollback means restoring the pre-upgrade backup.
+
+Manual rollback is not a plain rename: pg_upgrade disables the old cluster
+by renaming its `global/pg_control` to `.old` before linking, specifically
+so it can't be started by accident while its files are shared via hardlinks
+with the new cluster — restoring it means restoring that file too, not just
+moving the directory back to `$PGDATA`. And if the job ever refuses because
+a leftover `${PGDATA}.old-<from>` is already there, don't rename it to
+another `${PGDATA}.old-*` name to get it out of the way — the background
+reclaim above matches that whole glob and would delete it once the grace
+period passes; move it outside the prefix entirely.
+
+#### Collation caveat (known follow-up)
+
+`pg_upgrade` preserves index files verbatim, but indexes on collatable
+columns (text/varchar btrees) are only valid for the glibc that built them,
+and the target image's glibc may differ from whatever built the source
+cluster. The marker records `needsReindex: true` on every upgrade — the
+image deliberately does **not** auto-`REINDEX` (rebuilding every text index
+on an arbitrarily large database inside the upgrade window is the wrong
+default). Surfacing that flag and driving the reindex is the dashboard's
+follow-up; `wrapper.sh`'s collation-version refresh only silences the
+version-mismatch warnings, it does not rebuild indexes.
+
+### Archive re-anchoring
+
+`pg_upgrade` initdb's the target, so an upgraded service comes back with a new
+`system_identifier` and a new `PG_VERSION` — a different cluster as far as
+pgBackRest is concerned. Archiving has to follow it to
+`${WAL_ARCHIVE_PATH}/cluster-<new_sysid>`: the previous prefix records the old
+system id in its `archive.info`, so every `archive-push` against it fails and
+`stanza-create` refuses the mismatch outright.
+
+On every boot `wrapper.sh` compares `.pgbackrest_repo_anchor` against the
+cluster on disk. On a mismatch in either component, and only when
+`WAL_ARCHIVE_BUCKET` is set, it moves archiving before Postgres starts: flip the
+repo-path marker to the new cluster's prefix, drop the old path's async spool
+statuses (a stale `.ok` would make pgBackRest skip an upload the new path never
+received), reset the backup-watcher state so a full lands immediately at the new
+prefix, and `stanza-create` there. No epoch suffix is needed — a fresh system
+identifier makes the path collision-free and deterministic, so an interrupted
+attempt recomputes the same target. The previous cluster's archive is untouched
+and stays restorable as its own history in the bucket.
+
+Detection is the fingerprint, never the upgrade marker: the marker is
+removed from consideration eventually, and detection must not depend on it.
+To be precise about scope: a **PITR restore cannot trip this check** —
+`pgbackrest restore` copies the source's data files, so the
+`system_identifier` is preserved and the restored `$PGDATA` carries the
+source's repo-path marker *and* its matching anchor. (Restored forks get
+their own bucket via `WAL_ARCHIVE_*`, which is what keeps them off the
+source's prefix; the anchor plays no part.) The upgrade job's directory
+swap likewise promotes a freshly initdb'd data directory, so today's
+in-place route derives the path fresh rather than exercising the re-anchor.
+The re-anchor is therefore **defense in depth for routes that don't exist
+yet**: any upgrade path that carries `$PGDATA`'s pgbackrest files forward
+across a re-identification (a dump/restore fallback for the legacy
+PGDATA-at-the-volume-root layout, a future restore flavor that rewrites
+identity). Nothing here can fail the boot — an incomplete re-anchor is
+logged loudly and retried by the backup watcher, because a database that is
+up with degraded archiving beats one that refuses to start.
+
+A product consequence of per-cluster paths, accepted deliberately: **the
+PITR window restarts at a major upgrade.** Archiving moves to the new
+cluster's prefix and an immediate full backup re-anchors the window there;
+the old prefix stays in the bucket as a browsable, restorable history of
+the pre-upgrade cluster, but nothing expires it — its retention was driven
+by `pgbackrest expire` runs that now happen on the new prefix only. Adding
+expiry/cleanup for orphaned `cluster-*` prefixes (after a safety window) is
+an open follow-up, tracked for the dashboard/backboard side; the image does
+not delete archive data.
+
+There's also a small tail gap at the old prefix specifically: WAL written
+between the old cluster's last successful archive push and the upgrade
+never reaches the old prefix (the upgrade job's own quiesce step archives
+nothing new — see `ensure_clean_shutdown`'s docblock). The pre-upgrade
+backup this feature always takes is what covers that point, not the old
+archive.
+
+Tests: `./test/e2e-upgrade.sh` (add `FROM_VERSION=14 TO_VERSION=17` to cover a
+pre-16 source, where pg_upgrade's `reg*`/`aclitem` checks fire). CI runs the
+harness on 16→17 and 17→18 — the latter pins the initdb data-checksums
+default flip in 18, which needs explicit parity flags. The re-anchor
+tests need a bucket, so they live in the archive harness instead:
+`./test/e2e.sh t_upgrade_archive_reanchors_to_new_cluster_path
+t_reanchor_stale_marker_after_upgrade t_reanchor_backfills_missing_anchor`.

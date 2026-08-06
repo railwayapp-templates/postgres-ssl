@@ -69,3 +69,69 @@ jobs:
           name: e2e-logs-pg${{ matrix.pg_version }}
           path: failure-artifacts
           retention-days: 14
+
+  # Major-upgrade harness (test/e2e-upgrade.sh): one cell per version pair.
+  # 16→17 is the fleet's common pair; 17→18 pins the majors where initdb's
+  # data-checksums default flipped (18) — every →18 upgrade would fail
+  # --check without the explicit parity flag, which only a real 18 target
+  # can regress-test. 15→16 exercises the reg*/aclitem blockers
+  # (t_check_blocker_pre16_types self-skips at FROM>=16), which the
+  # dashboard preflight also checks for and was otherwise never
+  # regression-tested anywhere in CI — pg_upgrade's own behavior here isn't
+  # a clean "any pre-16 source" rule (14→15 fires neither check; see the
+  # test's own docblock), so this cell is a pair confirmed to trigger both,
+  # not a stand-in for every pre-16 pair. The
+  # harness builds its own images (FROM, TO, and the dual-binary job image),
+  # so no buildx step is needed here.
+  e2e-upgrade:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { from: 16, to: 17 }
+          - { from: 17, to: 18 }
+          - { from: 15, to: 16 }
+
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Run upgrade e2e harness
+        shell: bash
+        env:
+          FROM_VERSION: ${{ matrix.from }}
+          TO_VERSION: ${{ matrix.to }}
+          # Keep the harness's containers past its EXIT trap so the failure
+          # step below can still `docker logs` them (the trap otherwise
+          # removes them first, making that loop dead code). The runner VM
+          # is discarded either way.
+          E2E_KEEP_CONTAINERS: "1"
+        run: |
+          ./test/e2e-upgrade.sh 2>&1 | tee "e2e-upgrade-${FROM_VERSION}-${TO_VERSION}.log"
+          exit "${PIPESTATUS[0]}"
+
+      - name: Collect failure diagnostics
+        if: failure()
+        env:
+          FROM_VERSION: ${{ matrix.from }}
+          TO_VERSION: ${{ matrix.to }}
+        run: |
+          mkdir -p failure-artifacts
+          mv "e2e-upgrade-${FROM_VERSION}-${TO_VERSION}.log" failure-artifacts/ 2>/dev/null || true
+          docker ps -a > failure-artifacts/docker-ps.txt 2>&1 || true
+          docker volume ls > failure-artifacts/docker-volumes.txt 2>&1 || true
+          for c in $(docker ps -aq --filter "label=postgres-upgrade-e2e=1"); do
+            name=$(docker inspect -f '{{.Name}}' "$c" | sed 's|^/||')
+            docker logs --tail 200 "$c" > "failure-artifacts/container-${name}.log" 2>&1 || true
+          done
+
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-upgrade-logs-${{ matrix.from }}-${{ matrix.to }}
+          path: failure-artifacts
+          retention-days: 14

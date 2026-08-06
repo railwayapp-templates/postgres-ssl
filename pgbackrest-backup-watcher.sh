@@ -157,7 +157,7 @@ log() { echo "pgbackrest-watcher: $*"; }
 #                                       proof is "current catalog_max > this")
 #   last_force_recovery_at=<epoch>   — last time we pkill'd the async daemon
 #   force_attempts=<int>             — pkill cycles this gap-recovery cycle
-#   wal_regression_orig_path=<path>  — pre-migration repo1-path, set on the
+#   archive_migration_orig_path=<path> — pre-migration repo1-path, set on the
 #                                       first WAL_REGRESSION self-heal and
 #                                       never cleared. Successive migrations
 #                                       compose suffix off this (orig-<e2>),
@@ -166,15 +166,26 @@ log() { echo "pgbackrest-watcher: $*"; }
 #                                       rollbacks gets flat sibling prefixes
 #                                       (cluster-X, cluster-X-e1, cluster-X-e2)
 #                                       rather than a deepening chain.
-#   wal_regression_pending_new_path=<path>
-#                                     — in-flight migration target. Written
-#                                       before apply_active_path; cleared on
-#                                       success. On retry after a transient
+#   archive_migration_pending_new_path=<path>
+#                                     — in-flight migration target, and the
+#                                       interlock that blocks backups until the
+#                                       migration finalizes. Written before
+#                                       apply_active_path; cleared on success.
+#                                       On retry after a transient
 #                                       apply_active_path failure, reuse this
 #                                       instead of computing a fresh epoch —
 #                                       otherwise every retry would create a
 #                                       new cluster-X-<epoch> sibling and
 #                                       spam orphaned prefixes.
+#                                       Also set by wrapper.sh when a boot-time
+#                                       re-anchor moves archiving onto a
+#                                       re-identified cluster's own path, so the
+#                                       same finalization + gating applies to
+#                                       both producers.
+#                                       Both fields were named wal_regression_*
+#                                       before the re-anchor path shared them;
+#                                       migrate_legacy_state_field_names renames
+#                                       them in place on startup.
 #   probe_fail_since=<epoch>         — epoch when pgbackrest info first failed
 #                                       in the current consecutive-failure run
 #                                       (0 = probes are succeeding). Reset to 0
@@ -206,6 +217,39 @@ write_state_field() {
   fi
   echo "${field}=${value}" >> "$tmp"
   mv "$tmp" "$STATE_FILE"
+}
+
+# One-shot rename of the pre-generalization field names, run once at startup so
+# every reader below can assume the new names exist and nothing needs a
+# read-with-fallback (a fallback would deadlock the "cleared" state: writing the
+# new key empty while a legacy key still held a path would keep resolving to
+# the stale path forever).
+#
+# Renamed rather than dual-read because the migration machinery is no longer
+# WAL_REGRESSION-specific — wrapper.sh's boot-time re-anchor sets the same
+# pending field. A state file written by the previous image version is
+# converted on the first poll after the upgrade; one that has already been
+# converted (or never had the legacy fields) is untouched.
+migrate_legacy_state_field_names() {
+  [ ! -f "$STATE_FILE" ] && return 0
+  local legacy new value
+  for legacy in wal_regression_orig_path wal_regression_pending_new_path; do
+    grep -qE "^${legacy}=" "$STATE_FILE" 2>/dev/null || continue
+    new="archive_migration_${legacy#wal_regression_}"
+    value=$(read_state "$legacy")
+    # Keep whichever value the new name already carries: only the legacy
+    # writer could have set the legacy key, so a populated new key means this
+    # rename already ran and the legacy line is a leftover.
+    if [ -z "$(read_state "$new")" ] && [ -n "$value" ]; then
+      write_state_field "$new" "$value" || return 1
+    fi
+    local tmp
+    tmp=$(mktemp "$STATE_FILE.XXXX") || return 1
+    grep -vE "^${legacy}=" "$STATE_FILE" > "$tmp" 2>/dev/null || true
+    mv "$tmp" "$STATE_FILE" || { rm -f "$tmp"; return 1; }
+    log "state: renamed ${legacy} → ${new}"
+  done
+  return 0
 }
 
 # Stats from pg_stat_archiver. Sets globals so callers can branch on them
@@ -682,15 +726,21 @@ write_state_field_required() {
   return 0
 }
 
-# Finalizes a marker-flipped WAL_REGRESSION migration by forcing pgBackRest's
+# Finalizes a marker-flipped archive-path migration by forcing pgBackRest's
 # async daemon to re-read repo1-path and clearing stale async status files from
-# the old path. Only clear wal_regression_pending_new_path after this succeeds;
-# a crash before cleanup leaves the pending field in place so the next watcher
-# iteration retries this finalization instead of trusting stale .ok/.error files.
-finalize_wal_regression_migration() {
+# the old path. Only clear archive_migration_pending_new_path after this
+# succeeds; a crash before cleanup leaves the pending field in place so the next
+# watcher iteration retries this finalization instead of trusting stale
+# .ok/.error files.
+#
+# Shared by both producers of a migration: the WAL_REGRESSION self-heal below,
+# and wrapper.sh's boot-time re-anchor onto a re-identified cluster's path
+# (which sets the same pending field and normally finalizes its own migration —
+# this runs when that boot-time attempt did not get that far).
+finalize_archive_path_migration() {
   local path="$1"
 
-  log "wal-regression: kicking async daemon to pick up new repo1-path"
+  log "archive-migration: kicking async daemon to pick up new repo1-path"
   kick_async_daemon
   # Wait up to 2s for the daemon to actually exit before cleaning spool
   # files. pkill(1) is non-blocking — in the window between signal delivery
@@ -702,7 +752,7 @@ finalize_wal_regression_migration() {
     sleep 0.2
   done
   if pgrep -f 'archive-push:async' >/dev/null 2>&1; then
-    log "wal-regression: async daemon did not exit after TERM; forcing kill before cleaning spool"
+    log "archive-migration: async daemon did not exit after TERM; forcing kill before cleaning spool"
     pkill -9 -f 'archive-push:async' 2>/dev/null || true
     local _kill_deadline=$(($(date +%s) + 2))
     while pgrep -f 'archive-push:async' >/dev/null 2>&1 \
@@ -710,7 +760,7 @@ finalize_wal_regression_migration() {
       sleep 0.2
     done
     if pgrep -f 'archive-push:async' >/dev/null 2>&1; then
-      log "wal-regression: async daemon still alive after SIGKILL; will retry finalization"
+      log "archive-migration: async daemon still alive after SIGKILL; will retry finalization"
       return 1
     fi
   fi
@@ -721,37 +771,64 @@ finalize_wal_regression_migration() {
   # without uploading the segment to the NEW path. The spool is a coordination
   # cache, never durable data — async re-uploads from pg_wal on next call.
   if ! rm -f "$SPOOL_ERR_DIR"/*.error "$SPOOL_ERR_DIR"/*.ok 2>/dev/null; then
-    log "wal-regression: failed to clean async status files; will retry finalization"
+    log "archive-migration: failed to clean async status files; will retry finalization"
     return 1
   fi
 
-  # Clear the generic gap-recovery sentinel; wal_regression_pending_new_path
-  # remains the recovery-specific backup gate until finalization fully succeeds.
+  # Clear the generic gap-recovery sentinel; archive_migration_pending_new_path
+  # remains the migration-specific backup gate until finalization fully succeeds.
   rm -f "$GAP_MARKER"
 
-  if ! write_state_field wal_regression_pending_new_path ""; then
-    log "wal-regression: failed to clear pending migration marker; will retry finalization"
+  if ! write_state_field archive_migration_pending_new_path ""; then
+    log "archive-migration: failed to clear pending migration marker; will retry finalization"
     return 1
   fi
 
-  log "wal-regression: migration finalized at ${path}; async status cache cleared"
+  log "archive-migration: migration finalized at ${path}; async status cache cleared"
 }
 
-# If a prior iteration flipped the marker and cleaned stale spool statuses but
-# crashed (or hit a transient state-file write failure) before clearing
-# wal_regression_pending_new_path, no .error may remain to call
+# If a prior iteration (or wrapper.sh's boot-time re-anchor) flipped the marker
+# but crashed — or hit a transient state-file write failure — before clearing
+# archive_migration_pending_new_path, no .error may remain to call
 # migrate_to_new_archive_path again. Retry finalization directly whenever the
 # active marker already equals the pending target; suppress other gap work for
 # this iteration so failures keep retrying cleanly on the next poll.
-finalize_pending_wal_regression_migration_if_needed() {
+#
+# When the active path does NOT equal the pending target, the migration is
+# half-APPLIED: the gate was set but the marker never flipped — the shape
+# wrapper.sh's boot-time re-anchor leaves when its marker write fails after
+# the gate write succeeded. Nothing else retries that in-container (the boot
+# path only re-runs on the next deploy), so without this branch the gate
+# would block every backup until a redeploy. Complete the flip here: re-run
+# the state resets (idempotent — the gate writer already cleared them for a
+# wrapper-produced pending, and re-clearing closes the crash window where a
+# watcher-produced pending landed before its own resets), then
+# apply_active_path + finalize, the same steps the producer would have run.
+finalize_pending_archive_path_migration_if_needed() {
   local pending
-  pending=$(read_state wal_regression_pending_new_path)
+  pending=$(read_state archive_migration_pending_new_path)
   [ -z "$pending" ] && return 1
-  [ "${PGBACKREST_REPO1_PATH:-}" != "$pending" ] && return 1
 
-  GAP_STATE_DIAG="wal-regression-finalizing"
-  log "wal-regression: finalizing pending archive-path migration at ${pending}"
-  finalize_wal_regression_migration "$pending" || true
+  if [ "${PGBACKREST_REPO1_PATH:-}" != "$pending" ]; then
+    GAP_STATE_DIAG="archive-migration-completing"
+    log "archive-migration: completing half-applied migration to ${pending} (active path is still ${PGBACKREST_REPO1_PATH:-unset})"
+    refresh_archiver_stats || true
+    write_state_field_required last_full_failed_count "${FAILED_COUNT:-0}" || return 0
+    write_state_field_required last_full_at "" || return 0
+    write_state_field_required last_diff_at "" || return 0
+    write_state_field_required last_lag_detected_at 0 || return 0
+    write_state_field_required catalog_max_at_detection "" || return 0
+    write_state_field_required last_force_recovery_at 0 || return 0
+    write_state_field_required force_attempts 0 || return 0
+    if ! apply_active_path "$pending"; then
+      log "archive-migration: could not flip the repo-path marker to ${pending}; will retry"
+      return 0
+    fi
+  fi
+
+  GAP_STATE_DIAG="archive-migration-finalizing"
+  log "archive-migration: finalizing pending archive-path migration at ${pending}"
+  finalize_archive_path_migration "$pending" || true
   return 0
 }
 
@@ -777,7 +854,7 @@ finalize_pending_wal_regression_migration_if_needed() {
 # to 0 and re-pick the same `-2` suffix as a prior migration, colliding with
 # the still-broken contents at that path. Epoch-suffixed paths are unique
 # across rollbacks for as long as wall-clock advances. The computed epoch is
-# persisted in wal_regression_pending_new_path before the state reset and
+# persisted in archive_migration_pending_new_path before the state reset and
 # reused on retry, so a transiently-failing apply_active_path doesn't spawn
 # a new sibling prefix per poll.
 #
@@ -804,10 +881,10 @@ migrate_to_new_archive_path() {
   # cluster-SYSID-<epoch1>, cluster-SYSID-<epoch2>, … rather than chaining
   # suffixes (cluster-SYSID-<epoch1>-<epoch2>).
   local orig_path
-  orig_path=$(read_state wal_regression_orig_path)
+  orig_path=$(read_state archive_migration_orig_path)
   if [ -z "$orig_path" ]; then
     orig_path="$PGBACKREST_REPO1_PATH"
-    write_state_field_required wal_regression_orig_path "$orig_path" || return 1
+    write_state_field_required archive_migration_orig_path "$orig_path" || return 1
   fi
 
   # Reuse the pending new_path from a prior failed attempt if present —
@@ -816,10 +893,10 @@ migrate_to_new_archive_path() {
   # accumulate orphaned cluster-X-<epochN> siblings until the underlying
   # condition cleared.
   local new_path
-  new_path=$(read_state wal_regression_pending_new_path)
+  new_path=$(read_state archive_migration_pending_new_path)
   if [ -z "$new_path" ]; then
     new_path="${orig_path}-$(date +%s)"
-    write_state_field_required wal_regression_pending_new_path "$new_path" || return 1
+    write_state_field_required archive_migration_pending_new_path "$new_path" || return 1
   fi
 
   # Previous iteration may have flipped the marker and crashed before clearing
@@ -828,7 +905,7 @@ migrate_to_new_archive_path() {
   # the new path.
   if [ "$PGBACKREST_REPO1_PATH" = "$new_path" ]; then
     log "wal-regression: finalizing pending archive-path migration at ${new_path}"
-    finalize_wal_regression_migration "$new_path"
+    finalize_archive_path_migration "$new_path"
     return $?
   fi
 
@@ -858,7 +935,7 @@ migrate_to_new_archive_path() {
     return 1
   fi
 
-  if ! finalize_wal_regression_migration "$new_path"; then
+  if ! finalize_archive_path_migration "$new_path"; then
     return 1
   fi
 
@@ -876,11 +953,11 @@ migrate_to_new_archive_path() {
 # in recovery just advances the timers / inspects current catalog max.
 #
 # Returns 0 always — migration-specific backup gating is handled by
-# wal_regression_pending_new_path in decide_action.
+# archive_migration_pending_new_path in decide_action.
 gap_recovery_step() {
   local now; now=$(date +%s)
 
-  if finalize_pending_wal_regression_migration_if_needed; then
+  if finalize_pending_archive_path_migration_if_needed; then
     return 0
   fi
 
@@ -1138,14 +1215,16 @@ decide_action() {
   LAST_FULL_FAILED_DIAG="$last_full_failed"
   GAP_MARKER_DIAG=$([ -f "$GAP_MARKER" ] && echo "present" || echo "absent")
 
-  # WAL_REGRESSION migration is the only recovery path that must block
-  # backups: until the async daemon is stopped and stale old-path spool
-  # statuses are cleaned, a stale .ok can falsely satisfy archive-push on
-  # the new path. Generic WAL gaps are not gated here — if a full/diff can
-  # succeed while gap-recovery is running, that is useful signal.
-  local wal_regression_pending
-  wal_regression_pending=$(read_state wal_regression_pending_new_path)
-  if [ -n "$wal_regression_pending" ]; then
+  # An in-flight archive-path migration is the only condition that must block
+  # backups outright: until the async daemon is stopped and stale old-path spool
+  # statuses are cleaned, a stale .ok can falsely satisfy archive-push on the
+  # new path. Set by the WAL_REGRESSION self-heal and by wrapper.sh's boot-time
+  # re-anchor. Generic WAL gaps are not gated here — if a full/diff can succeed
+  # while gap-recovery is running, that is useful signal.
+  local migration_pending
+  migration_pending=$(read_state archive_migration_pending_new_path)
+  if [ -n "$migration_pending" ]; then
+    MIGRATION_PENDING_DIAG="$migration_pending"
     return 0
   fi
 
@@ -1317,7 +1396,7 @@ watcher_iteration() {
   if [ -z "$DECIDED_ACTION" ]; then
     # Surface why decide_action stayed silent so post-mortems on "watcher
     # ran for N minutes and never took a backup" don't require guessing.
-    log "iteration: no action (last_full=${LAST_FULL_DIAG:-?}, archived=${ARCHIVED_COUNT:-?}, failed=${FAILED_COUNT:-?}, gap_marker=${GAP_MARKER_DIAG:-?}, gap_state=${GAP_STATE_DIAG:-?}, last_full_failed=${LAST_FULL_FAILED_DIAG:-?}, lag=${LAST_OBSERVED_LAG_SEGMENTS:-?})"
+    log "iteration: no action (last_full=${LAST_FULL_DIAG:-?}, archived=${ARCHIVED_COUNT:-?}, failed=${FAILED_COUNT:-?}, gap_marker=${GAP_MARKER_DIAG:-?}, gap_state=${GAP_STATE_DIAG:-?}, last_full_failed=${LAST_FULL_FAILED_DIAG:-?}, lag=${LAST_OBSERVED_LAG_SEGMENTS:-?}, migration_pending=${MIGRATION_PENDING_DIAG:-none})"
     return 0
   fi
 
@@ -1345,6 +1424,14 @@ sync_repo_path_from_marker() {
 }
 
 sync_repo_path_from_marker
+
+# Convert a state file written by the pre-generalization field names before any
+# reader touches it. Non-fatal: a failure here leaves the legacy names in
+# place, which reads as "no migration pending" — the same state a fresh volume
+# starts in, and one the WAL_REGRESSION probe re-detects from the .error files
+# that caused it.
+migrate_legacy_state_field_names \
+  || log "state: could not rename legacy wal_regression_* fields; continuing"
 
 log "starting (poll=${POLL_INTERVAL_SECONDS}s, initial_poll=${INITIAL_POLL_SECONDS}s, full=${FULL_INTERVAL_SECONDS}s, diff=${DIFF_INTERVAL_SECONDS}s, gap_backoff=${GAP_RECOVERY_BACKOFF_SECONDS}s, lag_threshold=${WAL_LAG_GAP_THRESHOLD_SEGMENTS} segments, repo1-path=${PGBACKREST_REPO1_PATH:-unset})"
 
