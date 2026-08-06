@@ -372,10 +372,18 @@ takes a mode as its argument:
 
 | Mode | Effect |
 |------|--------|
-| `check` | `pg_upgrade --check` against a throwaway target cluster. Exit 1 = blockers. **Not strictly read-only**: a cluster that wasn't shut down cleanly (the platform stops containers with SIGKILL, so that's the normal case) is first quiesced — WAL replayed with the old binaries, then a clean shutdown — exactly what the next boot would have done. Only a cleanly-shut-down volume is checked without writes. |
+| `check` | `pg_upgrade --check` against a throwaway target cluster. Exit 1 = blockers, exit 2 = precondition refusal, exit 3 = environment failure (the quiesce could not start or stop the old server — its log is printed). Also proves the real upgrade's sibling directory slot is creatable on the volume, so a green check can't hide a volume-root permission problem the real run would hit. **Not strictly read-only**: a cluster that wasn't shut down cleanly (the platform stops containers with SIGKILL, so that's the normal case) is first quiesced — WAL replayed with the old binaries, then a clean shutdown — exactly what the next boot would have done. Only a cleanly-shut-down volume is checked without writes. |
 | `upgrade` | `--check`, then `pg_upgrade --link`, then the completion marker and directory swap. |
 | `status` | Prints the marker phase + on-disk major as JSON, for resume decisions. |
 | `manifest` | Prints the target major's installable extensions as JSON. |
+
+The job connects as the cluster's actual install user
+(`${POSTGRES_USER:-postgres}`), and initdb's the target cluster with the same
+name — a service deployed with a custom `POSTGRES_USER` has no `postgres`
+role at all, and pg_upgrade requires both clusters' install users to match.
+Every `RAILWAY_UPGRADE_RESULT:` payload is built with `jq --arg` (compact,
+one line) so no on-disk byte a database superuser can write reaches the
+workflow's JSON parser unescaped.
 
 Volumes with `recovery.signal` or `standby.signal` are refused outright by
 both `check` and `upgrade` (exit 2): those shapes can't be upgraded in
@@ -401,7 +409,12 @@ Both sides also hold a `flock` on the volume-root
 container shared for its lifetime. A job dispatched against a live database
 refuses instead of corrupting the cluster, and a database deployed while a
 job is mid-flight refuses to boot — in-image backstops for the
-orchestrator's own exclusion.
+orchestrator's own exclusion. Honest scope note: the shared side only exists
+on runtime images built from this change, so a service still running an
+older image is protected during its first upgrade by the orchestrator's
+stop-before-dispatch and the platform's single-mount guarantee alone — the
+lock becomes a real backstop for that service only after it redeploys onto a
+current image.
 
 The job tolerates the platform's ungraceful container stop: it clears a stale
 `postmaster.pid` and, when `pg_control` says the cluster was not shut down
@@ -416,14 +429,28 @@ SSL off and rejects every `sslmode=require` client. `pg_hba.conf` gets the
 same two-layer treatment: the job carries the old cluster's `pg_hba.conf`
 (and `pg_ident.conf`) into the new data directory — it's the user's actual
 config, custom rules included — and `wrapper.sh` re-appends the
-`host all all all <method>` rule whenever the config lacks any host rule,
-because a database without it looks healthy from localhost while refusing
-every remote client. The PITR lifecycle sentinels (`.pitr_configured`,
+`host all all all <method>` rule when (and only when) the file has been
+reset to initdb's recognizable default shape — loopback host rules and
+nothing else. A config the operator narrowed by address, database/user, or
+TLS is an authored policy and is never silently re-widened; a file with no
+host rules at all is a deliberate local-only lockdown and is left alone
+too. The PITR lifecycle sentinels (`.pitr_configured`,
 `.pitr_staging`, `.pgbackrest_restored`) are carried across the swap too,
 and a `completed` upgrade marker is itself treated as proof that recovery
 already promoted — otherwise an upgraded PITR-restored fork (whose
 `WAL_RECOVER_FROM_*` env stays set forever) would re-stage archive recovery
 against the source bucket and never become ready.
+
+`postgresql.conf` and `postgresql.auto.conf` (`ALTER SYSTEM` settings) are
+deliberately **not** carried: either file can hold a GUC the target major
+removed, and one unrecognized parameter there refuses the whole boot. The
+user's tuning must not silently evaporate either, so the job stashes both
+files at the volume root as `.pre-upgrade-<from>-postgresql.conf` /
+`.pre-upgrade-<from>-postgresql.auto.conf` (they outlive the old data dir's
+24 h reclaim) and records `needsConfigReview: true` in the completed marker —
+surfacing "re-apply your `ALTER SYSTEM` settings" is the dashboard's job,
+because the alternative is the user discovering it via a post-upgrade
+`max_connections` regression.
 
 #### Disk reclaim and rollback window
 

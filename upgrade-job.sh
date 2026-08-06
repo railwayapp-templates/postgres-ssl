@@ -9,7 +9,9 @@
 # Modes (first argument, default "upgrade"):
 #   check    — initdb a throwaway target cluster and run pg_upgrade --check.
 #              Exit 0 = upgradeable, exit 1 = blockers (printed), exit 2 =
-#              precondition failure. NOT strictly read-only: a cluster that
+#              precondition failure, exit 3 = environment failure (the
+#              quiesce below could not start or cleanly stop the old server
+#              — its log is printed). NOT strictly read-only: a cluster that
 #              was not shut down cleanly (the platform stops containers with
 #              SIGKILL, so that is the common case) is first quiesced —
 #              start the old server, replay its WAL, shut down cleanly —
@@ -52,6 +54,15 @@ set -uo pipefail
 FROM_MAJOR="${PG_UPGRADE_FROM:?PG_UPGRADE_FROM not set}"
 TO_MAJOR="${PG_UPGRADE_TO:?PG_UPGRADE_TO not set}"
 
+# The cluster's superuser. The official entrypoint runs
+# `initdb --username="$POSTGRES_USER"`, so a service deployed with a custom
+# POSTGRES_USER has no 'postgres' role at all — pg_upgrade must connect as
+# the cluster's actual install user, and the target cluster must be initdb'd
+# with the SAME name (pg_upgrade requires the install users to match). The
+# job inherits the service's variables in production, so this resolves to
+# the right name there; ad-hoc runs against a custom-user volume need -e.
+PG_SUPERUSER="${POSTGRES_USER:-postgres}"
+
 EXPECTED_VOLUME_MOUNT_PATH="/var/lib/postgresql/data"
 VOLUME_ROOT="$EXPECTED_VOLUME_MOUNT_PATH"
 # The dispatcher must pass the SERVICE's own PGDATA to this container. The
@@ -83,10 +94,16 @@ log() { echo "upgrade-job: $*"; }
 result() {
   echo "RAILWAY_UPGRADE_RESULT: $1"
 }
+# Every result payload is built with jq --arg, never by string interpolation:
+# several interpolated values trace back to bytes a DB superuser can write
+# (PG_VERSION contents, marker fields), and hand-built JSON would let a
+# crafted value close the string and plant duplicate keys — JSON.parse takes
+# the LAST duplicate, so `", "ok": true` inside an error message would flip a
+# failed result to ok:true for the workflow.
 die() {
   local code="$1"; shift
   log "ERROR: $*"
-  result "{\"ok\": false, \"mode\": \"$MODE\", \"error\": \"$*\"}"
+  result "$(jq -nc --arg mode "$MODE" --arg error "$*" '{ok: false, mode: $mode, error: $error}')"
   exit "$code"
 }
 
@@ -95,6 +112,19 @@ die() {
 read_marker_field() {
   [ -f "$MARKER_FILE" ] || { echo ""; return; }
   jq -r ".$1" "$MARKER_FILE" 2>/dev/null | sed 's/^null$//'
+}
+
+# A marker file that exists but cannot be parsed still means an upgrade
+# touched this volume (same contract as postgres-ha's guards and wrapper.sh's
+# boot gate): treating it as "nothing in flight" would let this job proceed
+# over — and overwrite — state whose meaning it cannot know. Refuse and let
+# an operator look. Both stateful modes call this before reading phases;
+# write_marker's atomic tmp+rename means only external damage produces this.
+refuse_unreadable_marker() {
+  [ -f "$MARKER_FILE" ] || return 0
+  if [ -z "$(read_marker_field phase)" ]; then
+    die 2 "the upgrade marker at $MARKER_FILE exists but cannot be read (or has no phase) — refusing to guess; inspect or remove it, then re-run"
+  fi
 }
 
 # The marker is the commit point — it must be durable before we act on it,
@@ -159,8 +189,18 @@ JOB_LOCK_FILE="$VOLUME_ROOT/.railway-major-upgrade.lock"
 # this is the in-image backstop that turns a workflow bug into a refusal
 # instead of a corrupted volume.
 take_job_lock() {
-  command -v flock >/dev/null 2>&1 || return 0
-  exec 9>>"$JOB_LOCK_FILE" || return 0
+  command -v flock >/dev/null 2>&1 \
+    || { log "flock not available; continuing without the upgrade lock"; return 0; }
+  # Brace group scopes the stderr silence to the open attempt (a bare
+  # `exec 9>>… 2>/dev/null` would blackhole this shell's stderr for good —
+  # the exact bug wrapper.sh's lock open once had). Proceeding without the
+  # lock is deliberate but must never be silent: the orchestrator's stop +
+  # single-mount remain the real exclusion, and the log line is the only
+  # record that the in-image backstop was absent for this run.
+  if ! { exec 9>>"$JOB_LOCK_FILE"; } 2>/dev/null; then
+    log "could not open $JOB_LOCK_FILE; continuing without the upgrade lock"
+    return 0
+  fi
   if ! flock -n 9; then
     die 2 "the volume is in use — another upgrade job, or a still-running database container, holds the upgrade lock"
   fi
@@ -217,17 +257,29 @@ ensure_clean_shutdown() {
   esac
 
   log "cluster state is '$state' — replaying WAL and shutting down cleanly before upgrade"
-  as_postgres "$OLD_BINDIR/pg_ctl" -D "$PGDATA" -w -t 600 \
+  # The server's own output goes to a log file that is PRINTED on failure:
+  # a WAL-replay failure is exactly the moment the FATAL lines matter, and
+  # discarding them leaves the job log with nothing but a generic message.
+  local quiesce_log="/tmp/pg-quiesce.log"
+  rm -f "$quiesce_log"
+  as_postgres "$OLD_BINDIR/pg_ctl" -D "$PGDATA" -w -t 600 -l "$quiesce_log" \
     -o "-c listen_addresses='' -k /tmp" start >/dev/null 2>&1 \
-    || die 3 "the old server could not start to complete crash recovery"
+    || { print_quiesce_log "$quiesce_log"; die 3 "the old server could not start to complete crash recovery (server log above)"; }
   as_postgres "$OLD_BINDIR/pg_ctl" -D "$PGDATA" -w -t 600 -m fast stop >/dev/null 2>&1 \
-    || die 3 "the old server did not shut down cleanly after recovery"
+    || { print_quiesce_log "$quiesce_log"; die 3 "the old server did not shut down cleanly after recovery (server log above)"; }
 
   state="$(cluster_state)"
   case "$state" in
     "shut down"|"shut down in recovery") log "cluster is now cleanly shut down" ;;
-    *) die 3 "cluster still not cleanly shut down (state: $state)" ;;
+    *) print_quiesce_log "$quiesce_log"; die 3 "cluster still not cleanly shut down (state: $state; server log above)" ;;
   esac
+}
+
+print_quiesce_log() {
+  [ -f "$1" ] || return 0
+  echo "----- old server log ($1) -----"
+  tail -100 "$1"
+  echo "----- end of old server log -----"
 }
 
 check_from_major() {
@@ -303,9 +355,12 @@ init_new_cluster() {
   fi
   # Locale/encoding inherit the image defaults, which match how the runtime
   # image initdb'd the old cluster; pg_upgrade --check verifies the pairing
-  # and aborts on any mismatch before anything is touched.
+  # and aborts on any mismatch before anything is touched. The superuser must
+  # be the OLD cluster's install user (see PG_SUPERUSER) — pg_upgrade
+  # requires both clusters' install users to match, and a custom
+  # POSTGRES_USER cluster has no 'postgres' role at all.
   # shellcheck disable=SC2046
-  as_postgres "$NEW_BINDIR/initdb" $(checksum_flag) --username=postgres -D "$target_dir" >/dev/null \
+  as_postgres "$NEW_BINDIR/initdb" $(checksum_flag) --username="$PG_SUPERUSER" -D "$target_dir" >/dev/null \
     || die 3 "initdb of the target cluster failed"
 }
 
@@ -317,12 +372,32 @@ run_pg_upgrade() {
     --new-bindir "$NEW_BINDIR" \
     --old-datadir "$PGDATA" \
     --new-datadir "$new_dir" \
-    --username=postgres \
+    --username="$PG_SUPERUSER" \
     --jobs "$(detect_cpus)" \
     $extra 2>&1)
   rc=$?
   echo "$out"
   return $rc
+}
+
+# check's throwaway target cluster lives in /tmp, so a plain --check never
+# exercises the real sibling slot next to $PGDATA — which is exactly where
+# upgrade mode puts the target cluster, and where a real Railway volume's
+# root:root ownership once failed every upgrade AFTER a green preflight (see
+# init_new_cluster's history). Prove the slot is creatable the same way the
+# real run will create it, then remove the probe. Uses a distinct suffix so
+# it can never collide with (or destroy) a real in-flight upgrade directory.
+probe_sibling_slot() {
+  local probe="${NEW_DATA_DIR}.preflight"
+  rm -rf "$probe" 2>/dev/null
+  if ! mkdir -p "$probe" 2>/dev/null; then
+    die 2 "cannot create the upgrade directory next to $PGDATA (volume root not writable?) — the real upgrade would fail after this check"
+  fi
+  if [ "$(id -u)" = "0" ] && ! chown postgres:postgres "$probe" 2>/dev/null; then
+    rm -rf "$probe"
+    die 2 "cannot hand the upgrade directory to postgres — the real upgrade would fail after this check"
+  fi
+  rm -rf "$probe"
 }
 
 # pg_upgrade --check prints its findings to stdout and detail files into cwd.
@@ -342,7 +417,8 @@ mode_status() {
   from="$(read_marker_field from)"
   to="$(read_marker_field to)"
   major="$(data_major)"
-  result "{\"ok\": true, \"mode\": \"status\", \"phase\": \"${phase:-none}\", \"from\": \"${from:-}\", \"to\": \"${to:-}\", \"dataMajor\": \"${major:-}\"}"
+  result "$(jq -nc --arg phase "${phase:-none}" --arg from "${from:-}" --arg to "${to:-}" --arg major "${major:-}" \
+    '{ok: true, mode: "status", phase: $phase, from: $from, to: $to, dataMajor: $major}')"
   exit 0
 }
 
@@ -350,7 +426,8 @@ mode_manifest() {
   local list
   list=$(ls /usr/share/postgresql/"$TO_MAJOR"/extension/*.control 2>/dev/null \
     | sed 's|.*/||; s|\.control$||' | sort -u | jq -R . | jq -sc .)
-  result "{\"ok\": true, \"mode\": \"manifest\", \"targetMajor\": \"$TO_MAJOR\", \"extensions\": ${list:-[]}}"
+  result "$(jq -nc --arg to "$TO_MAJOR" --argjson ext "${list:-[]}" \
+    '{ok: true, mode: "manifest", targetMajor: $to, extensions: $ext}')"
   exit 0
 }
 
@@ -361,6 +438,7 @@ mode_check() {
   # A marker mid-upgrade means the volume's state belongs to the upgrade
   # workflow, not to a preflight: name that instead of failing on whatever
   # half-swapped shape the disk happens to be in.
+  refuse_unreadable_marker
   local phase
   phase="$(read_marker_field phase)"
   if [ -n "$phase" ] && [ "$phase" != "completed" ]; then
@@ -370,6 +448,9 @@ mode_check() {
   clear_stale_pidfile
   check_from_major
   refuse_recovery_shapes
+  # Before the quiesce, so an unwritable volume root gets the precise
+  # refusal instead of a generic quiesce failure.
+  probe_sibling_slot
   # Quiesces an unclean cluster (WAL replay + clean shutdown — what the next
   # normal boot would do); see the header for why check is only strictly
   # read-only on a cleanly-shut-down volume.
@@ -382,13 +463,15 @@ mode_check() {
   if out=$(run_pg_upgrade "--check" "$tmp_new"); then
     log "$out"
     rm -rf "$tmp_new"
-    result "{\"ok\": true, \"mode\": \"check\", \"from\": \"$FROM_MAJOR\", \"to\": \"$TO_MAJOR\"}"
+    result "$(jq -nc --arg from "$FROM_MAJOR" --arg to "$TO_MAJOR" \
+      '{ok: true, mode: "check", from: $from, to: $to}')"
     exit 0
   else
     log "$out"
     print_check_details
     rm -rf "$tmp_new"
-    result "{\"ok\": false, \"mode\": \"check\", \"from\": \"$FROM_MAJOR\", \"to\": \"$TO_MAJOR\", \"error\": \"pg_upgrade --check found blockers\"}"
+    result "$(jq -nc --arg from "$FROM_MAJOR" --arg to "$TO_MAJOR" \
+      '{ok: false, mode: "check", from: $from, to: $to, error: "pg_upgrade --check found blockers"}')"
     exit 1
   fi
 }
@@ -426,20 +509,53 @@ carry_cluster_config() {
   done
 }
 
+# postgresql.conf and postgresql.auto.conf (ALTER SYSTEM settings) are NOT
+# carried into the new cluster — deliberately: either file can hold a GUC the
+# target major removed (old_snapshot_threshold in 17, promote_trigger_file in
+# 16, …), and an unrecognized parameter in those files refuses the whole
+# boot. The user's tuning must not silently evaporate either, so keep
+# reference copies at the volume root — they outlive the old dir's reclaim —
+# and the completed marker records needsConfigReview so the dashboard can
+# surface "re-apply your ALTER SYSTEM settings" instead of the user
+# discovering it via a post-upgrade max_connections regression.
+stash_old_config() {
+  local src="$1" f
+  for f in postgresql.conf postgresql.auto.conf; do
+    [ -f "$src/$f" ] || continue
+    cp -p "$src/$f" "$VOLUME_ROOT/.pre-upgrade-${FROM_MAJOR}-${f}" 2>/dev/null \
+      || log "could not stash $f at the volume root (non-fatal; the copy in $(basename "$OLD_KEEP_DIR") remains until reclaim)"
+  done
+}
+
 finish_swap() {
   # $PGDATA holds the OLD cluster and the NEW one is complete: move old aside,
   # promote new. Two renames; a crash between them leaves no $PGDATA, which
   # the marker (phase=upgraded) makes recoverable — and which wrapper.sh
   # refuses to boot into, so nothing can initdb over the gap.
   #
+  # Never begin the renames unless the target cluster is really there and
+  # really the target major (unless $PGDATA already IS the promoted target —
+  # the resume path after a crash between the second rename and the completed
+  # marker). The first rename takes $PGDATA apart; doing that on the strength
+  # of a marker alone would convert "resumable degenerate state" into "no
+  # data dir at all" when the new dir was lost or is a partial initdb.
+  if [ "$(data_major)" != "$TO_MAJOR" ] \
+    && [ "$(cat "$NEW_DATA_DIR/PG_VERSION" 2>/dev/null)" != "$TO_MAJOR" ]; then
+    die 3 "cannot finish the swap: $NEW_DATA_DIR is missing or is not a $TO_MAJOR cluster — volume left untouched; restore the pre-upgrade backup or re-run the upgrade from scratch"
+  fi
+
   # Before the renames, carry auth config + PITR sentinels from wherever the
   # old cluster currently sits (still at $PGDATA on a first pass, already
-  # moved aside on a resume after a crash between the renames).
+  # moved aside on a resume after a crash between the renames), and stash the
+  # old cluster's postgresql{,.auto}.conf as reference copies (see
+  # stash_old_config for why they are stashed, not carried).
   if [ -d "$NEW_DATA_DIR" ]; then
     if [ -d "$PGDATA" ] && [ "$(data_major)" = "$FROM_MAJOR" ]; then
       carry_cluster_config "$PGDATA" "$NEW_DATA_DIR"
+      stash_old_config "$PGDATA"
     elif [ -d "$OLD_KEEP_DIR" ]; then
       carry_cluster_config "$OLD_KEEP_DIR" "$NEW_DATA_DIR"
+      stash_old_config "$OLD_KEEP_DIR"
     fi
   fi
 
@@ -458,11 +574,15 @@ finish_swap() {
   # unconditionally and let the operator/dashboard drive the REINDEX; an
   # automatic REINDEX of an arbitrarily large database inside the upgrade
   # window is the wrong default (documented follow-up in the README).
+  # needsConfigReview: postgresql{,.auto}.conf were not carried (see
+  # stash_old_config) — the dashboard surfaces "re-apply your ALTER SYSTEM
+  # settings" off this flag, pointing at the stashed reference copies.
   write_marker "$(jq -nc \
     --arg from "$FROM_MAJOR" --arg to "$TO_MAJOR" --arg old "$(basename "$OLD_KEEP_DIR")" \
-    '{phase: "completed", from: $from, to: $to, oldDataDir: $old, needsAnalyze: true, needsReindex: true, completedAt: (now | todate)}')"
+    '{phase: "completed", from: $from, to: $to, oldDataDir: $old, needsAnalyze: true, needsReindex: true, needsConfigReview: true, completedAt: (now | todate)}')"
   log "upgrade $FROM_MAJOR -> $TO_MAJOR complete"
-  result "{\"ok\": true, \"mode\": \"upgrade\", \"phase\": \"completed\", \"from\": \"$FROM_MAJOR\", \"to\": \"$TO_MAJOR\"}"
+  result "$(jq -nc --arg from "$FROM_MAJOR" --arg to "$TO_MAJOR" \
+    '{ok: true, mode: "upgrade", phase: "completed", from: $from, to: $to}')"
   exit 0
 }
 
@@ -476,15 +596,22 @@ mode_upgrade() {
   # completed marker — reading that as "already done" would report success
   # while the data stays on the old major, and the workflow would flip the
   # image tag into a boot refusal.
+  refuse_unreadable_marker
   local marker_phase marker_from marker_to
   marker_phase="$(read_marker_field phase)"
   marker_from="$(read_marker_field from)"
   marker_to="$(read_marker_field to)"
   case "$marker_phase" in
     completed)
-      if [ "$marker_to" = "$TO_MAJOR" ]; then
-        log "marker says completed for ${marker_from:-?} -> $TO_MAJOR — nothing to do"
-        result "{\"ok\": true, \"mode\": \"upgrade\", \"phase\": \"completed\", \"alreadyDone\": true}"
+      # "Already done" needs BOTH the marker and the data directory to say
+      # so: a completed same-pair marker sitting over FROM-major data (a
+      # partial manual restore put the old cluster back without touching the
+      # volume-root marker) must re-run the upgrade, not no-op to success —
+      # the workflow would flip the image tag onto FROM data and the service
+      # would boot-refuse after a "successful" job.
+      if [ "$marker_to" = "$TO_MAJOR" ] && [ "$(data_major)" = "$TO_MAJOR" ]; then
+        log "marker says completed for ${marker_from:-?} -> $TO_MAJOR and the data directory is $TO_MAJOR — nothing to do"
+        result "$(jq -nc '{ok: true, mode: "upgrade", phase: "completed", alreadyDone: true}')"
         exit 0
       fi
       if [ "$(data_major)" != "$FROM_MAJOR" ]; then
@@ -518,6 +645,15 @@ mode_upgrade() {
         finish_swap
       fi
       ;;
+    *)
+      # A phase this job does not recognize (the HA workflow's "reseed" on a
+      # replica volume, or a future writer's new state) is someone else's
+      # in-flight state — same reading as postgres-ha's guards, where
+      # anything other than absent/completed is in flight. Proceeding would
+      # overwrite that owner's marker at our commit point and take away its
+      # ability to resolve the volume.
+      die 2 "marker phase '$marker_phase' is not this job's to resolve — refusing to upgrade over another writer's in-flight state"
+      ;;
   esac
 
   check_from_major
@@ -531,7 +667,8 @@ mode_upgrade() {
     log "$out"
     print_check_details
     rm -rf "$NEW_DATA_DIR"
-    result "{\"ok\": false, \"mode\": \"upgrade\", \"from\": \"$FROM_MAJOR\", \"to\": \"$TO_MAJOR\", \"error\": \"pg_upgrade --check found blockers\"}"
+    result "$(jq -nc --arg from "$FROM_MAJOR" --arg to "$TO_MAJOR" \
+      '{ok: false, mode: "upgrade", from: $from, to: $to, error: "pg_upgrade --check found blockers"}')"
     exit 1
   fi
   log "$out"
@@ -542,7 +679,8 @@ mode_upgrade() {
     # pg_upgrade's failed run and MUST NOT be restarted in place. The
     # workflow rolls back to the pre-upgrade backup.
     rm -rf "$NEW_DATA_DIR"
-    result "{\"ok\": false, \"mode\": \"upgrade\", \"from\": \"$FROM_MAJOR\", \"to\": \"$TO_MAJOR\", \"error\": \"pg_upgrade failed after check passed\"}"
+    result "$(jq -nc --arg from "$FROM_MAJOR" --arg to "$TO_MAJOR" \
+      '{ok: false, mode: "upgrade", from: $from, to: $to, error: "pg_upgrade failed after check passed"}')"
     exit 3
   fi
   log "$out"

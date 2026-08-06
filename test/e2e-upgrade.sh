@@ -354,7 +354,7 @@ t_check_pass() {
   seed_from_cluster "$vol" || return 1
   run_job "$vol" check
   assert_eq "$JOB_RC" 0 "check mode exit code" || { echo "$JOB_OUT" | tail -20; return 1; }
-  assert_contains "$JOB_OUT" '"ok": true' "machine-readable result" || return 1
+  assert_contains "$JOB_OUT" '"ok":true' "machine-readable result" || return 1
   assert_eq "$(volume_data_major "$vol")" "$FROM_VERSION" "data major untouched by check" || return 1
   run_pg checkpass-pg "$vol" "$FROM_IMAGE" || return 1
   wait_for_pg checkpass-pg || { fail_dump checkpass checkpass-pg; return 1; }
@@ -473,6 +473,12 @@ t_upgrade_happy_path() {
   assert_eq "$JOB_RC" 0 "upgrade exit code" || { echo "$JOB_OUT" | tail -30; return 1; }
   assert_eq "$(marker_field "$vol" phase)" "completed" "marker phase" || return 1
   assert_eq "$(marker_field "$vol" needsReindex)" "true" "collation-reindex flag recorded" || return 1
+  assert_eq "$(marker_field "$vol" needsConfigReview)" "true" "config-review flag recorded" || return 1
+  # postgresql{,.auto}.conf are not carried; their reference copies must land
+  # at the volume root, where they outlive the old dir's 24h reclaim.
+  in_volume "$vol" "test -f /var/lib/postgresql/data/.pre-upgrade-${FROM_VERSION}-postgresql.conf \
+    && test -f /var/lib/postgresql/data/.pre-upgrade-${FROM_VERSION}-postgresql.auto.conf" \
+    || { echo "  pre-upgrade config stash missing at the volume root"; return 1; }
   assert_eq "$(volume_data_major "$vol")" "$TO_VERSION" "on-disk major is now TO" || return 1
   # The rollback body must survive the upgrade itself (reclaim is a separate,
   # grace-gated path — see t_old_datadir_reclaimed).
@@ -494,7 +500,7 @@ t_upgrade_idempotent() {
   local vol="upg-e2e-happy"
   run_job "$vol" upgrade
   assert_eq "$JOB_RC" 0 "idempotent re-run exit code" || { echo "$JOB_OUT" | tail -10; return 1; }
-  assert_contains "$JOB_OUT" '"alreadyDone": true' "no-op signaled" || return 1
+  assert_contains "$JOB_OUT" '"alreadyDone":true' "no-op signaled" || return 1
 }
 
 # status mode reports the terminal state for the workflow's resume decision.
@@ -502,8 +508,8 @@ t_status_mode() {
   local vol="upg-e2e-happy"
   run_job "$vol" status
   assert_eq "$JOB_RC" 0 "status exit code" || return 1
-  assert_contains "$JOB_OUT" '"phase": "completed"' "status phase" || return 1
-  assert_contains "$JOB_OUT" "\"dataMajor\": \"$TO_VERSION\"" "status data major" || return 1
+  assert_contains "$JOB_OUT" '"phase":"completed"' "status phase" || return 1
+  assert_contains "$JOB_OUT" "\"dataMajor\":\"$TO_VERSION\"" "status data major" || return 1
 }
 
 # manifest mode lists the TO major's installable extensions (preflight feed).
@@ -572,7 +578,10 @@ t_old_image_on_upgraded_data() {
   expect_boot_refusal "$vol" "$FROM_IMAGE" "data directory holds major version $TO_VERSION" || return 1
 }
 
-# A non-completed marker blocks EVERY runtime boot — both majors.
+# A non-completed marker blocks EVERY runtime boot — both majors. An
+# UNREADABLE marker must refuse too: a file we cannot parse still means an
+# upgrade touched this volume, and "nothing in flight" is the one
+# interpretation that can lose data (same contract as postgres-ha's guards).
 t_boot_refused_mid_upgrade() {
   local vol="upg-e2e-midmarker"
   seed_from_cluster "$vol" || return 1
@@ -580,6 +589,11 @@ t_boot_refused_mid_upgrade() {
     -c "echo '{\"phase\": \"upgraded\", \"from\": \"$FROM_VERSION\", \"to\": \"$TO_VERSION\"}' > $MARKER_PATH"
   expect_boot_refusal "$vol" "$FROM_IMAGE" "upgrade is in progress" || return 1
   expect_boot_refusal "$vol" "$TO_IMAGE" "upgrade is in progress" || return 1
+
+  docker run --rm -v "$vol:/var/lib/postgresql/data" --entrypoint /bin/sh "$JOB_IMAGE" \
+    -c "echo '{not json' > $MARKER_PATH"
+  expect_boot_refusal "$vol" "$FROM_IMAGE" "marker phase: unreadable" || return 1
+  in_volume "$vol" "rm -f $MARKER_PATH"
 }
 
 # Crash between the two directory renames: marker=upgraded, old dir moved
@@ -637,9 +651,19 @@ t_remote_auth_survives_upgrade() {
     "e2e-custom-hba-rule" "custom pg_hba rule carried across the upgrade" || return 1
   stop_pg hba-after
 
-  # Wrapper self-heal layer: lose the host rules entirely (any path that
-  # regenerates pg_hba.conf), boot, and remote auth must come back.
-  in_volume "$vol" "grep -vE '^[[:space:]]*host' $PGDATA_IN_VOLUME/pg_hba.conf > /tmp/hba && cat /tmp/hba > $PGDATA_IN_VOLUME/pg_hba.conf" || return 1
+  # Wrapper self-heal layer: reset pg_hba to initdb's default shape — local
+  # lines plus the loopback host rules and nothing else, which is what any
+  # path that regenerates the file actually produces. The heal is keyed on
+  # exactly that shape (see t_narrowed_hba_not_rewidened for the negative),
+  # so remote auth must come back on the next boot.
+  in_volume "$vol" "printf '%s\n' \
+    'local all all trust' \
+    'host all all 127.0.0.1/32 trust' \
+    'host all all ::1/128 trust' \
+    'local replication all trust' \
+    'host replication all 127.0.0.1/32 trust' \
+    'host replication all ::1/128 trust' \
+    > $PGDATA_IN_VOLUME/pg_hba.conf" || return 1
   run_pg hba-healed "$vol" "$TO_IMAGE" --network "$E2E_NET" || return 1
   wait_for_pg hba-healed || { fail_dump hba-healed hba-healed; return 1; }
   assert_contains "$(docker logs hba-healed 2>&1)" "re-appending" "wrapper reported the pg_hba heal" || return 1
@@ -741,15 +765,51 @@ t_second_upgrade_reaches_next_major() {
 
 # An in-flight (phase=upgraded) marker belonging to a DIFFERENT version pair
 # must not drive this job's directory swap — its upgrade dirs belong to the
-# other job. Refuse loudly, volume untouched.
+# other job. Refuse loudly, volume untouched. The planted marker uses NUMERIC
+# majors on purpose: more than one producer writes this file (postgres-ha's
+# workflow tolerates numeric majors for the same reason), and jq's -r read
+# must normalize them rather than misread the pair.
 t_foreign_pair_upgraded_marker_refused() {
   local vol="upg-e2e-foreignpair"
   seed_from_cluster "$vol" || return 1
-  in_volume "$vol" "echo '{\"phase\": \"upgraded\", \"from\": \"13\", \"to\": \"14\"}' > $MARKER_PATH" || return 1
+  in_volume "$vol" "echo '{\"phase\": \"upgraded\", \"from\": 13, \"to\": 14}' > $MARKER_PATH" || return 1
   run_job "$vol" upgrade
   assert_eq "$JOB_RC" 2 "foreign-pair upgraded marker refused" || { echo "$JOB_OUT" | tail -10; return 1; }
   assert_contains "$JOB_OUT" "refuses to finish another pair's swap" "refusal names the mismatch" || return 1
+  assert_contains "$JOB_OUT" "13 -> 14" "numeric marker majors normalized in the message" || return 1
   assert_eq "$(volume_data_major "$vol")" "$FROM_VERSION" "volume untouched" || return 1
+
+  # check mode must also name the in-flight marker instead of preflighting
+  # over another job's half-done state.
+  run_job "$vol" check
+  assert_eq "$JOB_RC" 2 "check refused on a foreign in-flight marker" || { echo "$JOB_OUT" | tail -10; return 1; }
+  assert_contains "$JOB_OUT" "already in progress" "check names the in-flight marker" || return 1
+  in_volume "$vol" "rm -f $MARKER_PATH"
+}
+
+# A marker phase this job does not recognize (the HA workflow's "reseed" on a
+# replica volume, or a future writer's state) is someone else's in-flight
+# state: both modes must refuse rather than overwrite it at the commit point.
+t_unknown_marker_phase_refused() {
+  local vol="upg-e2e-unknownphase"
+  seed_from_cluster "$vol" || return 1
+  in_volume "$vol" "echo '{\"phase\": \"reseed\", \"from\": \"$FROM_VERSION\", \"to\": \"$TO_VERSION\"}' > $MARKER_PATH" || return 1
+  run_job "$vol" upgrade
+  assert_eq "$JOB_RC" 2 "unknown phase refused by upgrade" || { echo "$JOB_OUT" | tail -10; return 1; }
+  assert_contains "$JOB_OUT" "not this job's to resolve" "refusal names the foreign phase" || return 1
+  run_job "$vol" check
+  assert_eq "$JOB_RC" 2 "unknown phase refused by check" || { echo "$JOB_OUT" | tail -10; return 1; }
+  assert_eq "$(volume_data_major "$vol")" "$FROM_VERSION" "volume untouched" || return 1
+
+  # An UNREADABLE marker is someone's in-flight state we cannot even name:
+  # both modes must refuse rather than proceed over (and overwrite) it.
+  in_volume "$vol" "echo '{not json' > $MARKER_PATH" || return 1
+  run_job "$vol" upgrade
+  assert_eq "$JOB_RC" 2 "unreadable marker refused by upgrade" || { echo "$JOB_OUT" | tail -10; return 1; }
+  assert_contains "$JOB_OUT" "cannot be read" "refusal names the unreadable marker" || return 1
+  run_job "$vol" check
+  assert_eq "$JOB_RC" 2 "unreadable marker refused by check" || { echo "$JOB_OUT" | tail -10; return 1; }
+  assert_eq "$(volume_data_major "$vol")" "$FROM_VERSION" "volume still untouched" || return 1
   in_volume "$vol" "rm -f $MARKER_PATH"
 }
 
@@ -946,6 +1006,150 @@ t_upgrade_survives_root_owned_volume_root() {
   stop_pg rootvol-pg
 }
 
+# The official entrypoint initdb's with --username="$POSTGRES_USER", so a
+# custom-user cluster has NO 'postgres' role at all — the job must connect
+# (and initdb the target) as the cluster's actual install user, and the
+# wrapper's post-upgrade analyze must too. A hardcoded -U postgres made the
+# whole feature DOA for this cohort, with a libpq error buried in pg_upgrade
+# output as the only signal.
+t_custom_superuser_upgrades() {
+  local vol="upg-e2e-customuser"
+  fresh_volume "$vol" || return 1
+  remove_container custom-pg || return 1
+  docker run -d --name custom-pg --label postgres-upgrade-e2e=1 \
+    -e "POSTGRES_PASSWORD=test" -e "POSTGRES_USER=myuser" -e "PGDATA=$PGDATA_IN_VOLUME" \
+    -v "$vol:/var/lib/postgresql/data" "$FROM_IMAGE" >/dev/null || return 1
+  wait_for_pg custom-pg || { fail_dump customuser custom-pg; return 1; }
+  docker exec custom-pg psql -U myuser -tAc \
+    "CREATE TABLE cu_canary(id int); INSERT INTO cu_canary SELECT generate_series(1, 100)" >/dev/null \
+    || { echo "  could not seed as the custom superuser"; fail_dump customuser custom-pg; return 1; }
+  stop_pg custom-pg
+
+  # Both modes must work with the service's own env (which is how production
+  # dispatch delivers POSTGRES_USER to the job).
+  JOB_OUT=$(docker run --rm --label postgres-upgrade-e2e=1 \
+    -e "PGDATA=$PGDATA_IN_VOLUME" -e "POSTGRES_USER=myuser" \
+    -v "$vol:/var/lib/postgresql/data" "$JOB_IMAGE" check 2>&1)
+  JOB_RC=$?
+  assert_eq "$JOB_RC" 0 "check passes on a custom-superuser cluster" || { echo "$JOB_OUT" | tail -20; return 1; }
+  JOB_OUT=$(docker run --rm --label postgres-upgrade-e2e=1 \
+    -e "PGDATA=$PGDATA_IN_VOLUME" -e "POSTGRES_USER=myuser" \
+    -v "$vol:/var/lib/postgresql/data" "$JOB_IMAGE" upgrade 2>&1)
+  JOB_RC=$?
+  assert_eq "$JOB_RC" 0 "upgrade succeeds on a custom-superuser cluster" || { echo "$JOB_OUT" | tail -30; return 1; }
+  assert_eq "$(volume_data_major "$vol")" "$TO_VERSION" "data major is TO" || return 1
+
+  remove_container custom2-pg || return 1
+  docker run -d --name custom2-pg --label postgres-upgrade-e2e=1 \
+    -e "POSTGRES_PASSWORD=test" -e "POSTGRES_USER=myuser" -e "PGDATA=$PGDATA_IN_VOLUME" \
+    -v "$vol:/var/lib/postgresql/data" "$TO_IMAGE" >/dev/null || return 1
+  wait_for_pg custom2-pg || { fail_dump customuser2 custom2-pg; return 1; }
+  assert_eq "$(docker exec custom2-pg psql -U myuser -tAc 'SELECT count(*) FROM cu_canary' 2>&1)" "100" \
+    "data survived under the custom superuser" || return 1
+  # The wrapper's staged analyze must also authenticate as the custom user
+  # (a hardcoded -U postgres would fail here on every boot forever).
+  local deadline=$(($(date +%s) + 120))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    [ "$(marker_field "$vol" needsAnalyze)" = "false" ] && break
+    sleep 5
+  done
+  assert_eq "$(marker_field "$vol" needsAnalyze)" "false" "staged analyze completed as the custom superuser" \
+    || { fail_dump customuser2 custom2-pg; stop_pg custom2-pg; return 1; }
+  stop_pg custom2-pg
+}
+
+# The pg_hba heal must NEVER re-widen an authored policy: a config narrowed
+# by address keeps only its own rules — appending `host all all all` under it
+# would re-admit exactly the clients the narrowing excluded (pg_hba is
+# first-match-wins, so the catch-all wins for everything the narrow rules
+# don't match).
+t_narrowed_hba_not_rewidened() {
+  local vol="upg-e2e-narrowhba"
+  seed_from_cluster "$vol" || return 1
+  in_volume "$vol" "printf '%s\n' \
+    'local all all trust' \
+    'host all all 127.0.0.1/32 trust' \
+    'host all all ::1/128 trust' \
+    'host all all 192.0.2.0/24 scram-sha-256' \
+    > $PGDATA_IN_VOLUME/pg_hba.conf" || return 1
+  run_pg narrow-pg "$vol" "$FROM_IMAGE" || return 1
+  wait_for_pg narrow-pg || { fail_dump narrowhba narrow-pg; return 1; }
+  assert_not_contains "$(docker logs narrow-pg 2>&1)" "re-appending" "heal must not fire on an authored policy" || return 1
+  assert_not_contains "$(docker exec narrow-pg cat "$PGDATA_IN_VOLUME/pg_hba.conf" 2>&1)" "host all all all" \
+    "no wide-open rule appended under the narrowed policy" || return 1
+  stop_pg narrow-pg
+}
+
+# check initdb's its throwaway cluster into /tmp, so without an explicit
+# probe it would never notice that the REAL upgrade's sibling directory can't
+# be created on this volume — the exact green-preflight/red-upgrade class the
+# root-owned-volume-root bug shipped through. A read-only volume is the
+# cheapest reproducible "slot not creatable" shape.
+t_check_probes_sibling_slot() {
+  local vol="upg-e2e-roprobe"
+  seed_from_cluster "$vol" || return 1
+  JOB_OUT=$(docker run --rm --label postgres-upgrade-e2e=1 \
+    -e "PGDATA=$PGDATA_IN_VOLUME" \
+    -v "$vol:/var/lib/postgresql/data:ro" \
+    "$JOB_IMAGE" check 2>&1)
+  JOB_RC=$?
+  assert_eq "$JOB_RC" 2 "check refuses when the sibling slot cannot be created" || { echo "$JOB_OUT" | tail -10; return 1; }
+  assert_contains "$JOB_OUT" "cannot create the upgrade directory" "probe names the failure" || return 1
+
+  # And on a writable volume the probe passes and leaves nothing behind.
+  run_job "$vol" check
+  assert_eq "$JOB_RC" 0 "check passes on the writable volume" || { echo "$JOB_OUT" | tail -20; return 1; }
+  in_volume "$vol" "test ! -e ${PGDATA_IN_VOLUME}.upgrade-${TO_VERSION}.preflight" \
+    || { echo "  probe directory left behind"; return 1; }
+}
+
+# "Already done" needs the marker AND the data directory to agree: a
+# completed same-pair marker sitting over FROM-major data (a partial manual
+# restore put the old cluster back without touching the volume-root marker)
+# must re-run the upgrade, not no-op to success — the workflow would flip the
+# image tag onto FROM data and the service would boot-refuse after a
+# "successful" job.
+t_same_pair_completed_marker_reruns() {
+  local vol="upg-e2e-samepair"
+  seed_from_cluster "$vol" || return 1
+  in_volume "$vol" "echo '{\"phase\": \"completed\", \"from\": \"$FROM_VERSION\", \"to\": \"$TO_VERSION\"}' > $MARKER_PATH" || return 1
+  run_job "$vol" upgrade
+  assert_eq "$JOB_RC" 0 "same-pair marker over FROM data re-runs the upgrade" || { echo "$JOB_OUT" | tail -30; return 1; }
+  assert_not_contains "$JOB_OUT" '"alreadyDone"' "did not no-op on the stale marker" || return 1
+  assert_eq "$(volume_data_major "$vol")" "$TO_VERSION" "data actually upgraded" || return 1
+}
+
+# marker=upgraded (same pair) but the new data dir is gone: the swap must
+# refuse BEFORE the first rename. Moving $PGDATA aside on the strength of the
+# marker alone would convert a still-bootable degenerate state into "no data
+# dir at all".
+t_upgraded_marker_missing_new_dir_refused() {
+  local vol="upg-e2e-lostnewdir"
+  seed_from_cluster "$vol" || return 1
+  in_volume "$vol" "echo '{\"phase\": \"upgraded\", \"from\": \"$FROM_VERSION\", \"to\": \"$TO_VERSION\"}' > $MARKER_PATH" || return 1
+  run_job "$vol" upgrade
+  assert_eq "$JOB_RC" 3 "refused to swap without a valid new data dir" || { echo "$JOB_OUT" | tail -10; return 1; }
+  assert_contains "$JOB_OUT" "cannot finish the swap" "refusal names the missing target" || return 1
+  assert_eq "$(volume_data_major "$vol")" "$FROM_VERSION" "PGDATA left in place" || return 1
+  in_volume "$vol" "test ! -e ${PGDATA_IN_VOLUME}.old-${FROM_VERSION}" \
+    || { echo "  old-keep dir appeared — the swap began despite the refusal"; return 1; }
+  in_volume "$vol" "rm -f $MARKER_PATH"
+}
+
+# A service variable can set PG_MAJOR to anything; the mismatch guard must
+# trust the image's installed server tree instead (adopted from postgres-ha's
+# image_major()) — a stray PG_MAJOR must not refuse a perfectly matched boot.
+t_pg_major_env_override_ignored() {
+  local vol="upg-e2e-pgmajorenv"
+  seed_from_cluster "$vol" || return 1
+  run_pg envmajor-pg "$vol" "$FROM_IMAGE" -e "PG_MAJOR=$TO_VERSION" || return 1
+  wait_for_pg envmajor-pg || { fail_dump envmajor envmajor-pg; return 1; }
+  assert_contains "$(docker logs envmajor-pg 2>&1)" "trusting the filesystem" \
+    "the env/filesystem disagreement is logged" || return 1
+  assert_eq "$(psql_in envmajor-pg 'SELECT 1')" "1" "database booted despite the stray PG_MAJOR" || return 1
+  stop_pg envmajor-pg
+}
+
 # ----- runner -----------------------------------------------------------------
 ALL_TESTS=(
   t_vanilla_boot
@@ -976,6 +1180,13 @@ ALL_TESTS=(
   t_old_datadir_reclaimed
   t_trailing_slash_pgdata
   t_upgrade_survives_root_owned_volume_root
+  t_custom_superuser_upgrades
+  t_narrowed_hba_not_rewidened
+  t_check_probes_sibling_slot
+  t_same_pair_completed_marker_reruns
+  t_upgraded_marker_missing_new_dir_refused
+  t_unknown_marker_phase_refused
+  t_pg_major_env_override_ignored
 )
 
 TESTS=("${@:-}")

@@ -96,10 +96,38 @@ if [ -f "$UPGRADE_MARKER_FILE" ]; then
   fi
 fi
 
+# The image's own major, for the mismatch guard. Filesystem first, PG_MAJOR
+# env second — deliberately in that order (mirrors postgres-ha's
+# image_major()): the installed server tree under /usr/lib/postgresql is
+# baked into the image and nothing at deploy time can change it, while
+# PG_MAJOR is an env var a service variable can override — trusted alone, a
+# stray user-set PG_MAJOR=16 on a 17 image would refuse every boot of a
+# perfectly matched data directory. Exactly one numeric entry = the image's
+# major; zero or several (never true for runtime images) falls back to the
+# env; neither = the guard abstains.
+detect_image_major() {
+  local d name majors=()
+  for d in /usr/lib/postgresql/*/; do
+    [ -d "$d" ] || continue
+    name="${d%/}"; name="${name##*/}"
+    case "$name" in ''|*[!0-9]*) continue ;; esac
+    majors+=("$name")
+  done
+  if [ "${#majors[@]}" -eq 1 ]; then
+    if [ -n "${PG_MAJOR:-}" ] && [ "$PG_MAJOR" != "${majors[0]}" ]; then
+      echo "wrapper: PG_MAJOR=${PG_MAJOR} disagrees with the installed server tree (${majors[0]}); trusting the filesystem — a service variable can override the env, not the image contents" >&2
+    fi
+    echo "${majors[0]}"
+    return 0
+  fi
+  echo "${PG_MAJOR:-}"
+}
+
+IMAGE_MAJOR=$(detect_image_major)
 if [ -f "$PGDATA/PG_VERSION" ]; then
   DATA_MAJOR=$(cat "$PGDATA/PG_VERSION")
-  if [ -n "$PG_MAJOR" ] && [ "$DATA_MAJOR" != "$PG_MAJOR" ]; then
-    echo "This image runs PostgreSQL $PG_MAJOR but the data directory holds major version $DATA_MAJOR."
+  if [ -n "$IMAGE_MAJOR" ] && [ "$DATA_MAJOR" != "$IMAGE_MAJOR" ]; then
+    echo "This image runs PostgreSQL $IMAGE_MAJOR but the data directory holds major version $DATA_MAJOR."
     echo "Changing the image tag does not upgrade the data files. Set the image back to postgres $DATA_MAJOR,"
     echo "or run a major version upgrade from the service's settings."
     exit 1
@@ -175,22 +203,36 @@ ssl_ca_file = '$SSL_DIR/root.crt'
 EOF
 fi
 
-# Re-append the remote-access rule when pg_hba.conf has lost it. The official
-# entrypoint writes `host all all all <method>` ONCE, at initdb time — any
-# path that regenerates pg_hba.conf afterwards (a major upgrade promotes a
-# freshly initdb'd data directory; the upgrade job carries the old pg_hba
-# across, but this heals every other route too) leaves only initdb's default
-# local/loopback lines, so the database comes back healthy-looking while
-# EVERY remote client fails with "no pg_hba.conf entry". Same shape as the
-# SSL re-apply above: keyed on the CONFIG state itself, so it self-heals no
-# matter what reset it. The method mirrors the entrypoint's default. The
-# check accepts any host-family keyword (hostssl/hostnossl/…) so a user who
-# deliberately narrowed the rule to TLS-only doesn't get it silently
-# re-widened.
+# Re-append the remote-access rule when pg_hba.conf has been reset to
+# initdb's defaults. The official entrypoint writes `host all all all
+# <method>` ONCE, at initdb time — any path that regenerates pg_hba.conf
+# afterwards (a major upgrade promotes a freshly initdb'd data directory;
+# the upgrade job carries the old pg_hba across, but this heals every other
+# route too) leaves only initdb's default local/loopback lines, so the
+# database comes back healthy-looking while EVERY remote client fails with
+# "no pg_hba.conf entry". The method mirrors the entrypoint's default.
+#
+# The heal fires ONLY on the recognizable bare-initdb shape: loopback host
+# rules present, and no host-family rule with any other address. Anything
+# else is an authored policy and is left alone — a config the operator
+# narrowed by address (`host all all 10.0.0.0/8 …`), by database/user
+# (`host mydb appuser all …`), or by TLS (`hostssl …`) must never get a
+# wide-open `host all all all` silently appended under it: pg_hba is
+# first-match-wins, so the append would re-admit exactly the clients the
+# narrowing excluded. Likewise a file with NO host rules at all is a
+# deliberate local-only lockdown, not an initdb reset (initdb always writes
+# the loopback lines).
 PG_HBA_FILE="$PGDATA/pg_hba.conf"
+hba_has_loopback_host_rule() {
+  grep -qE "^[[:space:]]*host([[:space:]]+[^[:space:]]+){2}[[:space:]]+(127\.0\.0\.1/32|::1/128)([[:space:]]|$)" "$PG_HBA_FILE"
+}
+hba_has_authored_host_rule() {
+  grep -E "^[[:space:]]*host(ssl|nossl|gssenc|nogssenc)?[[:space:]]" "$PG_HBA_FILE" \
+    | grep -vE "[[:space:]](127\.0\.0\.1/32|::1/128)([[:space:]]|$)" | grep -q .
+}
 if [ -f "$POSTGRES_CONF_FILE" ] && [ -f "$PG_HBA_FILE" ] \
-  && ! grep -qE "^[[:space:]]*host(ssl|nossl|gssenc|nogssenc)?([[:space:]]+all){3}([[:space:]]|$)" "$PG_HBA_FILE"; then
-  echo "wrapper: pg_hba.conf has no 'host all all all' rule, re-appending (remote clients would be refused)"
+  && hba_has_loopback_host_rule && ! hba_has_authored_host_rule; then
+  echo "wrapper: pg_hba.conf holds only initdb's loopback host rules, re-appending the remote-access rule (remote clients would be refused)"
   cat >> "$PG_HBA_FILE" <<EOF
 
 host all all all ${POSTGRES_HOST_AUTH_METHOD:-scram-sha-256}
@@ -1561,10 +1603,21 @@ fork_post_upgrade_analyze() {
     for _ in $(seq 1 120); do
       if pg_isready -q -h /var/run/postgresql -p 5432 2>/dev/null; then
         echo "post-upgrade: rebuilding planner statistics in stages"
-        if vacuumdb --all --analyze-in-stages -h /var/run/postgresql -p 5432 -U postgres >/dev/null 2>&1; then
-          tmp_marker="${UPGRADE_MARKER_FILE}.tmp"
-          jq '.needsAnalyze = false' "$UPGRADE_MARKER_FILE" > "$tmp_marker" 2>/dev/null \
-            && mv "$tmp_marker" "$UPGRADE_MARKER_FILE"
+        # Connect as the cluster's actual superuser: a custom-POSTGRES_USER
+        # cluster has no 'postgres' role (the entrypoint initdb's with
+        # --username="$POSTGRES_USER"), and -U postgres would fail here on
+        # every boot forever.
+        if vacuumdb --all --analyze-in-stages -h /var/run/postgresql -p 5432 \
+             -U "${POSTGRES_USER:-postgres}" >/dev/null 2>&1; then
+          # mktemp, not a fixed .tmp suffix: fork_old_datadir_reclaim updates
+          # the same marker from a sibling fork, and a shared literal tmp
+          # path lets the two writers clobber each other's staged update.
+          if tmp_marker=$(mktemp "${UPGRADE_MARKER_FILE}.XXXX") \
+            && jq '.needsAnalyze = false' "$UPGRADE_MARKER_FILE" > "$tmp_marker" 2>/dev/null; then
+            mv "$tmp_marker" "$UPGRADE_MARKER_FILE"
+          else
+            rm -f "$tmp_marker" 2>/dev/null
+          fi
           echo "post-upgrade: statistics rebuild complete"
         else
           echo "post-upgrade: statistics rebuild failed; will retry on next boot"
@@ -1617,12 +1670,15 @@ fork_old_datadir_reclaim() {
       echo "post-upgrade: could not remove the pre-upgrade data dir; will retry on next boot"
       exit 0
     fi
-    tmp_marker="${UPGRADE_MARKER_FILE}.tmp"
-    if jq --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '.oldDataDirRemovedAt = $t' \
+    # mktemp for the same reason as fork_post_upgrade_analyze's marker
+    # update: two forks share this marker, a fixed tmp name lets them
+    # clobber each other's staged write.
+    if tmp_marker=$(mktemp "${UPGRADE_MARKER_FILE}.XXXX") \
+      && jq --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '.oldDataDirRemovedAt = $t' \
         "$UPGRADE_MARKER_FILE" > "$tmp_marker" 2>/dev/null; then
       mv "$tmp_marker" "$UPGRADE_MARKER_FILE"
     else
-      rm -f "$tmp_marker"
+      rm -f "$tmp_marker" 2>/dev/null
     fi
     echo "post-upgrade: pre-upgrade data dir reclaimed"
   ) &
