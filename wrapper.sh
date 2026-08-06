@@ -96,6 +96,23 @@ if [ -f "$UPGRADE_MARKER_FILE" ]; then
   fi
 fi
 
+# The marker above catches every phase pg_upgrade writes one for — but the
+# upgrade job only writes its FIRST marker on pg_upgrade's own success, so a
+# crash DURING pg_upgrade --link leaves no marker at all. pg_upgrade renames
+# global/pg_control to .old before it links the first relation file (its own
+# recovery advice is to rename it back), so this exact shape — .old present,
+# the real file absent — means a link was interrupted. PG_VERSION at the
+# PGDATA root is untouched by that rename, so it still matches THIS image's
+# major and the version-mismatch guard below would not catch it either;
+# without this check postgres would fail deep in startup with a bare "could
+# not open file "global/pg_control"" instead of naming the actual cause.
+if [ -f "$PGDATA/global/pg_control.old" ] && [ ! -f "$PGDATA/global/pg_control" ]; then
+  echo "This looks like an interrupted major version upgrade: pg_control is disabled (renamed to pg_control.old),"
+  echo "the shape pg_upgrade leaves if it crashes mid-link. A database major-version-upgrade job resolves this"
+  echo "volume; starting postgres against it directly will fail."
+  exit 1
+fi
+
 # The image's own major, for the mismatch guard. Filesystem first, PG_MAJOR
 # env second — deliberately in that order (mirrors postgres-ha's
 # image_major()): the installed server tree under /usr/lib/postgresql is

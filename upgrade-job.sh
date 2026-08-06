@@ -178,21 +178,31 @@ die() {
 # and appends startCommand as further args), so no single startCommand value
 # selects a mode on both. UPGRADE_JOB_MODE sidesteps that entirely — it
 # reaches the container the same way every other service variable already
-# does, regardless of which runtime or image is in play. Positional args are
-# kept only as a fallback for local/manual runs and the e2e harness, which
-# invoke this script directly (`upgrade-job.sh <mode>`) rather than through a
-# Railway deployment — and an unrecognized one dies rather than falling
-# through to the "upgrade" default: silently running the destructive path on
-# a typo'd read-only mode is exactly the failure this fallback must not have,
-# since manual/incident-response invocation is the only place it's reachable.
+# does, regardless of which runtime or image is in play.
+#
+# On Railway this env var is the ONLY dispatch mechanism, full stop — never
+# fall back to argv there. The image's own CMD ["upgrade"] always supplies a
+# recognized positional arg ($1="upgrade") on every real container start
+# regardless of runtime, so if the env var were ever lost (a mono-side bug,
+# a variable-injection regression), scanning argv would silently find
+# "upgrade" and run the single most destructive mode there is — including on
+# a resume dispatch that only meant to run `status` to decide roll-back vs
+# roll-forward. RAILWAY_ENVIRONMENT (same discriminator check_mount already
+# uses below) distinguishes a real deployment from local/manual/e2e use,
+# where positional args are the only invocation method and stay supported.
 MODE="${UPGRADE_JOB_MODE:-}"
-if [ -z "$MODE" ] && [ "$#" -gt 0 ]; then
-  for _arg in "$@"; do
-    case "$_arg" in
-      check | upgrade | status | manifest) MODE="$_arg" ;;
-    esac
-  done
-  [ -n "$MODE" ] || die 2 "no recognized mode among arguments: $* (expected one of: check, upgrade, status, manifest)"
+if [ -z "$MODE" ]; then
+  if [ -n "${RAILWAY_ENVIRONMENT:-}" ]; then
+    die 2 "UPGRADE_JOB_MODE is not set on a Railway deployment — refusing to guess a mode from argv (the image's own CMD supplies one, which would silently run the wrong mode)"
+  fi
+  if [ "$#" -gt 0 ]; then
+    for _arg in "$@"; do
+      case "$_arg" in
+        check | upgrade | status | manifest) MODE="$_arg" ;;
+      esac
+    done
+    [ -n "$MODE" ] || die 2 "no recognized mode among arguments: $* (expected one of: check, upgrade, status, manifest)"
+  fi
 fi
 MODE="${MODE:-upgrade}"
 
@@ -338,6 +348,18 @@ refuse_recovery_shapes() {
 # mid-flight leaves exactly that state, so recover it here — start the OLD
 # server so it replays its WAL, then shut it down cleanly. Isolated to a unix
 # socket in /tmp with no TCP listener, so nothing can connect meanwhile.
+#
+# On a PITR-enabled volume this server still has archive_mode/archive_command
+# configured (conf.d/pgbackrest.conf lives in PGDATA), and this image ships
+# no pgbackrest — every segment it tries to archive fails loudly (exit 127)
+# for the whole quiesce. That's the correct behavior, not noise to silence:
+# the segments stay .ready, nothing gets falsely marked archived, and a
+# rollback to the old image resumes pushing them. "Fixing" the log spam with
+# archive_command=/bin/true or -c archive_mode=off would punch a real WAL
+# hole into the rollback path. The unavoidable side effect either way: WAL
+# written between the last successful push and the upgrade never reaches the
+# old archive prefix — the pre-upgrade backup is what covers that point, not
+# the archive.
 ensure_clean_shutdown() {
   local state
   state="$(cluster_state)"
@@ -479,13 +501,14 @@ init_new_cluster() {
   # cluster the image-default initdb can never pair with. Replay the same
   # env the same way (eval, mirroring docker-entrypoint's quoting; the var
   # is the operator's own service variable, the exact trust the entrypoint
-  # already extends at every init). Our flags come LAST so --username and
-  # -D always win over anything in the user args; checksum parity stays
-  # owned by checksum_flag, derived from the old cluster's pg_controldata —
-  # which already reflects whatever the init args chose. pg_upgrade --check
-  # remains the final arbiter of the pairing. The superuser must be the OLD
-  # cluster's install user (see PG_SUPERUSER).
-  eval 'as_postgres "$NEW_BINDIR/initdb" '"$(checksum_flag) ${POSTGRES_INITDB_ARGS:-}"' --username="$PG_SUPERUSER" -D "$target_dir"' >/dev/null \
+  # already extends at every init). checksum_flag comes AFTER the user args
+  # (initdb is last-wins on a repeated toggle flag) so a stale --data-
+  # checksums/--no-data-checksums the user happened to carry in the var can
+  # never override the parity this job derived from the OLD cluster's own
+  # pg_controldata — --username and -D come last of all so they always win
+  # too. pg_upgrade --check remains the final arbiter of the pairing. The
+  # superuser must be the OLD cluster's install user (see PG_SUPERUSER).
+  eval 'as_postgres "$NEW_BINDIR/initdb" '"${POSTGRES_INITDB_ARGS:-} $(checksum_flag)"' --username="$PG_SUPERUSER" -D "$target_dir"' >/dev/null \
     || die 3 "initdb of the target cluster failed"
 }
 
@@ -548,6 +571,12 @@ print_check_details() {
 # ----- modes ------------------------------------------------------------------
 
 mode_status() {
+  # check and upgrade both refuse on a bad mount; status must too — the
+  # workflow's roll-back/roll-forward decision needs the mount to actually
+  # be the volume it thinks it's reading, not a report that's
+  # byte-identical in shape to "fresh volume, nothing has ever happened
+  # here" for a container whose volume didn't attach right.
+  check_mount
   local phase from to major
   if [ -f "$MARKER_FILE" ] && [ -z "$(read_marker_field phase)" ]; then
     # A marker that exists but can't be read (or has no phase) means an
@@ -692,7 +721,7 @@ finish_swap() {
   # data dir at all" when the new dir was lost or is a partial initdb.
   if [ "$(data_major)" != "$TO_MAJOR" ] \
     && [ "$(cat "$NEW_DATA_DIR/PG_VERSION" 2>/dev/null)" != "$TO_MAJOR" ]; then
-    die 3 "cannot finish the swap: $NEW_DATA_DIR is missing or is not a $TO_MAJOR cluster — volume left untouched; restore the pre-upgrade backup or re-run the upgrade from scratch"
+    die 3 "cannot finish the swap: $NEW_DATA_DIR is missing or is not a $TO_MAJOR cluster — volume left untouched; a plain re-run dies here again (the marker still says upgraded), restore the pre-upgrade backup or remove the marker to redo pg_upgrade from scratch"
   fi
 
   # Before the renames, carry auth config + PITR sentinels from wherever the

@@ -394,19 +394,36 @@ t_check_blocker() {
   stop_pg blocker2-pg
 }
 
-# reg*/aclitem columns block ONLY from a pre-16 source. Runs on the pairs
-# where that gating says it must fire, and asserts pg_upgrade agrees — this is
-# the ground truth the dashboard preflight's version gating mirrors.
+# reg*/aclitem columns never block from a >=16 source (verified for 16→17);
+# whether they block from any GIVEN pre-16 source is not a clean rule —
+# empirically, 15→16 fires both, but 14→15 fires neither (pg_upgrade's own
+# checks evidently depend on what changed across that specific pair's span,
+# not on the source major alone). This runs on whichever pre-16 pair the
+# suite is invoked with and asserts pg_upgrade agrees with what THAT pair
+# is known to do — it is not a general statement about every pre-16 source.
+# This is the same real-world gating the dashboard preflight's version
+# check mirrors.
+#
+# Seeded and checked SEPARATELY, not both columns in one cluster: pg_upgrade
+# runs its consistency checks in a fixed sequence and stops at the first
+# fatal one, so with both columns present the reg* check (which comes first)
+# preempts aclitem's — its message never prints, not because the gating
+# didn't fire, but because that check never ran.
 t_check_blocker_pre16_types() {
   if [ "$FROM_VERSION" -ge 16 ]; then
-    note "skipped: reg*/aclitem checks only fire from a pre-16 source"
+    note "skipped: only verified to fire on a pre-16 source (16→17 confirmed clean)"
     return 0
   fi
   local vol="upg-e2e-pre16types"
-  seed_from_cluster "$vol" "CREATE TABLE t_aclitem (c aclitem); CREATE TABLE t_regproc (c regproc)" || return 1
+  seed_from_cluster "$vol" "CREATE TABLE t_regproc (c regproc)" || return 1
   run_job "$vol" check
-  assert_eq "$JOB_RC" 1 "check exit code with pre-16 type blockers" || { echo "$JOB_OUT" | tail -20; return 1; }
+  assert_eq "$JOB_RC" 1 "check exit code with a reg* blocker" || { echo "$JOB_OUT" | tail -20; return 1; }
   assert_contains "$JOB_OUT" "reg* data types" "reg* blocker named" || return 1
+
+  local vol2="upg-e2e-pre16types-aclitem"
+  seed_from_cluster "$vol2" "CREATE TABLE t_aclitem (c aclitem)" || return 1
+  run_job "$vol2" check
+  assert_eq "$JOB_RC" 1 "check exit code with an aclitem blocker" || { echo "$JOB_OUT" | tail -20; return 1; }
   assert_contains "$JOB_OUT" "aclitem" "aclitem blocker named" || return 1
 }
 
@@ -599,6 +616,19 @@ t_boot_refused_mid_upgrade() {
   in_volume "$vol" "rm -f $MARKER_PATH"
 }
 
+# The upgrade job only writes its first marker on pg_upgrade's own success —
+# a crash DURING --link leaves no marker at all. pg_control.old present with
+# pg_control absent (pg_upgrade renames it before linking the first relation
+# file) is that exact shape, and PG_VERSION is untouched by the rename, so it
+# still matches the FROM image — the version-mismatch guard would not catch
+# this either without a dedicated check.
+t_pg_control_disabled_without_marker_refused() {
+  local vol="upg-e2e-pgcontrolold"
+  seed_from_cluster "$vol" || return 1
+  in_volume "$vol" "mv $PGDATA_IN_VOLUME/global/pg_control $PGDATA_IN_VOLUME/global/pg_control.old" || return 1
+  expect_boot_refusal "$vol" "$FROM_IMAGE" "interrupted major version upgrade" || return 1
+}
+
 # Crash between the two directory renames: marker=upgraded, old dir moved
 # aside, no $PGDATA. Re-running the job completes the swap deterministically.
 t_resume_after_crash_between_swaps() {
@@ -764,6 +794,51 @@ t_second_upgrade_reaches_next_major() {
   assert_eq "$(psql_in chain-pg 'SELECT count(*) FROM upgrade_canary')" "1000" "data intact after two upgrades" || return 1
   assert_contains "$(psql_in chain-pg 'SHOW server_version')" "$CHAIN_VERSION." "server is TO+1" || return 1
   stop_pg chain-pg
+}
+
+# checksum_flag derives the target's --data-checksums / --no-data-checksums
+# from the OLD cluster's own pg_controldata, specifically so a user's stale
+# POSTGRES_INITDB_ARGS can't mismatch the pairing. That only protects
+# anything when the derived flag is non-empty AND initdb is last-wins on a
+# repeated toggle — which needs a target where --no-data-checksums actually
+# exists (18+, where the default flipped to ON), so this rides the chain
+# pair (17→18 by default) rather than the suite's main FROM→TO. Without the
+# derived flag coming after the user's in the initdb invocation, this would
+# refuse at --check with "old cluster does not use data checksums but the
+# new one does" instead of upgrading.
+t_custom_initdb_args_checksums_flag_wins() {
+  if [ ! -f "$REPO_ROOT/Dockerfile.${CHAIN_VERSION}" ]; then
+    note "skipped: no Dockerfile.${CHAIN_VERSION} to chain onto"
+    return 0
+  fi
+  if [ "$CHAIN_VERSION" -lt 18 ]; then
+    # --no-data-checksums doesn't exist before 18 (added alongside the
+    # default flip), so checksum_flag() derives nothing for a checksums-off
+    # old cluster below that target — there is no override for this test to
+    # prove wins, and the user's --data-checksums would legitimately take
+    # effect and mismatch. Needs a real 18+ target; this suite's own
+    # FROM/TO env vars decide which pair the chain lands on.
+    note "skipped: chain target $CHAIN_VERSION predates --no-data-checksums (needs 18+)"
+    return 0
+  fi
+  ensure_chain_images || return 1
+  local vol="upg-e2e-checksumflag"
+  seed_from_cluster "$vol" || return 1
+  run_job "$vol" upgrade
+  assert_eq "$JOB_RC" 0 "first upgrade (to the checksums-off default) exit code" || { echo "$JOB_OUT" | tail -20; return 1; }
+
+  JOB_OUT=$(docker run --rm --label postgres-upgrade-e2e=1 \
+    -e "PGDATA=$PGDATA_IN_VOLUME" -e "POSTGRES_INITDB_ARGS=--data-checksums" \
+    -v "$vol:/var/lib/postgresql/data" \
+    "$CHAIN_JOB_IMAGE" upgrade 2>&1)
+  JOB_RC=$?
+  assert_eq "$JOB_RC" 0 "chain upgrade succeeds despite a contradicting POSTGRES_INITDB_ARGS" || { echo "$JOB_OUT" | tail -30; return 1; }
+  assert_eq "$(volume_data_major "$vol")" "$CHAIN_VERSION" "data major after chain upgrade" || return 1
+
+  local checksum_version
+  checksum_version=$(docker run --rm -v "$vol:/var/lib/postgresql/data" --entrypoint /bin/sh "$CHAIN_JOB_IMAGE" \
+    -c "/usr/lib/postgresql/${CHAIN_VERSION}/bin/pg_controldata $PGDATA_IN_VOLUME 2>/dev/null | awk -F: '/Data page checksum version/ {gsub(/ /,\"\",\$2); print \$2}'")
+  assert_eq "$checksum_version" "0" "derived checksum_flag won — target matches the OLD cluster, not the user's stale flag" || return 1
 }
 
 # An in-flight (phase=upgraded) marker belonging to a DIFFERENT version pair
@@ -1384,6 +1459,26 @@ t_upgrade_job_mode_env_var_selects_mode() {
   assert_eq "$(volume_data_major "$vol")" "$FROM_VERSION" "status is read-only — data untouched" || return 1
 }
 
+# The image's own CMD ["upgrade"] means every real container start supplies
+# a RECOGNIZED positional arg regardless of runtime — an unrecognized-arg
+# refusal (see t_unrecognized_positional_arg_refused) does nothing to catch
+# a lost UPGRADE_JOB_MODE in production, because "upgrade" isn't unrecognized,
+# it's the single most destructive mode there is. Simulates that exact shape:
+# RAILWAY_ENVIRONMENT set (a real deployment), UPGRADE_JOB_MODE missing, and
+# the positional arg the CMD would supply.
+t_railway_env_without_mode_var_refused() {
+  local vol="upg-e2e-railwaynomode"
+  seed_from_cluster "$vol" || return 1
+
+  JOB_OUT=$(docker run --rm --label postgres-upgrade-e2e=1 \
+    -e "PGDATA=$PGDATA_IN_VOLUME" -e "RAILWAY_ENVIRONMENT=production" \
+    -v "$vol:/var/lib/postgresql/data" "$JOB_IMAGE" upgrade 2>&1)
+  JOB_RC=$?
+  assert_eq "$JOB_RC" 2 "refuses on Railway without UPGRADE_JOB_MODE, despite a recognized positional arg" || { echo "$JOB_OUT" | tail -20; return 1; }
+  assert_contains "$JOB_OUT" "UPGRADE_JOB_MODE is not set" "refusal names the missing env var" || return 1
+  assert_eq "$(volume_data_major "$vol")" "$FROM_VERSION" "volume untouched — did not silently upgrade" || return 1
+}
+
 # ----- runner -----------------------------------------------------------------
 ALL_TESTS=(
   t_vanilla_boot
@@ -1402,10 +1497,12 @@ ALL_TESTS=(
   t_old_image_on_upgraded_data
   t_mismatch_boot_failstop
   t_boot_refused_mid_upgrade
+  t_pg_control_disabled_without_marker_refused
   t_resume_after_crash_between_swaps
   t_remote_auth_survives_upgrade
   t_pitr_fork_survives_upgrade
   t_second_upgrade_reaches_next_major
+  t_custom_initdb_args_checksums_flag_wins
   t_foreign_pair_upgraded_marker_refused
   t_job_refused_while_runtime_live
   t_runtime_refused_while_job_locked
@@ -1429,6 +1526,7 @@ ALL_TESTS=(
   t_railway_private_domain_pghost_ignored
   t_unrecognized_positional_arg_refused
   t_upgrade_job_mode_env_var_selects_mode
+  t_railway_env_without_mode_var_refused
 )
 
 TESTS=("${@:-}")

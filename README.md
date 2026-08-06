@@ -562,6 +562,13 @@ expiry/cleanup for orphaned `cluster-*` prefixes (after a safety window) is
 an open follow-up, tracked for the dashboard/backboard side; the image does
 not delete archive data.
 
+There's also a small tail gap at the old prefix specifically: WAL written
+between the old cluster's last successful archive push and the upgrade
+never reaches the old prefix (the upgrade job's own quiesce step archives
+nothing new — see `ensure_clean_shutdown`'s docblock). The pre-upgrade
+backup this feature always takes is what covers that point, not the old
+archive.
+
 Tests: `./test/e2e-upgrade.sh` (add `FROM_VERSION=14 TO_VERSION=17` to cover a
 pre-16 source, where pg_upgrade's `reg*`/`aclitem` checks fire). CI runs the
 harness on 16→17 and 17→18 — the latter pins the initdb data-checksums
