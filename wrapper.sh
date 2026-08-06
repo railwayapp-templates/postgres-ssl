@@ -113,6 +113,24 @@ if [ -f "$PGDATA/global/pg_control.old" ] && [ ! -f "$PGDATA/global/pg_control" 
   exit 1
 fi
 
+# Belt-and-suspenders for a crash between finish_swap's two renames: PGDATA
+# itself is gone at that point (renamed to .old-<from>), so neither guard
+# above has anything to check — the pg_control.old one above looks under
+# $PGDATA, which no longer exists. No legitimate first init ever has
+# upgrade-job sibling directories sitting next to an empty/missing PGDATA;
+# only a job that started swapping directories and never finished does.
+# Without this, docker-entrypoint would initdb a fresh empty cluster over
+# what's actually a split, unfinished upgrade sitting in those siblings.
+if [ ! -f "$PGDATA/PG_VERSION" ] \
+  && { compgen -G "${PGDATA}.upgrade-*" >/dev/null 2>&1 || compgen -G "${PGDATA}.old-*" >/dev/null 2>&1; }; then
+  echo "PGDATA is empty or missing, but upgrade-job sibling directories exist next to it"
+  echo "(${PGDATA}.upgrade-* / ${PGDATA}.old-*) — this looks like an interrupted major version"
+  echo "upgrade caught mid-swap, not a fresh volume. A database major-version-upgrade job"
+  echo "resolves this volume; starting postgres against it directly would initdb a new, empty"
+  echo "cluster over real data sitting in those siblings."
+  exit 1
+fi
+
 # The image's own major, for the mismatch guard. Filesystem first, PG_MAJOR
 # env second — deliberately in that order (mirrors postgres-ha's
 # image_major()): the installed server tree under /usr/lib/postgresql is
@@ -1595,10 +1613,15 @@ fi
 # subshells. Customer-set PGHOST=${{ Postgres.RAILWAY_PRIVATE_DOMAIN }} (a
 # common app-side pattern) leaks into pgbackrest's libpq calls — pgbackrest
 # then tries to connect to itself via the privnet domain and times out
-# (`unable to find primary cluster`). A local-only connection is what we want
-# from inside the container; clearing PGHOST/PGPORT lets libpq fall back to
-# the Unix socket.
+# (`unable to find primary cluster`). PGHOSTADDR is the same hazard: libpq
+# honors it even over an explicit -h to the local socket, so it silently
+# breaks stanza bootstrap, the watcher's probes, and everything else forked
+# below that talks libpq — the exact class upgrade-job.sh's own PGHOST/
+# PGHOSTADDR/PGPORT clearing cites this block as precedent for. A local-only
+# connection is what we want from inside the container; clearing all three
+# lets libpq fall back to the Unix socket.
 unset PGHOST
+unset PGHOSTADDR
 unset PGPORT
 
 # Write the per-cluster repo-path marker synchronously when archive is on

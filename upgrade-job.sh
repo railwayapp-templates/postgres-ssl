@@ -841,6 +841,22 @@ mode_upgrade() {
         if [ -f "$NEW_DATA_DIR/.railway_pg_upgrade_complete" ] \
           && [ "$(cat "$NEW_DATA_DIR/PG_VERSION" 2>/dev/null)" = "$TO_MAJOR" ]; then
           log "no marker, but the disk shape shows a finished pg_upgrade (pg_control.old present, completion sentinel in the $TO_MAJOR dir) — resuming directory swap"
+          # Every other route into finish_swap is entered with a
+          # phase=upgraded marker already durably on disk; this is the one
+          # resume path that reconstructs the same conclusion from disk
+          # shape instead. Without a marker here, a crash between
+          # finish_swap's two renames leaves $PGDATA absent, both sibling
+          # dirs holding the split cluster, and nothing — no marker, no
+          # $PGDATA/PG_VERSION for wrapper.sh's guards to key on — to say so:
+          # a re-run wedges ("nothing to upgrade"), status reports
+          # phase=none (indistinguishable from a fresh volume), and a
+          # runtime boot would initdb an empty cluster over the wreckage.
+          # Writing the marker first makes this call site symmetric with
+          # the other two: any crash from here on is the already-covered
+          # "resume from an upgraded marker" case.
+          write_marker "$(jq -nc \
+            --arg from "$FROM_MAJOR" --arg to "$TO_MAJOR" \
+            '{phase: "upgraded", from: $from, to: $to, upgradedAt: (now | todate)}')"
           finish_swap
         fi
         log "pg_control.old present without a completion sentinel — pg_upgrade crashed mid-run; rolling back to the old cluster and re-running the upgrade"

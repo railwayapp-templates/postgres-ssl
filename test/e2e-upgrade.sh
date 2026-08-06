@@ -629,6 +629,29 @@ t_pg_control_disabled_without_marker_refused() {
   expect_boot_refusal "$vol" "$FROM_IMAGE" "interrupted major version upgrade" || return 1
 }
 
+# Belt-and-suspenders guard for a crash between finish_swap's two renames:
+# $PGDATA itself is gone at that point (renamed to .old-<from>), so the
+# pg_control.old guard above (which looks under $PGDATA) has nothing to
+# check — this is the shape only the sibling-directory check catches.
+# Reconstructs the disk exactly as a crash there would leave it: no
+# $PGDATA, the old (disabled) cluster at .old-<from>, the finished new
+# cluster at .upgrade-<to>, no marker.
+t_upgrade_siblings_without_pgdata_refused() {
+  local vol="upg-e2e-siblingsnodata"
+  seed_from_cluster "$vol" || return 1
+  run_job "$vol" upgrade
+  assert_eq "$JOB_RC" 0 "initial upgrade" || { echo "$JOB_OUT" | tail -20; return 1; }
+  in_volume "$vol" "
+    set -e
+    cd /var/lib/postgresql/data
+    mv pgdata pgdata.upgrade-${TO_VERSION}
+    rm -f $MARKER_PATH
+  " || return 1
+  expect_boot_refusal "$vol" "$TO_IMAGE" "upgrade-job sibling directories exist" || return 1
+  in_volume "$vol" "test -d ${PGDATA_IN_VOLUME}.upgrade-${TO_VERSION}" \
+    || { echo "  sibling directory got touched despite the refusal"; return 1; }
+}
+
 # Crash between the two directory renames: marker=upgraded, old dir moved
 # aside, no $PGDATA. Re-running the job completes the swap deterministically.
 t_resume_after_crash_between_swaps() {
@@ -996,6 +1019,16 @@ t_marker_lost_after_pg_upgrade_resumes() {
     rm -f $MARKER_PATH
   " || return 1
 
+  # This resume now writes a phase=upgraded marker before calling
+  # finish_swap (matching the other two entries into it), closing a window
+  # where a crash between finish_swap's two renames during THIS specific
+  # path left no marker at all — a black-box success-path assertion can't
+  # distinguish that fix being present from absent (finish_swap's own final
+  # write lands "completed" either way), so this is verified by code
+  # reading, not by this test. t_upgrade_siblings_without_pgdata_refused is
+  # the actual regression backstop: it proves wrapper.sh now refuses to
+  # boot on the disk shape that ordering gap could have produced, whatever
+  # its root cause.
   run_job "$vol" upgrade
   assert_eq "$JOB_RC" 0 "marker-less resume exit code" || { echo "$JOB_OUT" | tail -20; return 1; }
   assert_contains "$JOB_OUT" "disk shape shows a finished pg_upgrade" "roll-forward inferred from disk" || return 1
@@ -1498,6 +1531,7 @@ ALL_TESTS=(
   t_mismatch_boot_failstop
   t_boot_refused_mid_upgrade
   t_pg_control_disabled_without_marker_refused
+  t_upgrade_siblings_without_pgdata_refused
   t_resume_after_crash_between_swaps
   t_remote_auth_survives_upgrade
   t_pitr_fork_survives_upgrade

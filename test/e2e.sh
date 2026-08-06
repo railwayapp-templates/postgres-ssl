@@ -304,6 +304,7 @@ wait_for_log_line() {
 }
 
 cleanup_test_resources() {
+  [ "${E2E_KEEP_CONTAINERS:-0}" = "1" ] && return 0
   docker rm -f $(docker ps -aq --filter "label=postgres-ssl-e2e=1") 2>/dev/null >/dev/null || true
   for v in $(docker volume ls -q --filter "label=postgres-ssl-e2e=1" 2>/dev/null); do
     docker volume rm "$v" >/dev/null 2>&1 || true
@@ -474,6 +475,61 @@ t_archiving_boot() {
     return
   fi
   ok t_archiving_boot
+  docker rm -f "$name" >/dev/null
+  docker volume rm "$vol" >/dev/null
+}
+
+# A service that sets PGHOSTADDR (an app-side pattern equivalent to the
+# PGHOST=${{ Postgres.RAILWAY_PRIVATE_DOMAIN }} case above) must not break
+# stanza bootstrap: libpq honors PGHOSTADDR even over an explicit -h to the
+# local socket, so pgbackrest's stanza-create subshell would otherwise try
+# to reach itself over the (bogus, non-local) address instead of falling
+# back to the socket. wrapper.sh clears it alongside PGHOST/PGPORT before
+# forking those subshells.
+t_archiving_boot_survives_pghostaddr() {
+  local name=t-arch-pghostaddr-${PG_VERSION}
+  local vol=${name}-vol
+  reset_bucket
+  new_volume "$vol"
+  docker rm -f "$name" >/dev/null 2>&1 || true
+  run_archiving_pg "$name" "$vol" -e "PGHOSTADDR=10.255.255.1"
+  docker container update --label-add postgres-ssl-e2e=1 "$name" >/dev/null 2>&1 || true
+  # wait_for_pg's own readiness probe (docker exec ... pg_isready, no -h)
+  # would ALWAYS fail here regardless of wrapper.sh's own fix, and NOT
+  # because of an -h precedence subtlety: verified empirically that
+  # PGHOSTADDR overrides even an explicit socket-path -h (pg_isready -h
+  # /var/run/postgresql still tries the bogus TCP address and fails) — it
+  # unconditionally forces a TCP connection to that address, full stop.
+  # This is a test-infrastructure limitation, not the product's: `docker
+  # exec` always sees the CONTAINER's declared env (what `docker run -e`
+  # set), never whatever wrapper.sh's already-running process later unset
+  # in its own memory — an unset inside one process can't retroactively
+  # change what a brand-new exec'd process sees, and there is no `-h` value
+  # that out-ranks PGHOSTADDR once it's present in that process's own
+  # environment. So the check itself must clear it for the exec, same as
+  # wrapper.sh clears it for what it forks.
+  local deadline=$(($(date +%s) + 120)) ready=0
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if docker exec -e PGHOSTADDR= "$name" pg_isready -U postgres -q 2>/dev/null; then
+      ready=1
+      break
+    fi
+    sleep 1
+  done
+  [ "$ready" = "1" ] || { ko t_archiving_boot_survives_pghostaddr "postgres did not start"; fail_dump t_archiving_boot_survives_pghostaddr "$name"; return; }
+
+  # A wider deadline than t_archiving_boot's 15s: stanza-create can hit a
+  # transient lock-contention retry (30s backoff, unrelated to PGHOSTADDR —
+  # reproduced with the same shape and timing on a plain manual boot) before
+  # succeeding.
+  local sc_deadline=$(($(date +%s) + 60)) found=0
+  while [ "$(date +%s)" -lt "$sc_deadline" ]; do
+    if docker logs "$name" 2>&1 | grep -q "stanza-create completed"; then found=1; break; fi
+    sleep 1
+  done
+  [ "$found" = "1" ] || { ko t_archiving_boot_survives_pghostaddr "stanza-create did not complete despite PGHOSTADDR"; fail_dump t_archiving_boot_survives_pghostaddr "$name"; return; }
+
+  ok t_archiving_boot_survives_pghostaddr
   docker rm -f "$name" >/dev/null
   docker volume rm "$vol" >/dev/null
 }
@@ -4445,6 +4501,7 @@ ALL_TESTS=(
   t_vanilla_boot
   t_invalid_bucket_skips_archive
   t_archiving_boot
+  t_archiving_boot_survives_pghostaddr
   t_alter_system_survives_restart
   t_s3_unreachable_pg_stays_up
   t_queue_max_5gib_trips
