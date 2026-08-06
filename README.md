@@ -397,10 +397,18 @@ must roll **forward**; `completed` means the swap is done. Both phases are
 scoped to the marker's own version pair — a `completed` marker from a
 previous upgrade of the same volume is history, not state, so chained
 upgrades (16→17, later 17→18) work; an in-flight marker of a foreign pair
-is refused. If the marker is lost in the one window where roll-back is
-impossible (post-pg_upgrade, the old cluster's `pg_control` is renamed
-away), the job re-infers the roll-forward from the disk shape itself.
-`wrapper.sh` refuses to boot while a non-completed marker exists, and
+is refused. pg_upgrade disables the old cluster (renames its `pg_control`
+to `pg_control.old`) **before** it links the first user relation file —
+verified empirically, and pg_upgrade's own output prescribes the rename-back
+as the recovery — so that rename alone never drives a roll-forward. If the
+marker is lost, the job rolls forward only when its own completion sentinel
+(written inside the target dir the moment pg_upgrade exits 0) is present;
+`pg_control.old` without the sentinel is a crash mid-link, and the job rolls
+back instead — it reverses the rename (safe while the target cluster has
+never been started) and redoes the upgrade from scratch. The same rename-back
+runs when pg_upgrade itself fails after disabling the old cluster, so that
+failure leaves a bootable FROM-major volume rather than forcing a backup
+restore. `wrapper.sh` refuses to boot while a non-completed marker exists, and
 refuses any image whose major differs from the on-disk `PG_VERSION` — so no
 mismatched boot can touch the data.
 

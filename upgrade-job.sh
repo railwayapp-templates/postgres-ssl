@@ -33,11 +33,16 @@
 #   absent               — nothing committed; any failure rolls back. One
 #                          exception: when the disk shape itself proves
 #                          pg_upgrade finished (old cluster's pg_control
-#                          renamed to pg_control.old AND the new dir's
-#                          PG_VERSION is the target major), upgrade mode
-#                          rolls FORWARD — the old cluster can no longer be
-#                          started, so a lost marker must not brick the
-#                          volume.
+#                          renamed to pg_control.old AND the job's own
+#                          completion sentinel inside the target-major new
+#                          dir), upgrade mode rolls FORWARD — a lost marker
+#                          must not brick the volume. pg_control.old alone
+#                          proves only that pg_upgrade STARTED linking (the
+#                          rename lands before the first user file is
+#                          linked — verified empirically), so without the
+#                          sentinel the job rolls BACK instead: it reverses
+#                          the rename (safe while the new cluster has never
+#                          been started) and redoes the upgrade.
 #   phase == "upgraded"  — pg_upgrade succeeded; directory swap may be
 #                          incomplete. Roll FORWARD (re-run upgrade mode).
 #   phase == "completed" — swap done; the runtime image of TO major boots.
@@ -63,6 +68,21 @@ TO_MAJOR="${PG_UPGRADE_TO:?PG_UPGRADE_TO not set}"
 # the right name there; ad-hoc runs against a custom-user volume need -e.
 PG_SUPERUSER="${POSTGRES_USER:-postgres}"
 
+# The quiesce (WAL replay + clean stop) shares this timeout for both the
+# start and the stop. An interrupted crash recovery persists NO progress —
+# verified empirically (killed while pg_control said "in crash recovery":
+# the checkpoint pointer had not moved): restartpoints can only land on
+# replayed CHECKPOINT records, and the replay range — the last completed
+# checkpoint's redo point to WAL end — contains none by construction. So
+# every retry replays the same WAL from scratch, and a volume whose replay
+# genuinely outruns this timeout (a customer-raised max_wal_size on a slow
+# disk) would die 3 forever with no way to give it more time short of
+# editing the image. The job is already a stop-the-world window; a generous
+# override costs nothing. pg_ctl's timeout also does NOT stop the server —
+# it keeps recovering until this container's exit SIGKILLs it, which is the
+# same unclean state we started from.
+UPGRADE_QUIESCE_TIMEOUT_SECONDS="${UPGRADE_QUIESCE_TIMEOUT_SECONDS:-600}"
+
 EXPECTED_VOLUME_MOUNT_PATH="/var/lib/postgresql/data"
 VOLUME_ROOT="$EXPECTED_VOLUME_MOUNT_PATH"
 # The dispatcher must pass the SERVICE's own PGDATA to this container. The
@@ -87,9 +107,39 @@ NEW_BINDIR="/usr/lib/postgresql/${TO_MAJOR}/bin"
 NEW_DATA_DIR="${PGDATA}.upgrade-${TO_MAJOR}"
 OLD_KEEP_DIR="${PGDATA}.old-${FROM_MAJOR}"
 
-MODE="${1:-upgrade}"
+# Scan every positional arg for a recognized mode instead of trusting $1
+# alone. Railway's two container runtimes disagree on how a deployment's
+# startCommand combines with the image's own ENTRYPOINT: one REPLACES the
+# entrypoint outright (so the dispatcher must send the script name itself,
+# "upgrade-job.sh <mode>", or the exec target is a nonexistent program named
+# literally "check"/"upgrade"), the other KEEPS the entrypoint and appends
+# startCommand as further args (so that same two-word command arrives as
+# "upgrade-job.sh upgrade-job.sh <mode>" — the script's own name twice). A
+# bare positional read ($1) is correct for only one of those two shapes;
+# scanning for the first arg that IS a known mode is correct for both, and
+# for every existing bare-mode caller (local runs, the e2e harness) too.
+MODE="upgrade"
+for _arg in "$@"; do
+  case "$_arg" in
+    check | upgrade | status | manifest) MODE="$_arg" ;;
+  esac
+done
 
 log() { echo "upgrade-job: $*"; }
+# pg_upgrade's own combined output is forwarded verbatim for diagnosability,
+# and it can embed attacker-chosen bytes: a database/role/tablespace name a
+# superuser controls can appear in its check messages, and Postgres allows a
+# literal newline inside a quoted identifier. The existing jq hardening on
+# RAILWAY_UPGRADE_RESULT closes value injection into OUR OWN payload, but a
+# crafted identifier containing "\nRAILWAY_UPGRADE_RESULT: {...}\n" would ride
+# through a bare `log "$out"` as an indistinguishable extra line — and the
+# real sentinel always prints last, so whichever scraping convention the
+# dispatcher uses, an attacker-controlled earlier line is the wrong thing to
+# risk matching. Prefix every line so none of them can start with the literal
+# sentinel string.
+log_upgrade_output() {
+  printf '%s\n' "$1" | sed 's/^/  pg_upgrade: /'
+}
 # Machine-readable result line the workflow scrapes from the job logs.
 result() {
   echo "RAILWAY_UPGRADE_RESULT: $1"
@@ -252,6 +302,9 @@ ensure_clean_shutdown() {
       return 0
       ;;
     "")
+      if [ -f "$PGDATA/global/pg_control.old" ]; then
+        die 2 "no pg_control at $PGDATA but pg_control.old exists — an interrupted pg_upgrade disabled this cluster; run upgrade mode, which restores it and re-runs"
+      fi
       die 2 "could not read cluster state from $PGDATA (pg_controldata failed)"
       ;;
   esac
@@ -262,11 +315,11 @@ ensure_clean_shutdown() {
   # discarding them leaves the job log with nothing but a generic message.
   local quiesce_log="/tmp/pg-quiesce.log"
   rm -f "$quiesce_log"
-  as_postgres "$OLD_BINDIR/pg_ctl" -D "$PGDATA" -w -t 600 -l "$quiesce_log" \
+  as_postgres "$OLD_BINDIR/pg_ctl" -D "$PGDATA" -w -t "$UPGRADE_QUIESCE_TIMEOUT_SECONDS" -l "$quiesce_log" \
     -o "-c listen_addresses='' -k /tmp" start >/dev/null 2>&1 \
-    || { print_quiesce_log "$quiesce_log"; die 3 "the old server could not start to complete crash recovery (server log above)"; }
-  as_postgres "$OLD_BINDIR/pg_ctl" -D "$PGDATA" -w -t 600 -m fast stop >/dev/null 2>&1 \
-    || { print_quiesce_log "$quiesce_log"; die 3 "the old server did not shut down cleanly after recovery (server log above)"; }
+    || { print_quiesce_log "$quiesce_log"; die 3 "the old server could not start to complete crash recovery within ${UPGRADE_QUIESCE_TIMEOUT_SECONDS}s (server log above; override with UPGRADE_QUIESCE_TIMEOUT_SECONDS)"; }
+  as_postgres "$OLD_BINDIR/pg_ctl" -D "$PGDATA" -w -t "$UPGRADE_QUIESCE_TIMEOUT_SECONDS" -m fast stop >/dev/null 2>&1 \
+    || { print_quiesce_log "$quiesce_log"; die 3 "the old server did not shut down cleanly after recovery within ${UPGRADE_QUIESCE_TIMEOUT_SECONDS}s (server log above)"; }
 
   state="$(cluster_state)"
   case "$state" in
@@ -280,6 +333,22 @@ print_quiesce_log() {
   echo "----- old server log ($1) -----"
   tail -100 "$1"
   echo "----- end of old server log -----"
+}
+
+# Reverse pg_upgrade's disable of the old cluster. pg_upgrade renames
+# global/pg_control to pg_control.old BEFORE it links the first user
+# relation file (verified empirically on 16->17; its own failure output
+# prescribes this rename-back as the recovery), so a crash anywhere in the
+# link phase leaves the old cluster intact but unstartable. Renaming back
+# is safe exactly while the NEW cluster has never been started — linking
+# never modifies the old cluster's files, and this job never starts the
+# target cluster — which is pg_upgrade's own documented criterion.
+restore_disabled_pg_control() {
+  [ -f "$PGDATA/global/pg_control.old" ] || return 0
+  [ -f "$PGDATA/global/pg_control" ] && return 0
+  mv "$PGDATA/global/pg_control.old" "$PGDATA/global/pg_control" \
+    || die 3 "pg_upgrade left the old cluster disabled (global/pg_control.old) and restoring it failed — restore the pre-upgrade backup"
+  log "restored global/pg_control — pg_upgrade had disabled the old cluster before linking; the old cluster is startable again"
 }
 
 check_from_major() {
@@ -400,9 +469,17 @@ probe_sibling_slot() {
   rm -rf "$probe"
 }
 
-# pg_upgrade --check prints its findings to stdout and detail files into cwd.
+# pg_upgrade --check writes its per-item detail files (and, on a failed
+# upgrade, its server/internal logs) under pg_upgrade_output.d INSIDE THE NEW
+# CLUSTER'S DATA DIRECTORY (since PG 15) — not the invocation cwd, whatever
+# the "into cwd" phrasing below used to assume. Verified empirically: a
+# failing --check leaves nothing under /tmp except the timestamped dir this
+# function must be pointed at. Getting this wrong doesn't just print nothing —
+# the caller then rm -rf's $new_dir, so an unmatched glob deletes the very
+# files it was supposed to show.
 print_check_details() {
-  for f in /tmp/pg_upgrade_output.d/*/*.txt /tmp/*.txt; do
+  local new_dir="$1"
+  for f in "$new_dir"/pg_upgrade_output.d/*/*.txt "$new_dir"/pg_upgrade_output.d/*/log/*.log; do
     [ -f "$f" ] || continue
     echo "----- $(basename "$f") -----"
     cat "$f"
@@ -461,14 +538,14 @@ mode_check() {
 
   local out
   if out=$(run_pg_upgrade "--check" "$tmp_new"); then
-    log "$out"
+    log_upgrade_output "$out"
     rm -rf "$tmp_new"
     result "$(jq -nc --arg from "$FROM_MAJOR" --arg to "$TO_MAJOR" \
       '{ok: true, mode: "check", from: $from, to: $to}')"
     exit 0
   else
-    log "$out"
-    print_check_details
+    log_upgrade_output "$out"
+    print_check_details "$tmp_new"
     rm -rf "$tmp_new"
     result "$(jq -nc --arg from "$FROM_MAJOR" --arg to "$TO_MAJOR" \
       '{ok: false, mode: "check", from: $from, to: $to, error: "pg_upgrade --check found blockers"}')"
@@ -567,6 +644,12 @@ finish_swap() {
     mv "$NEW_DATA_DIR" "$PGDATA" || die 3 "failed to promote new data dir"
   fi
 
+  # The completion sentinel has served its purpose once the swap is done;
+  # don't leave job bookkeeping inside the live data directory (pgbackrest
+  # would carry it into every backup). Best-effort: a survivor is inert —
+  # the marker-less resume only ever reads it inside a NEW_DATA_DIR sibling.
+  rm -f "$PGDATA/.railway_pg_upgrade_complete" 2>/dev/null || true
+
   # needsReindex: pg_upgrade preserves index FILES verbatim, but any index on
   # collatable columns (text/varchar btree) is only valid for the glibc that
   # built it — and the source cluster may have run on an older base image.
@@ -631,18 +714,28 @@ mode_upgrade() {
       finish_swap
       ;;
     "")
-      # No marker, but the disk shape can still prove pg_upgrade finished:
-      # --link renames the old cluster's pg_control to pg_control.old as its
-      # last act, and the new data dir carries the target major's
-      # PG_VERSION. If the marker write was lost (crash after pg_upgrade,
-      # or a marker durability failure on an earlier image), this is the
-      # only window where "no marker" does NOT mean "roll back" — the old
-      # cluster can't be restarted (pg_control is gone), so roll forward.
-      # This keeps the marker from being a single point of failure.
-      if [ -f "$PGDATA/global/pg_control.old" ] \
-        && [ "$(cat "$NEW_DATA_DIR/PG_VERSION" 2>/dev/null)" = "$TO_MAJOR" ]; then
-        log "no marker, but the disk shape shows a finished pg_upgrade (pg_control.old present, new dir is $TO_MAJOR) — resuming directory swap"
-        finish_swap
+      # No marker, but the disk can still say where pg_upgrade got to.
+      # pg_control.old proves only that pg_upgrade DISABLED the old cluster
+      # — the rename lands before the first user relation file is linked
+      # (verified empirically; pg_upgrade's own output prescribes the
+      # rename-back as the recovery) — so on its own it must never drive a
+      # roll-forward: a crash mid-link leaves exactly this shape around a
+      # PARTIALLY-linked target dir, and promoting that is data loss. The
+      # job's completion sentinel, written the moment pg_upgrade exits 0,
+      # is the proof of a FINISHED run whose marker write was lost: with
+      # both, roll forward — only the swap remains, and the marker stays a
+      # non-single-point-of-failure. With pg_control.old but no sentinel,
+      # roll BACK: reverse the rename (safe — the target cluster has never
+      # been started, and linking never modifies the old cluster's files)
+      # and let the normal flow below redo the upgrade from scratch.
+      if [ -f "$PGDATA/global/pg_control.old" ]; then
+        if [ -f "$NEW_DATA_DIR/.railway_pg_upgrade_complete" ] \
+          && [ "$(cat "$NEW_DATA_DIR/PG_VERSION" 2>/dev/null)" = "$TO_MAJOR" ]; then
+          log "no marker, but the disk shape shows a finished pg_upgrade (pg_control.old present, completion sentinel in the $TO_MAJOR dir) — resuming directory swap"
+          finish_swap
+        fi
+        log "pg_control.old present without a completion sentinel — pg_upgrade crashed mid-run; rolling back to the old cluster and re-running the upgrade"
+        restore_disabled_pg_control
       fi
       ;;
     *)
@@ -664,26 +757,44 @@ mode_upgrade() {
 
   local out
   if ! out=$(run_pg_upgrade "--check" "$NEW_DATA_DIR"); then
-    log "$out"
-    print_check_details
+    log_upgrade_output "$out"
+    print_check_details "$NEW_DATA_DIR"
     rm -rf "$NEW_DATA_DIR"
     result "$(jq -nc --arg from "$FROM_MAJOR" --arg to "$TO_MAJOR" \
       '{ok: false, mode: "upgrade", from: $from, to: $to, error: "pg_upgrade --check found blockers"}')"
     exit 1
   fi
-  log "$out"
+  log_upgrade_output "$out"
 
   if ! out=$(run_pg_upgrade "--link" "$NEW_DATA_DIR"); then
-    log "$out"
-    # No marker was written: the old cluster may have been modified by
-    # pg_upgrade's failed run and MUST NOT be restarted in place. The
-    # workflow rolls back to the pre-upgrade backup.
+    log_upgrade_output "$out"
+    # No marker was written, so this is a roll-back. print BEFORE rm -rf:
+    # this is the undiagnosable-failure case round 3 already worried about —
+    # pg_upgrade's own server/internal logs live under $NEW_DATA_DIR too, and
+    # would otherwise vanish with it, unread. If pg_upgrade got far enough
+    # to disable the old cluster (the pg_control rename lands before the
+    # first user file is linked), reverse that too: the target cluster was
+    # never started, so the old cluster's files are untouched and renaming
+    # pg_control back returns the volume to a bootable FROM-major state
+    # instead of forcing a backup restore.
+    print_check_details "$NEW_DATA_DIR"
+    restore_disabled_pg_control
     rm -rf "$NEW_DATA_DIR"
     result "$(jq -nc --arg from "$FROM_MAJOR" --arg to "$TO_MAJOR" \
       '{ok: false, mode: "upgrade", from: $from, to: $to, error: "pg_upgrade failed after check passed"}')"
     exit 3
   fi
-  log "$out"
+  log_upgrade_output "$out"
+
+  # Proof of completion for the marker-less resume: pg_control.old is
+  # renamed away before linking even BEGINS, so only this sentinel can
+  # distinguish "pg_upgrade finished but the marker write was lost" from
+  # "pg_upgrade crashed mid-link". finish_swap removes it after the promote.
+  # Durability is best-effort by design: a lost sentinel re-runs the upgrade
+  # from scratch (safe — see restore_disabled_pg_control), and a phantom one
+  # cannot exist because success is the only writer.
+  touch "$NEW_DATA_DIR/.railway_pg_upgrade_complete" \
+    || die 3 "failed to write the completion sentinel in $NEW_DATA_DIR"
 
   # THE commit point: from here recovery always rolls forward.
   write_marker "$(jq -nc \

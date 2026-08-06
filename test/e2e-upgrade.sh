@@ -884,11 +884,15 @@ t_recovery_shapes_refused() {
 }
 
 # The marker-lost window: pg_upgrade finished (old cluster's pg_control
-# renamed to pg_control.old — it can never start again) but the marker is
-# gone. The disk shape alone must drive the roll-forward; without it the
-# volume is bricked in both directions. Reconstructed from a completed
-# upgrade: put the dirs back to "post-pg_upgrade, pre-swap" and delete the
-# marker.
+# renamed to pg_control.old, the job's completion sentinel written) but the
+# marker is gone. The disk shape alone must drive the roll-forward; without
+# it the volume is bricked in both directions. Reconstructed from a
+# completed upgrade: put the dirs back to "post-pg_upgrade, pre-swap",
+# re-plant the sentinel (finish_swap removes it from the promoted dir; in
+# the real window finish_swap never ran, so it is present), delete the
+# marker. The sentinel is load-bearing: pg_control.old alone means only
+# that linking STARTED — see t_crash_mid_link_rolls_back_and_reruns for
+# the shape where it must NOT roll forward.
 t_marker_lost_after_pg_upgrade_resumes() {
   local vol="upg-e2e-lostmarker"
   seed_from_cluster "$vol" || return 1
@@ -901,6 +905,7 @@ t_marker_lost_after_pg_upgrade_resumes() {
     set -e
     cd /var/lib/postgresql/data
     mv pgdata pgdata.upgrade-${TO_VERSION}
+    touch pgdata.upgrade-${TO_VERSION}/.railway_pg_upgrade_complete
     mv pgdata.old-${FROM_VERSION} pgdata
     rm -f $MARKER_PATH
   " || return 1
@@ -913,6 +918,50 @@ t_marker_lost_after_pg_upgrade_resumes() {
   wait_for_pg lostmarker-pg || { fail_dump lostmarker lostmarker-pg; return 1; }
   assert_eq "$(psql_in lostmarker-pg 'SELECT count(*) FROM upgrade_canary')" "1000" "data intact after marker-less resume" || return 1
   stop_pg lostmarker-pg
+}
+
+# The inverse of the marker-lost window: pg_upgrade renames the old
+# cluster's pg_control BEFORE it links the first user relation file
+# (verified empirically — its own output prescribes the rename-back as the
+# recovery), so "pg_control.old present" is NOT proof pg_upgrade finished.
+# A crash mid-link leaves that rename plus a PARTIALLY-linked target dir;
+# without the completion sentinel the resume must roll BACK — reverse the
+# rename and redo the upgrade from scratch — never promote the partial
+# target (the old inference did exactly that: silent data loss).
+t_crash_mid_link_rolls_back_and_reruns() {
+  local vol="upg-e2e-midlink"
+  seed_from_cluster "$vol" || return 1
+  run_job "$vol" upgrade
+  assert_eq "$JOB_RC" 0 "initial upgrade" || { echo "$JOB_OUT" | tail -20; return 1; }
+  # Reconstruct the mid-link crash: the old cluster back in place still
+  # DISABLED (global/pg_control.old — pg_upgrade renamed it in place and the
+  # swap carried it into pgdata.old-<from>), a partial target dir
+  # (PG_VERSION present, no completion sentinel), no marker. Removing the
+  # promoted dir first only drops hardlink counts; the old files survive.
+  in_volume "$vol" "
+    set -e
+    cd /var/lib/postgresql/data
+    rm -rf pgdata
+    mv pgdata.old-${FROM_VERSION} pgdata
+    mkdir -p pgdata.upgrade-${TO_VERSION}
+    echo ${TO_VERSION} > pgdata.upgrade-${TO_VERSION}/PG_VERSION
+    chown -R postgres:postgres pgdata.upgrade-${TO_VERSION}
+    rm -f $MARKER_PATH
+  " || return 1
+  in_volume "$vol" "test -f ${PGDATA_IN_VOLUME}/global/pg_control.old && test ! -f ${PGDATA_IN_VOLUME}/global/pg_control" \
+    || { echo "  premise broken: reconstructed old cluster is not in the disabled shape"; return 1; }
+
+  run_job "$vol" upgrade
+  assert_eq "$JOB_RC" 0 "mid-link crash resume exit code" || { echo "$JOB_OUT" | tail -30; return 1; }
+  assert_contains "$JOB_OUT" "rolling back to the old cluster" "roll-back path taken, not roll-forward" || return 1
+  assert_contains "$JOB_OUT" "restored global/pg_control" "the disable was reversed" || return 1
+  assert_eq "$(marker_field "$vol" phase)" "completed" "re-run completed" || return 1
+  assert_eq "$(volume_data_major "$vol")" "$TO_VERSION" "data major is TO after the re-run" || return 1
+
+  run_pg midlink-pg "$vol" "$TO_IMAGE" || return 1
+  wait_for_pg midlink-pg || { fail_dump midlink midlink-pg; return 1; }
+  assert_eq "$(psql_in midlink-pg 'SELECT count(*) FROM upgrade_canary')" "1000" "data intact after roll-back + re-run" || return 1
+  stop_pg midlink-pg
 }
 
 # pgdata.old-<from> is the rollback body and pins every pre-upgrade inode
@@ -1177,6 +1226,7 @@ ALL_TESTS=(
   t_runtime_refused_while_job_locked
   t_recovery_shapes_refused
   t_marker_lost_after_pg_upgrade_resumes
+  t_crash_mid_link_rolls_back_and_reruns
   t_old_datadir_reclaimed
   t_trailing_slash_pgdata
   t_upgrade_survives_root_owned_volume_root
