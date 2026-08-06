@@ -96,6 +96,11 @@ jobs:
         env:
           FROM_VERSION: ${{ matrix.from }}
           TO_VERSION: ${{ matrix.to }}
+          # Keep the harness's containers past its EXIT trap so the failure
+          # step below can still `docker logs` them (the trap otherwise
+          # removes them first, making that loop dead code). The runner VM
+          # is discarded either way.
+          E2E_KEEP_CONTAINERS: "1"
         run: |
           ./test/e2e-upgrade.sh 2>&1 | tee "e2e-upgrade-${FROM_VERSION}-${TO_VERSION}.log"
           exit "${PIPESTATUS[0]}"

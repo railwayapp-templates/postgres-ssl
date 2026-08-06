@@ -189,11 +189,6 @@ run_pg() {
   fi
 }
 
-# Waits for the REAL server, not the temporary one docker-entrypoint runs
-# during initdb to execute the init scripts. pg_isready answers on that temp
-# server's socket too, so a seed issued on its say-so can land mid-init and be
-# rolled away with it. The "ready to accept connections" line is only logged by
-# the final server, so gate on that as well.
 # Waits for the FINAL server, never the temporary one docker-entrypoint runs
 # during initdb to execute the init scripts. That temp server logs its own
 # "ready to accept connections" and then shuts down, so both pg_isready on the
@@ -327,6 +322,11 @@ volume_data_major() {
 }
 
 cleanup_all() {
+  # CI sets this so its failure-diagnostics step can still `docker logs` the
+  # containers — this trap otherwise removes them before that step runs,
+  # making the collection loop dead code. The runner VM is discarded either
+  # way, so nothing leaks.
+  [ "${E2E_KEEP_CONTAINERS:-0}" = "1" ] && return 0
   docker ps -aq --filter label=postgres-upgrade-e2e=1 | xargs -r docker rm -f >/dev/null 2>&1
   docker volume ls -q | grep '^upg-e2e-' | xargs -r docker volume rm >/dev/null 2>&1
   docker network rm "$E2E_NET" >/dev/null 2>&1
@@ -1185,6 +1185,83 @@ t_upgraded_marker_missing_new_dir_refused() {
   in_volume "$vol" "rm -f $MARKER_PATH"
 }
 
+# The old cluster was initdb'd by the entrypoint with POSTGRES_INITDB_ARGS
+# spliced into its initdb call, and pg_upgrade refuses any locale/encoding
+# mismatch between the clusters — so the job must replay the same args into
+# the target initdb, or a custom-locale service preflights and upgrades into
+# a refusal forever. --locale=C is always available and differs from the
+# image default (en_US.utf8), which makes it the regression discriminator.
+t_custom_initdb_args_upgrade() {
+  local vol="upg-e2e-initdbargs"
+  fresh_volume "$vol" || return 1
+  run_pg initargs-pg "$vol" "$FROM_IMAGE" -e "POSTGRES_INITDB_ARGS=--locale=C" || return 1
+  wait_for_pg initargs-pg || { fail_dump initargs initargs-pg; return 1; }
+  psql_must initargs-pg "CREATE TABLE ia_canary(id int); INSERT INTO ia_canary SELECT generate_series(1,100)" || return 1
+  assert_eq "$(psql_in initargs-pg "SELECT datcollate FROM pg_database WHERE datname='template0'")" "C" "seed cluster really is locale=C" || return 1
+  stop_pg initargs-pg
+
+  JOB_OUT=$(docker run --rm --label postgres-upgrade-e2e=1 \
+    -e "PGDATA=$PGDATA_IN_VOLUME" -e "POSTGRES_INITDB_ARGS=--locale=C" \
+    -v "$vol:/var/lib/postgresql/data" "$JOB_IMAGE" upgrade 2>&1)
+  JOB_RC=$?
+  assert_eq "$JOB_RC" 0 "upgrade with custom initdb args" || { echo "$JOB_OUT" | tail -30; return 1; }
+  assert_eq "$(volume_data_major "$vol")" "$TO_VERSION" "data major is TO" || return 1
+
+  run_pg initargs2-pg "$vol" "$TO_IMAGE" -e "POSTGRES_INITDB_ARGS=--locale=C" || return 1
+  wait_for_pg initargs2-pg || { fail_dump initargs2 initargs2-pg; return 1; }
+  assert_eq "$(psql_in initargs2-pg 'SELECT count(*) FROM ia_canary')" "100" "data survived" || return 1
+  assert_eq "$(psql_in initargs2-pg "SELECT datcollate FROM pg_database WHERE datname='template0'")" "C" "locale carried into the new cluster" || return 1
+  stop_pg initargs2-pg
+}
+
+# postgres-ha's env contract INVERTS postgres-ssl's: POSTGRES_USER there is
+# the APP user Patroni creates, and the install user is
+# PATRONI_SUPERUSER_USERNAME (default postgres). The job inherits the
+# service's variables, so on an HA volume it must not trust POSTGRES_USER —
+# the discriminator is the volume itself (a Patroni data dir always carries
+# patroni.dynamic.json). Simulated: a postgres-install-user cluster with the
+# patroni file planted, dispatched with the app-user env a real HA service
+# would deliver — without the discriminator the job initdb's the target as
+# 'appuser' and pg_upgrade fails the install-user match.
+t_patroni_volume_uses_patroni_superuser() {
+  local vol="upg-e2e-patroniuser"
+  seed_from_cluster "$vol" || return 1
+  in_volume "$vol" "echo '{}' > $PGDATA_IN_VOLUME/patroni.dynamic.json \
+    && chown postgres:postgres $PGDATA_IN_VOLUME/patroni.dynamic.json" || return 1
+
+  JOB_OUT=$(docker run --rm --label postgres-upgrade-e2e=1 \
+    -e "PGDATA=$PGDATA_IN_VOLUME" -e "POSTGRES_USER=appuser" \
+    -v "$vol:/var/lib/postgresql/data" "$JOB_IMAGE" upgrade 2>&1)
+  JOB_RC=$?
+  assert_eq "$JOB_RC" 0 "upgrade succeeds on a patroni-shaped volume with app-user env" || { echo "$JOB_OUT" | tail -30; return 1; }
+  assert_contains "$JOB_OUT" "patroni cluster detected" "the discriminator is logged" || return 1
+  assert_eq "$(marker_field "$vol" phase)" "completed" "marker completed" || return 1
+  assert_eq "$(volume_data_major "$vol")" "$TO_VERSION" "data major is TO" || return 1
+}
+
+# A pre-existing pgdata.old-<from> next to FROM-major data is a manual-
+# intervention artifact (a partial restore COPIED the rollback body back and
+# left the original). finish_swap's `mv` onto that existing directory would
+# NEST pgdata inside it instead of renaming — both modes must refuse upfront
+# with the volume untouched, and succeed once the leftover is cleared.
+t_stale_old_keep_dir_refused() {
+  local vol="upg-e2e-staleold"
+  seed_from_cluster "$vol" || return 1
+  in_volume "$vol" "mkdir -p ${PGDATA_IN_VOLUME}.old-${FROM_VERSION} \
+    && touch ${PGDATA_IN_VOLUME}.old-${FROM_VERSION}/PG_VERSION" || return 1
+
+  run_job "$vol" check
+  assert_eq "$JOB_RC" 2 "check refuses on a stale rollback body" || { echo "$JOB_OUT" | tail -10; return 1; }
+  run_job "$vol" upgrade
+  assert_eq "$JOB_RC" 2 "upgrade refuses on a stale rollback body" || { echo "$JOB_OUT" | tail -10; return 1; }
+  assert_contains "$JOB_OUT" "already exists" "refusal names the leftover dir" || return 1
+  assert_eq "$(volume_data_major "$vol")" "$FROM_VERSION" "PGDATA untouched" || return 1
+
+  in_volume "$vol" "rm -rf ${PGDATA_IN_VOLUME}.old-${FROM_VERSION}" || return 1
+  run_job "$vol" upgrade
+  assert_eq "$JOB_RC" 0 "succeeds once the leftover is removed" || { echo "$JOB_OUT" | tail -20; return 1; }
+}
+
 # A service variable can set PG_MAJOR to anything; the mismatch guard must
 # trust the image's installed server tree instead (adopted from postgres-ha's
 # image_major()) — a stray PG_MAJOR must not refuse a perfectly matched boot.
@@ -1235,6 +1312,9 @@ ALL_TESTS=(
   t_check_probes_sibling_slot
   t_same_pair_completed_marker_reruns
   t_upgraded_marker_missing_new_dir_refused
+  t_custom_initdb_args_upgrade
+  t_patroni_volume_uses_patroni_superuser
+  t_stale_old_keep_dir_refused
   t_unknown_marker_phase_refused
   t_pg_major_env_override_ignored
 )

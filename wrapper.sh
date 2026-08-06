@@ -597,7 +597,8 @@ write_pgbackrest_repo_path_marker() {
 }
 
 # Replace the backup watcher's state file with nothing but the migration gate
-# (`archive_migration_pending_new_path`, empty to release it).
+# (`archive_migration_pending_new_path`). Releasing the gate is the separate,
+# field-preserving clear_backup_state_migration_gate below — never this.
 #
 # Replaced rather than edited because every field in it describes backups at
 # the OLD path. Clearing last_full_at is what trips the watcher's
@@ -632,6 +633,24 @@ write_backup_state_migration_gate() {
       rm -f "$tmp"; return 1
     fi
   fi
+  chown postgres:postgres "$tmp" 2>/dev/null || true
+  chmod 0640 "$tmp" 2>/dev/null || true
+  mv "$tmp" "$state_file" || { rm -f "$tmp"; return 1; }
+}
+
+# Release the watcher's migration gate WITHOUT touching the rest of its
+# state. The gate-SET path deliberately replaces the whole file (see
+# write_backup_state_migration_gate), but the CLEAR must not: on the
+# re-anchor RETRY path (marker already flipped by an earlier attempt whose
+# final anchor write failed) the state file holds real post-migration
+# watcher state — a last_full_at from a full that already landed at the new
+# path — and wiping it would re-arm NEEDS_INITIAL_BACKUP into one redundant
+# full upload per boot until the anchor write finally succeeds.
+clear_backup_state_migration_gate() {
+  local state_file="$PGDATA/.pgbackrest_backup_state" tmp
+  [ ! -f "$state_file" ] && return 0
+  tmp=$(mktemp "${state_file}.XXXX") || return 1
+  grep -vE "^archive_migration_pending_new_path=" "$state_file" > "$tmp" 2>/dev/null || true
   chown postgres:postgres "$tmp" 2>/dev/null || true
   chmod 0640 "$tmp" 2>/dev/null || true
   mv "$tmp" "$state_file" || { rm -f "$tmp"; return 1; }
@@ -686,9 +705,10 @@ reanchor_pgbackrest_repo_path() {
   clean_archive_spool_statuses
   # The old cluster's gap sentinel describes the old path's coverage.
   rm -f "$PGDATA/.pgbackrest_gap_pending" 2>/dev/null || true
-  # Cleanup done: release the watcher's backup gate. Failing here is safe —
+  # Cleanup done: release the watcher's backup gate — field-preserving, so
+  # the retry path's real watcher state survives. Failing here is safe —
   # the watcher retries the same cleanup and clears the gate itself.
-  write_backup_state_migration_gate "" \
+  clear_backup_state_migration_gate \
     || echo "pgbackrest: could not clear the pending-migration gate; the watcher will retry it" >&2
   return 0
 }
@@ -1591,6 +1611,32 @@ fi
 # starting — the watcher retries.
 reanchor_pgbackrest_repo_path_if_reidentified || true
 
+# Serialized read-modify-write for the upgrade marker. Two background forks
+# (the staged analyze and the old-dir reclaim) both update it; their mktemp
+# staging keeps the WRITES apart, but without mutual exclusion the classic
+# lost update remains — reclaim re-reads a marker analyze is about to
+# replace and writes back a stale needsAnalyze, or reclaim's own stamp is
+# clobbered. flock on a sibling lock file closes it; when flock (or the
+# open) is unavailable this degrades to the old unserialized behavior,
+# whose worst outcomes were benign (a re-run analyze, a missing timestamp).
+# Runs in a subshell so fd 7 never leaks into the caller.
+update_upgrade_marker() {
+  (
+    if command -v flock >/dev/null 2>&1; then
+      if { exec 7>>"${UPGRADE_MARKER_FILE}.updatelock"; } 2>/dev/null; then
+        flock 7 || true
+      fi
+    fi
+    tmp_marker=$(mktemp "${UPGRADE_MARKER_FILE}.XXXX") || exit 1
+    if jq "$@" "$UPGRADE_MARKER_FILE" > "$tmp_marker" 2>/dev/null; then
+      mv "$tmp_marker" "$UPGRADE_MARKER_FILE"
+    else
+      rm -f "$tmp_marker" 2>/dev/null
+      exit 1
+    fi
+  )
+}
+
 # After a major upgrade, planner statistics start empty (pg_upgrade does not
 # carry them across majors before 18). Rebuild them in stages in the
 # background once postgres accepts connections, so the database is usable
@@ -1607,20 +1653,16 @@ fork_post_upgrade_analyze() {
         # cluster has no 'postgres' role (the entrypoint initdb's with
         # --username="$POSTGRES_USER"), and -U postgres would fail here on
         # every boot forever.
-        if vacuumdb --all --analyze-in-stages -h /var/run/postgresql -p 5432 \
-             -U "${POSTGRES_USER:-postgres}" >/dev/null 2>&1; then
-          # mktemp, not a fixed .tmp suffix: fork_old_datadir_reclaim updates
-          # the same marker from a sibling fork, and a shared literal tmp
-          # path lets the two writers clobber each other's staged update.
-          if tmp_marker=$(mktemp "${UPGRADE_MARKER_FILE}.XXXX") \
-            && jq '.needsAnalyze = false' "$UPGRADE_MARKER_FILE" > "$tmp_marker" 2>/dev/null; then
-            mv "$tmp_marker" "$UPGRADE_MARKER_FILE"
-          else
-            rm -f "$tmp_marker" 2>/dev/null
-          fi
+        if analyze_out=$(vacuumdb --all --analyze-in-stages -h /var/run/postgresql -p 5432 \
+             -U "${POSTGRES_USER:-postgres}" 2>&1); then
+          update_upgrade_marker '.needsAnalyze = false' || true
           echo "post-upgrade: statistics rebuild complete"
         else
+          # Print WHY — an auth-hardened local rule or a missing role makes
+          # this fail on every boot forever, and a bare "failed" gives the
+          # operator nothing to fix.
           echo "post-upgrade: statistics rebuild failed; will retry on next boot"
+          printf '%s\n' "$analyze_out" | tail -20 | sed 's/^/post-upgrade:   /'
         fi
         exit 0
       fi
@@ -1670,16 +1712,9 @@ fork_old_datadir_reclaim() {
       echo "post-upgrade: could not remove the pre-upgrade data dir; will retry on next boot"
       exit 0
     fi
-    # mktemp for the same reason as fork_post_upgrade_analyze's marker
-    # update: two forks share this marker, a fixed tmp name lets them
-    # clobber each other's staged write.
-    if tmp_marker=$(mktemp "${UPGRADE_MARKER_FILE}.XXXX") \
-      && jq --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '.oldDataDirRemovedAt = $t' \
-        "$UPGRADE_MARKER_FILE" > "$tmp_marker" 2>/dev/null; then
-      mv "$tmp_marker" "$UPGRADE_MARKER_FILE"
-    else
-      rm -f "$tmp_marker" 2>/dev/null
-    fi
+    # Serialized against the analyze fork's update — see update_upgrade_marker.
+    update_upgrade_marker --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '.oldDataDirRemovedAt = $t' \
+      || echo "post-upgrade: could not stamp oldDataDirRemovedAt (reclaim already done; cosmetic)"
     echo "post-upgrade: pre-upgrade data dir reclaimed"
   ) &
 }

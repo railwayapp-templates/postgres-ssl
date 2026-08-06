@@ -377,13 +377,26 @@ takes a mode as its argument:
 | `status` | Prints the marker phase + on-disk major as JSON, for resume decisions. |
 | `manifest` | Prints the target major's installable extensions as JSON. |
 
-The job connects as the cluster's actual install user
-(`${POSTGRES_USER:-postgres}`), and initdb's the target cluster with the same
-name — a service deployed with a custom `POSTGRES_USER` has no `postgres`
-role at all, and pg_upgrade requires both clusters' install users to match.
+The job connects as the cluster's actual install user, and initdb's the
+target cluster with the same name — pg_upgrade requires both clusters'
+install users to match. Which env var names that user depends on the
+template family, and the two disagree: on postgres-ssl the official
+entrypoint initdb's with `--username="$POSTGRES_USER"` (a custom-user
+service has no `postgres` role at all), while on postgres-ha
+`POSTGRES_USER` is the **app** user Patroni creates and the install user is
+`PATRONI_SUPERUSER_USERNAME` (default `postgres`). The job disambiguates by
+the volume itself — a Patroni-managed data dir always carries
+`patroni.dynamic.json` — so the same inherited service env resolves
+correctly on both. The target initdb also replays the service's
+`POSTGRES_INITDB_ARGS` (evaled, exactly as the official entrypoint does at
+init time), because pg_upgrade refuses any locale/encoding mismatch and a
+cluster initialized with `--locale=C` could otherwise never pair with an
+image-default target.
 Every `RAILWAY_UPGRADE_RESULT:` payload is built with `jq --arg` (compact,
 one line) so no on-disk byte a database superuser can write reaches the
-workflow's JSON parser unescaped.
+workflow's JSON parser unescaped — and every passthrough of pg_upgrade
+output, server logs, or failure lists is indented, so no
+attacker-controlled byte can start a line with the result sentinel either.
 
 Volumes with `recovery.signal` or `standby.signal` are refused outright by
 both `check` and `upgrade` (exit 2): those shapes can't be upgraded in
@@ -437,7 +450,12 @@ reset to initdb's recognizable default shape — loopback host rules and
 nothing else. A config the operator narrowed by address, database/user, or
 TLS is an authored policy and is never silently re-widened; a file with no
 host rules at all is a deliberate local-only lockdown and is left alone
-too. The PITR lifecycle sentinels (`.pitr_configured`,
+too. One residual ambiguity is accepted knowingly: a config an operator
+deliberately narrowed to *exactly* initdb's loopback-only shape is
+byte-indistinguishable from a reset and gets the rule re-appended — on
+Railway a loopback-only Postgres is unreachable by every real client
+(private networking is a remote connection), so the shape reads as a reset,
+not a policy. The PITR lifecycle sentinels (`.pitr_configured`,
 `.pitr_staging`, `.pgbackrest_restored`) are carried across the swap too,
 and a `completed` upgrade marker is itself treated as proof that recovery
 already promoted — otherwise an upgraded PITR-restored fork (whose

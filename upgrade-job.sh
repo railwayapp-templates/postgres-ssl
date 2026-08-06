@@ -6,7 +6,8 @@
 # stopped. The orchestrating workflow guarantees exclusivity (volume lock +
 # service maintenance lock); this script still refuses the obvious hazards.
 #
-# Modes (first argument, default "upgrade"):
+# Modes (UPGRADE_JOB_MODE env var; falls back to a positional arg for local/
+# e2e runs; default "upgrade"):
 #   check    — initdb a throwaway target cluster and run pg_upgrade --check.
 #              Exit 0 = upgradeable, exit 1 = blockers (printed), exit 2 =
 #              precondition failure, exit 3 = environment failure (the
@@ -59,14 +60,9 @@ set -uo pipefail
 FROM_MAJOR="${PG_UPGRADE_FROM:?PG_UPGRADE_FROM not set}"
 TO_MAJOR="${PG_UPGRADE_TO:?PG_UPGRADE_TO not set}"
 
-# The cluster's superuser. The official entrypoint runs
-# `initdb --username="$POSTGRES_USER"`, so a service deployed with a custom
-# POSTGRES_USER has no 'postgres' role at all — pg_upgrade must connect as
-# the cluster's actual install user, and the target cluster must be initdb'd
-# with the SAME name (pg_upgrade requires the install users to match). The
-# job inherits the service's variables in production, so this resolves to
-# the right name there; ad-hoc runs against a custom-user volume need -e.
-PG_SUPERUSER="${POSTGRES_USER:-postgres}"
+# PG_SUPERUSER (the cluster's INSTALL user) is resolved below, after PGDATA
+# is normalized — which env var names it depends on the template family, and
+# the discriminator is on the volume itself.
 
 # The quiesce (WAL replay + clean stop) shares this timeout for both the
 # start and the stop. An interrupted crash recovery persists NO progress —
@@ -102,28 +98,53 @@ PGDATA="${PGDATA:-$VOLUME_ROOT/pgdata}"
 while [ "${PGDATA%/}" != "$PGDATA" ] && [ -n "${PGDATA%/}" ]; do PGDATA="${PGDATA%/}"; done
 MARKER_FILE="$VOLUME_ROOT/.railway-major-upgrade.json"
 
+# The cluster's INSTALL user — pg_upgrade must connect as it, and the target
+# cluster must be initdb'd with the SAME name (pg_upgrade requires the
+# install users to match). Which env var names it depends on the template
+# family, and the two DISAGREE:
+#   postgres-ssl: the official entrypoint runs `initdb --username="$POSTGRES_USER"`,
+#     so POSTGRES_USER IS the install user (a custom-user service has no
+#     'postgres' role at all).
+#   postgres-ha: Patroni bootstraps with PATRONI_SUPERUSER_USERNAME (default
+#     postgres, postgres-patroni config.rs + yaml.rs) and POSTGRES_USER is
+#     the APP user Patroni creates afterwards — trusting POSTGRES_USER there
+#     picks a non-superuser that is not the install user, and pg_upgrade
+#     fails the install-user match.
+# The job inherits the service's variables in production, so disambiguate by
+# the volume itself: a Patroni-managed data dir always carries
+# patroni.dynamic.json. Ad-hoc runs against a custom-user volume need -e.
+if [ -f "$PGDATA/patroni.dynamic.json" ]; then
+  PG_SUPERUSER="${PATRONI_SUPERUSER_USERNAME:-postgres}"
+  echo "upgrade-job: patroni cluster detected (patroni.dynamic.json) — using install user '$PG_SUPERUSER' (POSTGRES_USER is the app user on postgres-ha)"
+else
+  PG_SUPERUSER="${POSTGRES_USER:-postgres}"
+fi
+
 OLD_BINDIR="/usr/lib/postgresql/${FROM_MAJOR}/bin"
 NEW_BINDIR="/usr/lib/postgresql/${TO_MAJOR}/bin"
 NEW_DATA_DIR="${PGDATA}.upgrade-${TO_MAJOR}"
 OLD_KEEP_DIR="${PGDATA}.old-${FROM_MAJOR}"
 
-# Scan every positional arg for a recognized mode instead of trusting $1
-# alone. Railway's two container runtimes disagree on how a deployment's
-# startCommand combines with the image's own ENTRYPOINT: one REPLACES the
-# entrypoint outright (so the dispatcher must send the script name itself,
-# "upgrade-job.sh <mode>", or the exec target is a nonexistent program named
-# literally "check"/"upgrade"), the other KEEPS the entrypoint and appends
-# startCommand as further args (so that same two-word command arrives as
-# "upgrade-job.sh upgrade-job.sh <mode>" — the script's own name twice). A
-# bare positional read ($1) is correct for only one of those two shapes;
-# scanning for the first arg that IS a known mode is correct for both, and
-# for every existing bare-mode caller (local runs, the e2e harness) too.
-MODE="upgrade"
-for _arg in "$@"; do
-  case "$_arg" in
-    check | upgrade | status | manifest) MODE="$_arg" ;;
-  esac
-done
+# The dispatcher selects the mode via a real Railway variable, not
+# startCommand or argv: this repo's two container runtimes disagree on how a
+# deployment's startCommand combines with the image's own ENTRYPOINT (one
+# REPLACES the entrypoint outright, so a bare mode string tries to exec a
+# nonexistent program named "check"/"upgrade"; the other KEEPS the entrypoint
+# and appends startCommand as further args), so no single startCommand value
+# selects a mode on both. UPGRADE_JOB_MODE sidesteps that entirely — it
+# reaches the container the same way every other service variable already
+# does, regardless of which runtime or image is in play. Positional args are
+# kept only as a fallback for local/manual runs and the e2e harness, which
+# invoke this script directly (`upgrade-job.sh <mode>`) rather than through a
+# Railway deployment.
+MODE="${UPGRADE_JOB_MODE:-upgrade}"
+if [ -z "${UPGRADE_JOB_MODE:-}" ]; then
+  for _arg in "$@"; do
+    case "$_arg" in
+      check | upgrade | status | manifest) MODE="$_arg" ;;
+    esac
+  done
+fi
 
 log() { echo "upgrade-job: $*"; }
 # pg_upgrade's own combined output is forwarded verbatim for diagnosability,
@@ -331,7 +352,12 @@ ensure_clean_shutdown() {
 print_quiesce_log() {
   [ -f "$1" ] || return 0
   echo "----- old server log ($1) -----"
-  tail -100 "$1"
+  # Indented like log_upgrade_output and for the same reason: server log
+  # lines carry DB-superuser-controlled bytes (error detail, statement
+  # text), and a multi-line message's continuation lines have no
+  # log_line_prefix — unprefixed, one could open with the
+  # RAILWAY_UPGRADE_RESULT: sentinel and forge a result line.
+  tail -100 "$1" | sed 's/^/  server: /'
   echo "----- end of old server log -----"
 }
 
@@ -422,14 +448,20 @@ init_new_cluster() {
     chown postgres:postgres "$target_dir" \
       || die 3 "failed to chown the target cluster directory to postgres"
   fi
-  # Locale/encoding inherit the image defaults, which match how the runtime
-  # image initdb'd the old cluster; pg_upgrade --check verifies the pairing
-  # and aborts on any mismatch before anything is touched. The superuser must
-  # be the OLD cluster's install user (see PG_SUPERUSER) — pg_upgrade
-  # requires both clusters' install users to match, and a custom
-  # POSTGRES_USER cluster has no 'postgres' role at all.
-  # shellcheck disable=SC2046
-  as_postgres "$NEW_BINDIR/initdb" $(checksum_flag) --username="$PG_SUPERUSER" -D "$target_dir" >/dev/null \
+  # Locale/encoding must MATCH the old cluster or pg_upgrade --check refuses
+  # the pairing. The old cluster was initdb'd by the official entrypoint,
+  # which evals POSTGRES_INITDB_ARGS into its initdb call — so a service
+  # that customized locale/encoding at init time ("--locale=C", …) has a
+  # cluster the image-default initdb can never pair with. Replay the same
+  # env the same way (eval, mirroring docker-entrypoint's quoting; the var
+  # is the operator's own service variable, the exact trust the entrypoint
+  # already extends at every init). Our flags come LAST so --username and
+  # -D always win over anything in the user args; checksum parity stays
+  # owned by checksum_flag, derived from the old cluster's pg_controldata —
+  # which already reflects whatever the init args chose. pg_upgrade --check
+  # remains the final arbiter of the pairing. The superuser must be the OLD
+  # cluster's install user (see PG_SUPERUSER).
+  eval 'as_postgres "$NEW_BINDIR/initdb" '"$(checksum_flag) ${POSTGRES_INITDB_ARGS:-}"' --username="$PG_SUPERUSER" -D "$target_dir"' >/dev/null \
     || die 3 "initdb of the target cluster failed"
 }
 
@@ -482,7 +514,10 @@ print_check_details() {
   for f in "$new_dir"/pg_upgrade_output.d/*/*.txt "$new_dir"/pg_upgrade_output.d/*/log/*.log; do
     [ -f "$f" ] || continue
     echo "----- $(basename "$f") -----"
-    cat "$f"
+    # Indented for the same reason as log_upgrade_output: failure lists are
+    # made of relation/database names — DB-superuser-controlled bytes that
+    # must not be able to start a line with the result sentinel.
+    sed 's/^/  detail: /' "$f"
   done
 }
 
@@ -524,6 +559,11 @@ mode_check() {
 
   clear_stale_pidfile
   check_from_major
+  # Mirror upgrade mode's stale-rollback-body refusal: a green check must
+  # mean the real run won't refuse on a condition check could see.
+  if [ -e "$OLD_KEEP_DIR" ]; then
+    die 2 "$OLD_KEEP_DIR already exists next to $FROM_MAJOR-major data — a previous upgrade's rollback body was left in place; remove or rename it, then re-run"
+  fi
   refuse_recovery_shapes
   # Before the quiesce, so an unwritable volume root gets the precise
   # refusal instead of a generic quiesce failure.
@@ -637,6 +677,12 @@ finish_swap() {
   fi
 
   if [ -d "$PGDATA" ] && [ "$(data_major)" = "$FROM_MAJOR" ]; then
+    # Belt to mode_upgrade's upfront refusal: `mv` onto an EXISTING directory
+    # nests the source inside it instead of renaming — pgdata would end up at
+    # .old-<from>/pgdata, silently mangling the rollback body.
+    if [ -e "$OLD_KEEP_DIR" ]; then
+      die 3 "cannot move the old data dir aside: $OLD_KEEP_DIR already exists (a leftover rollback body) — remove or rename it, then re-run"
+    fi
     mv "$PGDATA" "$OLD_KEEP_DIR" || die 3 "failed to move old data dir aside"
   fi
   if [ ! -d "$PGDATA" ]; then
@@ -750,6 +796,16 @@ mode_upgrade() {
   esac
 
   check_from_major
+  # A pre-existing .old-<from> next to FROM-major data is a manual-
+  # intervention artifact (a partial restore COPIED the rollback body back
+  # and left the original — no normal flow produces this pairing: a first
+  # pass has no .old dir, and every resume path has no FROM-major $PGDATA).
+  # finish_swap's first rename would NEST pgdata inside it; refuse here,
+  # before anything is touched, and let the operator pick the authoritative
+  # copy.
+  if [ -e "$OLD_KEEP_DIR" ]; then
+    die 2 "$OLD_KEEP_DIR already exists next to $FROM_MAJOR-major data — a previous upgrade's rollback body was left in place; remove or rename it, then re-run"
+  fi
   clear_stale_pidfile
   refuse_recovery_shapes
   ensure_clean_shutdown
