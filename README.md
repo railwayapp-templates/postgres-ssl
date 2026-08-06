@@ -409,12 +409,7 @@ Both sides also hold a `flock` on the volume-root
 container shared for its lifetime. A job dispatched against a live database
 refuses instead of corrupting the cluster, and a database deployed while a
 job is mid-flight refuses to boot — in-image backstops for the
-orchestrator's own exclusion. Honest scope note: the shared side only exists
-on runtime images built from this change, so a service still running an
-older image is protected during its first upgrade by the orchestrator's
-stop-before-dispatch and the platform's single-mount guarantee alone — the
-lock becomes a real backstop for that service only after it redeploys onto a
-current image.
+orchestrator's own exclusion.
 
 The job tolerates the platform's ungraceful container stop: it clears a stale
 `postmaster.pid` and, when `pg_control` says the cluster was not shut down
