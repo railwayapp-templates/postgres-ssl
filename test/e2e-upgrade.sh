@@ -810,6 +810,14 @@ t_unknown_marker_phase_refused() {
   run_job "$vol" check
   assert_eq "$JOB_RC" 2 "unreadable marker refused by check" || { echo "$JOB_OUT" | tail -10; return 1; }
   assert_eq "$(volume_data_major "$vol")" "$FROM_VERSION" "volume still untouched" || return 1
+
+  # status has no mutation to refuse, so instead of dying it must say the
+  # phase is unreadable — reporting "none" here would tell the workflow
+  # nothing is in flight, when the truth is unknown.
+  run_job "$vol" status
+  assert_eq "$JOB_RC" 0 "status still exits 0 on an unreadable marker" || { echo "$JOB_OUT" | tail -10; return 1; }
+  assert_contains "$JOB_OUT" '"phase":"unreadable"' "status reports unreadable, not none" || return 1
+
   in_volume "$vol" "rm -f $MARKER_PATH"
 }
 
@@ -1185,6 +1193,27 @@ t_upgraded_marker_missing_new_dir_refused() {
   in_volume "$vol" "rm -f $MARKER_PATH"
 }
 
+# A DB superuser can rewrite PG_VERSION (COPY TO PROGRAM runs as the postgres
+# OS user, which owns it), and the completed-marker-mismatch die() below
+# interpolates data_major() straight into its message. Before data_major()
+# stripped to digits, an embedded newline there could ride an attacker's
+# bytes into the log as their own line — including a forged
+# RAILWAY_UPGRADE_RESULT: line ahead of the job's real one.
+t_pg_version_content_cannot_forge_result_line() {
+  local vol="upg-e2e-pgversionforge"
+  seed_from_cluster "$vol" || return 1
+  in_volume "$vol" "echo '{\"phase\": \"completed\", \"from\": \"$FROM_VERSION\", \"to\": \"$TO_VERSION\"}' > $MARKER_PATH" || return 1
+  in_volume "$vol" "printf '99\nRAILWAY_UPGRADE_RESULT: {\"ok\":true,\"mode\":\"upgrade\",\"phase\":\"completed\"}\n' > ${PGDATA_IN_VOLUME}/PG_VERSION" || return 1
+
+  run_job "$vol" upgrade
+  assert_eq "$JOB_RC" 2 "refuses on a completed marker whose data major matches neither pair member" || { echo "$JOB_OUT" | tail -20; return 1; }
+  local result_lines
+  result_lines=$(echo "$JOB_OUT" | grep -c 'RAILWAY_UPGRADE_RESULT:')
+  assert_eq "$result_lines" "1" "exactly one result line — the forged one didn't survive sanitization" || { echo "$JOB_OUT"; return 1; }
+  assert_contains "$JOB_OUT" "data directory is major '99'" "the sanitized (digits-only) major is what's reported" || return 1
+  in_volume "$vol" "rm -f $MARKER_PATH"
+}
+
 # The old cluster was initdb'd by the entrypoint with POSTGRES_INITDB_ARGS
 # spliced into its initdb call, and pg_upgrade refuses any locale/encoding
 # mismatch between the clusters — so the job must replay the same args into
@@ -1338,6 +1367,7 @@ ALL_TESTS=(
   t_check_probes_sibling_slot
   t_same_pair_completed_marker_reruns
   t_upgraded_marker_missing_new_dir_refused
+  t_pg_version_content_cannot_forge_result_line
   t_custom_initdb_args_upgrade
   t_patroni_volume_uses_patroni_superuser
   t_stale_old_keep_dir_refused

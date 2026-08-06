@@ -234,8 +234,14 @@ as_postgres() {
   fi
 }
 
+# PG_VERSION is DB-superuser-writable (COPY TO PROGRAM runs as the postgres
+# OS user, which owns it) and several call sites interpolate this straight
+# into a die() message — stripped to digits so an embedded newline can never
+# ride along and forge a RAILWAY_UPGRADE_RESULT: line into the log. A
+# well-formed value in this job's supported range (14-18) is digits only, so
+# this is a no-op on every real input.
 data_major() {
-  [ -f "$PGDATA/PG_VERSION" ] && cat "$PGDATA/PG_VERSION" || echo ""
+  [ -f "$PGDATA/PG_VERSION" ] && tr -cd '0-9' < "$PGDATA/PG_VERSION" || echo ""
 }
 
 # ----- preconditions ---------------------------------------------------------
@@ -536,7 +542,17 @@ print_check_details() {
 
 mode_status() {
   local phase from to major
-  phase="$(read_marker_field phase)"
+  if [ -f "$MARKER_FILE" ] && [ -z "$(read_marker_field phase)" ]; then
+    # A marker that exists but can't be read (or has no phase) means an
+    # upgrade touched this volume in a way status can't characterize.
+    # check and upgrade both refuse outright on this same condition
+    # (refuse_unreadable_marker); status has no mutation to refuse, so it
+    # must say so explicitly instead of defaulting to "none" — which the
+    # workflow reads as "nothing in flight, safe to restart the old image."
+    phase="unreadable"
+  else
+    phase="$(read_marker_field phase)"
+  fi
   from="$(read_marker_field from)"
   to="$(read_marker_field to)"
   major="$(data_major)"
