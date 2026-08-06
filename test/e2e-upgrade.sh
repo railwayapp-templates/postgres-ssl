@@ -819,6 +819,77 @@ t_second_upgrade_reaches_next_major() {
   stop_pg chain-pg
 }
 
+# Regression for the reclaim fix: chaining two upgrades before the first's
+# background reclaim ever runs (no runtime boot in between — exactly what the
+# sibling test above does) leaves TWO .old-<major> siblings on the volume at
+# once. wrapper.sh used to gate a single `rm -rf .old-*` off the LATEST
+# marker's completedAt alone, so an orphaned older generation was held
+# hostage to the newer upgrade's own clock instead of being reclaimed on its
+# own schedule (and, with a shorter retention override on the later upgrade,
+# could be swept before its OWN retention had actually elapsed). Each
+# sibling's mtime is set once — by the mv that created it — and is an
+# independent per-generation clock: back-date the first generation past its
+# own default 24h retention while leaving the second one fresh, and confirm
+# only the first is reclaimed.
+t_chained_upgrade_reclaims_by_own_age() {
+  if [ ! -f "$REPO_ROOT/Dockerfile.${CHAIN_VERSION}" ]; then
+    note "skipped: no Dockerfile.${CHAIN_VERSION} to chain onto"
+    return 0
+  fi
+  ensure_chain_images || return 1
+  local vol="upg-e2e-chainreclaim"
+  seed_from_cluster "$vol" || return 1
+
+  run_job "$vol" upgrade
+  assert_eq "$JOB_RC" 0 "first upgrade exit code" || { echo "$JOB_OUT" | tail -20; return 1; }
+
+  # No runtime boot here on purpose: the first upgrade's own reclaim fork
+  # never gets a chance to run, so its rollback body survives untouched into
+  # the second upgrade.
+  JOB_OUT=$(docker run --rm --label postgres-upgrade-e2e=1 \
+    -e "PGDATA=$PGDATA_IN_VOLUME" \
+    -v "$vol:/var/lib/postgresql/data" \
+    "$CHAIN_JOB_IMAGE" upgrade 2>&1)
+  JOB_RC=$?
+  assert_eq "$JOB_RC" 0 "second upgrade exit code" || { echo "$JOB_OUT" | tail -30; return 1; }
+  in_volume "$vol" "test -d ${PGDATA_IN_VOLUME}.old-${FROM_VERSION} && test -d ${PGDATA_IN_VOLUME}.old-${TO_VERSION}" \
+    || { echo "  premise broken: expected both .old-${FROM_VERSION} and .old-${TO_VERSION} to exist after chaining"; return 1; }
+
+  # Back-date the FIRST generation past the default 24h retention; leave the
+  # second one at its real (just-created) mtime.
+  in_volume "$vol" "touch -d '@$(( $(date +%s) - 90000 ))' ${PGDATA_IN_VOLUME}.old-${FROM_VERSION}" || return 1
+
+  remove_container chainreclaim-pg
+  docker run -d --name chainreclaim-pg --label postgres-upgrade-e2e=1 \
+    -e "POSTGRES_PASSWORD=test" -e "PGDATA=$PGDATA_IN_VOLUME" \
+    -v "$vol:/var/lib/postgresql/data" "$CHAIN_IMAGE" >/dev/null || return 1
+  wait_for_pg chainreclaim-pg || { fail_dump chainreclaim chainreclaim-pg; return 1; }
+
+  local deadline=$(($(date +%s) + 120)) reclaimed=0
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if docker logs chainreclaim-pg 2>&1 | grep -qF "reclaiming the pre-upgrade data dir (${PGDATA_IN_VOLUME}.old-${FROM_VERSION})"; then
+      reclaimed=1; break
+    fi
+    sleep 3
+  done
+  if [ "$reclaimed" != "1" ]; then
+    echo "  the back-dated .old-${FROM_VERSION} was never reclaimed"
+    fail_dump chainreclaim chainreclaim-pg
+    stop_pg chainreclaim-pg
+    return 1
+  fi
+
+  in_volume "$vol" "test ! -e ${PGDATA_IN_VOLUME}.old-${FROM_VERSION}" \
+    || { echo "  back-dated .old-${FROM_VERSION} still present"; stop_pg chainreclaim-pg; return 1; }
+  # The fresh (just-created) second generation must NOT have been swept along
+  # with it — its own 24h default retention has not elapsed.
+  in_volume "$vol" "test -d ${PGDATA_IN_VOLUME}.old-${TO_VERSION}" \
+    || { echo "  fresh .old-${TO_VERSION} was reclaimed early — generations are not independent"; stop_pg chainreclaim-pg; return 1; }
+  assert_eq "$(psql_in chainreclaim-pg 'SELECT count(*) FROM upgrade_canary')" "1000" "data intact after partial reclaim" \
+    || { stop_pg chainreclaim-pg; return 1; }
+  stop_pg chainreclaim-pg
+}
+
 # checksum_flag derives the target's --data-checksums / --no-data-checksums
 # from the OLD cluster's own pg_controldata, specifically so a user's stale
 # POSTGRES_INITDB_ARGS can't mismatch the pairing. That only protects
@@ -1366,7 +1437,11 @@ t_custom_initdb_args_upgrade() {
 t_patroni_volume_uses_patroni_superuser() {
   local vol="upg-e2e-patroniuser"
   seed_from_cluster "$vol" || return 1
-  in_volume "$vol" "echo '{}' > $PGDATA_IN_VOLUME/patroni.dynamic.json \
+  # A real dynamic.json always carries a top-level .postgresql key — the
+  # discriminator checks for it (see t_stray_patroni_file_not_trusted for the
+  # negative case), so the planted fixture has to be Patroni-shaped, not just
+  # correctly named.
+  in_volume "$vol" "echo '{\"postgresql\": {}}' > $PGDATA_IN_VOLUME/patroni.dynamic.json \
     && chown postgres:postgres $PGDATA_IN_VOLUME/patroni.dynamic.json" || return 1
 
   JOB_OUT=$(docker run --rm --label postgres-upgrade-e2e=1 \
@@ -1376,6 +1451,25 @@ t_patroni_volume_uses_patroni_superuser() {
   assert_eq "$JOB_RC" 0 "upgrade succeeds on a patroni-shaped volume with app-user env" || { echo "$JOB_OUT" | tail -30; return 1; }
   assert_contains "$JOB_OUT" "patroni cluster detected" "the discriminator is logged" || return 1
   assert_eq "$(marker_field "$vol" phase)" "completed" "marker completed" || return 1
+  assert_eq "$(volume_data_major "$vol")" "$TO_VERSION" "data major is TO" || return 1
+}
+
+# A stray/empty file that merely happens to be NAMED patroni.dynamic.json (a
+# manual copy, a leftover from mixing template types) must not be trusted as
+# proof of a Patroni-managed cluster — that would pick
+# PATRONI_SUPERUSER_USERNAME over the volume's real install user on an
+# ordinary postgres-ssl service. The discriminator requires the file's own
+# .postgresql key, which this fixture deliberately omits.
+t_stray_patroni_file_not_trusted() {
+  local vol="upg-e2e-straypatroni"
+  seed_from_cluster "$vol" || return 1
+  in_volume "$vol" "echo '{}' > $PGDATA_IN_VOLUME/patroni.dynamic.json \
+    && chown postgres:postgres $PGDATA_IN_VOLUME/patroni.dynamic.json" || return 1
+
+  run_job "$vol" upgrade
+  assert_eq "$JOB_RC" 0 "upgrade succeeds despite the stray file" || { echo "$JOB_OUT" | tail -30; return 1; }
+  assert_not_contains "$JOB_OUT" "patroni cluster detected" "discriminator did not fire on a non-Patroni-shaped file" || return 1
+  assert_contains "$JOB_OUT" "doesn't look like a Patroni state file" "the mismatch is logged" || return 1
   assert_eq "$(volume_data_major "$vol")" "$TO_VERSION" "data major is TO" || return 1
 }
 
@@ -1461,6 +1555,26 @@ t_unrecognized_positional_arg_refused() {
   assert_eq "$(volume_data_major "$vol")" "$FROM_VERSION" "volume untouched — did not silently upgrade" || return 1
 }
 
+# The image's own CMD is the safety net for a bare `docker run` with NO mode
+# specified at all — no UPGRADE_JOB_MODE, no positional arg — exactly the
+# ad-hoc manual/incident-response invocation the mode-dispatch guards above
+# exist for (an unrecognized positional arg refuses, but "no argument
+# whatsoever" isn't unrecognized, it silently inherits whatever CMD defaults
+# to). That default must be inert — read-only, no lock taken, no directory
+# touched — never the single most destructive mode there is.
+t_bare_invocation_defaults_to_read_only_mode() {
+  local vol="upg-e2e-barecmd"
+  seed_from_cluster "$vol" || return 1
+  JOB_OUT=$(docker run --rm --label postgres-upgrade-e2e=1 \
+    -e "PGDATA=$PGDATA_IN_VOLUME" \
+    -v "$vol:/var/lib/postgresql/data" \
+    "$JOB_IMAGE" 2>&1)
+  JOB_RC=$?
+  assert_eq "$JOB_RC" 0 "bare invocation (image default CMD) exit code" || { echo "$JOB_OUT" | tail -20; return 1; }
+  assert_contains "$JOB_OUT" '"mode":"status"' "image default is the read-only status mode, not upgrade" || return 1
+  assert_eq "$(volume_data_major "$vol")" "$FROM_VERSION" "a bare invocation must not touch the data" || return 1
+}
+
 # The production dispatch path selects the mode via UPGRADE_JOB_MODE alone,
 # with NO positional arg — Railway never sends one (see the doc comment on
 # the MODE block in upgrade-job.sh). Every other test in this suite drives
@@ -1536,6 +1650,7 @@ ALL_TESTS=(
   t_remote_auth_survives_upgrade
   t_pitr_fork_survives_upgrade
   t_second_upgrade_reaches_next_major
+  t_chained_upgrade_reclaims_by_own_age
   t_custom_initdb_args_checksums_flag_wins
   t_foreign_pair_upgraded_marker_refused
   t_job_refused_while_runtime_live
@@ -1554,11 +1669,13 @@ ALL_TESTS=(
   t_pg_version_content_cannot_forge_result_line
   t_custom_initdb_args_upgrade
   t_patroni_volume_uses_patroni_superuser
+  t_stray_patroni_file_not_trusted
   t_stale_old_keep_dir_refused
   t_unknown_marker_phase_refused
   t_pg_major_env_override_ignored
   t_railway_private_domain_pghost_ignored
   t_unrecognized_positional_arg_refused
+  t_bare_invocation_defaults_to_read_only_mode
   t_upgrade_job_mode_env_var_selects_mode
   t_railway_env_without_mode_var_refused
 )

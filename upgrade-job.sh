@@ -126,10 +126,21 @@ MARKER_FILE="$VOLUME_ROOT/.railway-major-upgrade.json"
 # The job inherits the service's variables in production, so disambiguate by
 # the volume itself: a Patroni-managed data dir always carries
 # patroni.dynamic.json. Ad-hoc runs against a custom-user volume need -e.
-if [ -f "$PGDATA/patroni.dynamic.json" ]; then
+#
+# Checked for SHAPE, not just presence: a bare filename match would also fire
+# on a stray/empty file of the same name (a manual copy, a leftover from
+# mixing template types) that has nothing to do with Patroni, silently
+# picking PATRONI_SUPERUSER_USERNAME over the volume's real install user.
+# Patroni always writes a top-level `.postgresql` key into this file, so
+# require that too — cheap, and the failure mode either way is a safe
+# pg_upgrade install-user-mismatch refusal, never a wrong upgrade.
+if [ -f "$PGDATA/patroni.dynamic.json" ] && jq -e '.postgresql' "$PGDATA/patroni.dynamic.json" >/dev/null 2>&1; then
   PG_SUPERUSER="${PATRONI_SUPERUSER_USERNAME:-postgres}"
   echo "upgrade-job: patroni cluster detected (patroni.dynamic.json) — using install user '$PG_SUPERUSER' (POSTGRES_USER is the app user on postgres-ha)"
 else
+  if [ -f "$PGDATA/patroni.dynamic.json" ]; then
+    echo "upgrade-job: found patroni.dynamic.json but it doesn't look like a Patroni state file (no .postgresql key) — ignoring it"
+  fi
   PG_SUPERUSER="${POSTGRES_USER:-postgres}"
 fi
 

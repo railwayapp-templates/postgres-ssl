@@ -34,4 +34,11 @@ RUN sed -ri "s/^(deb .*pgdg main).*$/\1 ${FROM_VERSION} ${TO_VERSION}/" /etc/apt
 COPY --chmod=755 upgrade-job.sh /usr/local/bin/upgrade-job.sh
 
 ENTRYPOINT ["upgrade-job.sh"]
-CMD ["upgrade"]
+# Read-only default: production dispatch always sets UPGRADE_JOB_MODE, which
+# wins over this positional arg unconditionally (upgrade-job.sh resolves the
+# env var before ever looking at argv), so this CMD only matters for a bare
+# `docker run` with no mode specified — exactly the ad-hoc manual/incident-
+# response invocation the entrypoint's own mode-dispatch comments call out as
+# where a typo happens. Defaulting to the single most destructive mode there
+# is would be the one input this script's fail-stop design doesn't guard.
+CMD ["status"]

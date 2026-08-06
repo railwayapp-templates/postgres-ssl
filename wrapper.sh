@@ -1724,36 +1724,69 @@ fork_post_upgrade_analyze() {
 fork_old_datadir_reclaim() {
   [ -f "$UPGRADE_MARKER_FILE" ] || return 0
   [ "$(jq -r '.phase // empty' "$UPGRADE_MARKER_FILE" 2>/dev/null || true)" = "completed" ] || return 0
-  [ -z "$(jq -r '.oldDataDirRemovedAt // empty' "$UPGRADE_MARKER_FILE" 2>/dev/null || true)" ] || return 0
   compgen -G "${PGDATA}.old-*" >/dev/null 2>&1 || return 0
   (
     retention="${UPGRADE_OLD_DIR_RETENTION_SECONDS:-86400}"
-    completed_at=$(jq -r '.completedAt // empty' "$UPGRADE_MARKER_FILE" 2>/dev/null) || exit 0
-    completed_epoch=$(date -d "$completed_at" +%s 2>/dev/null) || exit 0
-    [ -n "$completed_epoch" ] || exit 0
-    wait_secs=$(( completed_epoch + retention - $(date +%s) ))
-    if [ "$wait_secs" -gt 0 ]; then
-      echo "post-upgrade: keeping the pre-upgrade data dir for rollback; reclaiming in ${wait_secs}s"
-      sleep "$wait_secs"
-    fi
-    # Confirmation = the upgraded database is actually up and answering, not
-    # merely "the grace elapsed": a crash-looping upgrade must keep its
-    # rollback body. If postgres never becomes ready, leave everything in
-    # place — the next boot retries.
-    for _ in $(seq 1 120); do
-      pg_isready -q -h /var/run/postgresql -p 5432 2>/dev/null && break
-      sleep 5
+    marker_stamped=0
+    [ -n "$(jq -r '.oldDataDirRemovedAt // empty' "$UPGRADE_MARKER_FILE" 2>/dev/null || true)" ] && marker_stamped=1
+
+    # A chained upgrade (16->17, then 17->18 before the first reclaim ever
+    # runs) leaves TWO .old-<major> siblings on the volume at once — each
+    # job's own pre-existing-rollback-body refusal only checks ITS OWN
+    # FROM-suffixed name, never a glob, so nothing stops them coexisting.
+    # Keying reclaim off the CURRENT marker's completedAt alone (as a single
+    # `rm -rf "${PGDATA}".old-*` gated on one timestamp) would judge every
+    # generation by the LATEST upgrade's clock — sweeping an older, unrelated
+    # rollback body early if a later upgrade used a shorter retention
+    # override, or holding it hostage to a later upgrade's own wait. A
+    # directory's own mtime is set once, by the `mv` that created it in
+    # finish_swap, and nothing writes into it afterward — that makes it an
+    # independent per-generation clock. Loop so each sibling is judged, and
+    # reclaimed, on its own schedule; the earliest deadline first, so a
+    # long-overdue orphan from a previous chain link doesn't wait behind a
+    # much younger one.
+    while :; do
+      remaining=()
+      for old_dir in "${PGDATA}".old-*; do
+        [ -d "$old_dir" ] || continue
+        dir_mtime=$(stat -c %Y "$old_dir" 2>/dev/null) || continue
+        remaining+=("$(( dir_mtime + retention )):${old_dir}")
+      done
+      [ "${#remaining[@]}" -eq 0 ] && break
+
+      next=$(printf '%s\n' "${remaining[@]}" | sort -n | head -1)
+      next_deadline="${next%%:*}"
+      next_dir="${next#*:}"
+      wait_secs=$(( next_deadline - $(date +%s) ))
+      if [ "$wait_secs" -gt 0 ]; then
+        echo "post-upgrade: keeping ${next_dir} for rollback; reclaiming in ${wait_secs}s"
+        sleep "$wait_secs"
+      fi
+
+      # Confirmation = the upgraded database is actually up and answering, not
+      # merely "the grace elapsed": a crash-looping upgrade must keep every
+      # rollback body in place. If postgres never becomes ready, stop
+      # entirely — the next boot's fork re-evaluates everything from scratch.
+      ready=0
+      for _ in $(seq 1 120); do
+        if pg_isready -q -h /var/run/postgresql -p 5432 2>/dev/null; then ready=1; break; fi
+        sleep 5
+      done
+      [ "$ready" = 1 ] || exit 0
+
+      echo "post-upgrade: reclaiming the pre-upgrade data dir (${next_dir})"
+      if ! rm -rf "$next_dir"; then
+        echo "post-upgrade: could not remove ${next_dir}; will retry on next boot"
+        break
+      fi
+      if [ "$marker_stamped" = 0 ]; then
+        # Serialized against the analyze fork's update — see update_upgrade_marker.
+        update_upgrade_marker --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '.oldDataDirRemovedAt = $t' \
+          || echo "post-upgrade: could not stamp oldDataDirRemovedAt (reclaim already done; cosmetic)"
+        marker_stamped=1
+      fi
+      echo "post-upgrade: pre-upgrade data dir reclaimed (${next_dir})"
     done
-    pg_isready -q -h /var/run/postgresql -p 5432 2>/dev/null || exit 0
-    echo "post-upgrade: reclaiming the pre-upgrade data dir (${PGDATA}.old-*)"
-    if ! rm -rf "${PGDATA}".old-*; then
-      echo "post-upgrade: could not remove the pre-upgrade data dir; will retry on next boot"
-      exit 0
-    fi
-    # Serialized against the analyze fork's update — see update_upgrade_marker.
-    update_upgrade_marker --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '.oldDataDirRemovedAt = $t' \
-      || echo "post-upgrade: could not stamp oldDataDirRemovedAt (reclaim already done; cosmetic)"
-    echo "post-upgrade: pre-upgrade data dir reclaimed"
   ) &
 }
 
