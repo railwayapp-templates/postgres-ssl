@@ -521,14 +521,23 @@ t_s3_unreachable_pg_stays_up() {
   for i in 1 2 3 4; do
     docker exec "$name" psql -U postgres -c "INSERT INTO t SELECT g FROM generate_series(1,100000) g; SELECT pg_switch_wal();" >/dev/null 2>&1
   done
-  sleep 5
 
   local alive
   alive=$(docker exec "$name" psql -U postgres -At -c "SELECT 1" 2>/dev/null || echo "DEAD")
   assert_eq "$alive" "1" "postgres alive after S3 outage" || { ko t_s3_unreachable_pg_stays_up ""; docker start "$MINIO" >/dev/null; return; }
 
-  local failed_count
-  failed_count=$(docker exec "$name" psql -U postgres -At -c "SELECT failed_count FROM pg_stat_archiver" 2>/dev/null || echo 0)
+  # A fixed sleep here raced the archiver's own retry/backoff on a loaded
+  # runner: docker stop returning is not the same instant pgbackrest's
+  # archive-push actually observes the connection refusal and reports back to
+  # postgres, and that latency is exactly what varies under load. Poll
+  # instead of guessing a sleep long enough for the slowest runner.
+  local failed_count=0
+  local deadline=$(($(date +%s) + 30))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    failed_count=$(docker exec "$name" psql -U postgres -At -c "SELECT failed_count FROM pg_stat_archiver" 2>/dev/null || echo 0)
+    [ "$failed_count" -ge 1 ] && break
+    sleep 1
+  done
   if [ "$failed_count" -lt 1 ]; then
     ko t_s3_unreachable_pg_stays_up "pg_stat_archiver.failed_count should grow under S3 outage; got $failed_count"
     docker start "$MINIO" >/dev/null
@@ -537,10 +546,14 @@ t_s3_unreachable_pg_stays_up() {
 
   log "restarting MinIO; archiver should catch up"
   docker start "$MINIO" >/dev/null
-  sleep 8
 
-  local archived_count
-  archived_count=$(docker exec "$name" psql -U postgres -At -c "SELECT archived_count FROM pg_stat_archiver")
+  local archived_count=0
+  deadline=$(($(date +%s) + 30))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    archived_count=$(docker exec "$name" psql -U postgres -At -c "SELECT archived_count FROM pg_stat_archiver" 2>/dev/null || echo 0)
+    [ "$archived_count" -ge 1 ] && break
+    sleep 1
+  done
   if [ "$archived_count" -lt 1 ]; then
     ko t_s3_unreachable_pg_stays_up "archived_count did not climb after S3 came back; got $archived_count"
     return
