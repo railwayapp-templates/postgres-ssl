@@ -395,14 +395,17 @@ t_check_blocker() {
 }
 
 # reg*/aclitem columns never block from a >=16 source (verified for 16→17);
-# whether they block from any GIVEN pre-16 source is not a clean rule —
-# empirically, 15→16 fires both, but 14→15 fires neither (pg_upgrade's own
-# checks evidently depend on what changed across that specific pair's span,
-# not on the source major alone). This runs on whichever pre-16 pair the
-# suite is invoked with and asserts pg_upgrade agrees with what THAT pair
-# is known to do — it is not a general statement about every pre-16 source.
-# This is the same real-world gating the dashboard preflight's version
-# check mirrors.
+# whether they block from any GIVEN pre-16 source is not a clean rule, and the
+# two checks don't even share the same rule with EACH OTHER — verified
+# directly by running this suite with FROM_VERSION=14 and FROM_VERSION=15:
+# reg* blocks from BOTH 14 and 15; aclitem blocks from 15 but NOT from 14
+# (pg_upgrade's own checks evidently depend on what changed across that
+# specific pair's span, not on the source major alone — an earlier version of
+# this comment claimed 14→15 fired neither, which a real run contradicted for
+# reg*). This runs on whichever pre-16 pair the suite is invoked with and
+# asserts pg_upgrade agrees with what THAT pair is known to do — it is not a
+# general statement about every pre-16 source. This is the same real-world
+# gating the dashboard preflight's version check mirrors.
 #
 # Seeded and checked SEPARATELY, not both columns in one cluster: pg_upgrade
 # runs its consistency checks in a fixed sequence and stops at the first
@@ -420,6 +423,10 @@ t_check_blocker_pre16_types() {
   assert_eq "$JOB_RC" 1 "check exit code with a reg* blocker" || { echo "$JOB_OUT" | tail -20; return 1; }
   assert_contains "$JOB_OUT" "reg* data types" "reg* blocker named" || return 1
 
+  if [ "$FROM_VERSION" -lt 15 ]; then
+    note "skipped aclitem sub-case: verified to fire from 15 but NOT from 14"
+    return 0
+  fi
   local vol2="upg-e2e-pre16types-aclitem"
   seed_from_cluster "$vol2" "CREATE TABLE t_aclitem (c aclitem)" || return 1
   run_job "$vol2" check
