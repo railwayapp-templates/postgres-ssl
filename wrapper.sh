@@ -71,6 +71,59 @@ if command -v flock >/dev/null 2>&1 && [ -d "$EXPECTED_VOLUME_MOUNT_PATH" ] \
 fi
 
 # -----------------------------------------------------------------------------
+# Runtime lock: at most one postgres container touches this volume at a time.
+# Held EXCLUSIVELY (fd 9) for the container's lifetime, same shell-as-PID-1
+# mechanics as the upgrade lock above — the kernel releases it only when the
+# last process holding the open description exits, so "lock free" really
+# means every process of the previous container is gone, however that
+# container ended (graceful stop, SIGKILL, OOM).
+#
+# Why: a redeploy can leave the old and new containers briefly overlapping
+# on the shared volume. The stale-postmaster.pid removal below cannot see
+# the old container's postgres (different PID namespace), and worse, a
+# still-shutting-down old postmaster unlinks postmaster.pid on its way out
+# — deleting the file the NEW postgres just wrote. Postgres treats a missing
+# lock file as fatal on its once-per-minute recheck and shuts itself down.
+# Waiting on the previous holder before touching the data directory closes
+# both directions of that race.
+#
+# Fail-stop on timeout: refusing to boot (the restart policy retries) beats
+# starting a second postmaster against a volume the previous one may still
+# be using. Same legacy-layout skip as the upgrade lock: never create files
+# inside an empty PGDATA-at-the-volume-root, or docker-entrypoint skips
+# initdb.
+# -----------------------------------------------------------------------------
+RUNTIME_LOCK_FILE="$EXPECTED_VOLUME_MOUNT_PATH/.railway-postgres-runtime.lock"
+RUNTIME_LOCK_WAIT_SECONDS="${RUNTIME_LOCK_WAIT_SECONDS:-300}"
+# Must be a whole number of seconds: `flock -w` rejects anything else with a
+# usage error, whose non-zero exit is indistinguishable from a hold timeout
+# below — so a typo'd override would surface as "previous container did not
+# release the volume" and instant-fail every boot DURING a real overlap,
+# exactly when the wait matters. Fall back loudly instead.
+case "$RUNTIME_LOCK_WAIT_SECONDS" in
+  ''|*[!0-9]*)
+    echo "wrapper: RUNTIME_LOCK_WAIT_SECONDS='${RUNTIME_LOCK_WAIT_SECONDS}' is not a whole number of seconds; using 300" >&2
+    RUNTIME_LOCK_WAIT_SECONDS=300
+    ;;
+esac
+if command -v flock >/dev/null 2>&1 && [ -d "$EXPECTED_VOLUME_MOUNT_PATH" ] \
+  && ! { [ "$PGDATA" = "$EXPECTED_VOLUME_MOUNT_PATH" ] && [ ! -f "$PGDATA/PG_VERSION" ]; }; then
+  # Brace-group-scoped stderr for the same reason as the upgrade lock above.
+  if { exec 9>>"$RUNTIME_LOCK_FILE"; } 2>/dev/null; then
+    if ! flock -n -x 9; then
+      echo "wrapper: another postgres container still holds this volume (overlapping deploy); waiting up to ${RUNTIME_LOCK_WAIT_SECONDS}s for it to shut down"
+      if ! flock -w "$RUNTIME_LOCK_WAIT_SECONDS" -x 9; then
+        echo "wrapper: previous container did not release the volume within ${RUNTIME_LOCK_WAIT_SECONDS}s; refusing to start postgres on a volume another postmaster may still be using"
+        exit 1
+      fi
+      echo "wrapper: previous container released the volume; continuing boot"
+    fi
+  else
+    echo "wrapper: could not open $RUNTIME_LOCK_FILE; continuing without the runtime lock" >&2
+  fi
+fi
+
+# -----------------------------------------------------------------------------
 # Major-version guards. Both are fail-stop and loud, and both run before
 # anything touches the data directory, so a mismatched boot can never corrupt
 # data or initdb over a half-swapped upgrade.
@@ -194,6 +247,14 @@ POSTGRES_CONF_FILE="$PGDATA/postgresql.conf"
 # guarantees only one wrapper.sh per container instance. Avoids the
 # need for a graceful-shutdown handoff that re-parents children onto
 # postmaster (postmaster panics with SIGCHLD on unknown children).
+#
+# "No postgres running" additionally covers OTHER containers on this
+# volume once the runtime lock (fd 9, above) is held: any previous
+# container running this image keeps that lock until its last process
+# exits, so reaching this line means no lock-honoring postmaster can
+# still be alive on the volume. A previous container from an image
+# WITHOUT the lock can still overlap; the unasked-clean-exit shaping at
+# the bottom of this file is what recovers that case.
 if [ -f "$PGDATA/postmaster.pid" ]; then
   echo "wrapper: removing stale $PGDATA/postmaster.pid (no postgres running at container start)"
   rm -f "$PGDATA/postmaster.pid" 2>/dev/null || true
@@ -1817,4 +1878,37 @@ fork_old_datadir_reclaim
 # subprocesses. Falling back to the simple foreground invocation
 # preserves the e2e suite's existing behavior on docker stop / docker
 # restart.
-/usr/local/bin/docker-entrypoint.sh "$@"
+#
+# The traps below deliberately do NOT forward signals or restructure the
+# foreground invocation (that is the pattern CI rejected). They only
+# record that a stop was requested: bash runs a trap after the foreground
+# child returns, so by the time the exit-code shaping below executes the
+# flag reflects whether the runtime asked us to stop. That distinction is
+# what lets a postgres that dies CLEANLY BUT UNASKED — e.g. it shut itself
+# down because something unlinked its postmaster.pid — exit this container
+# nonzero so an ON_FAILURE restart policy can bring the database back,
+# instead of the container reporting exit 0 and staying down forever.
+#
+# The flag is a one-shot latch: a TERM/INT that never culminates in a stop
+# (an operator poking PID 1, a platform stop that gets cancelled) still
+# reclassifies a LATER unasked clean exit as requested, exit 0, no restart.
+# Accepted: bash defers trap execution until the foreground child returns,
+# so signal-delivery time cannot be recorded and a recency check is not
+# implementable in this design — and on Railway a TERM broadcast is always
+# followed by container removal, so a latched flag never coexists with a
+# live postgres for long.
+STOP_REQUESTED=0
+trap 'STOP_REQUESTED=1' TERM INT
+
+ENTRYPOINT_EXIT=0
+/usr/local/bin/docker-entrypoint.sh "$@" || ENTRYPOINT_EXIT=$?
+
+if [ "$ENTRYPOINT_EXIT" -ne 0 ]; then
+  # Failure exit codes already make the restart policy act; pass through.
+  exit "$ENTRYPOINT_EXIT"
+fi
+if [ "$STOP_REQUESTED" = "1" ]; then
+  exit 0
+fi
+echo "wrapper: postgres exited cleanly but no stop was requested; exiting nonzero so the restart policy can recover the database"
+exit 1
