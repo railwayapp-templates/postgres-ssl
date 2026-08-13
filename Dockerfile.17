@@ -9,9 +9,15 @@ FROM postgres:${POSTGRES_VERSION}
 # pending-security-fix set moved, so this layer re-runs exactly when there
 # is something to pick up — and stays byte-cached (stable digest) otherwise.
 ARG PKG_REFRESH=none
+# apt-mark hold: the OS upgrade must never touch the packages that define
+# the bundled Postgres minor — PGDG always carries the major's newest minor,
+# so an unheld upgrade can make the image bundle a newer server than the
+# minor tag it publishes under. Everything else upgrades freely.
 RUN echo "refresh key: ${PKG_REFRESH}" \
+    && apt-mark hold postgresql-17 postgresql-client-17 \
     && apt-get update && apt-get upgrade -y \
     && apt-get install -y openssl sudo ca-certificates jq pgbackrest postgresql-17-pgvector \
+    && apt-mark unhold postgresql-17 postgresql-client-17 \
     && rm -rf /var/lib/apt/lists/*
 
 # Allow the postgres user to execute certain commands as root without a password
