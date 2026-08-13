@@ -375,6 +375,11 @@ t_runtime_lock_blocks_overlapping_boot() {
   # next once-per-minute lock-file recheck.
   local name=t-rtlock-${PG_VERSION}
   local vol=${name}-vol
+  # Asserts on wrapper.sh behavior — never trust a pre-existing tag.
+  if ! rebuild_image; then
+    ko "${FUNCNAME[0]}" "could not rebuild $IMAGE"
+    return
+  fi
   new_volume "$vol"
   docker rm -f "$name" "${name}-b" >/dev/null 2>&1 || true
   docker run -d --name "$name" --label postgres-ssl-e2e=1 --network "$NET" \
@@ -400,11 +405,23 @@ t_runtime_lock_blocks_overlapping_boot() {
     fail_dump t_runtime_lock_blocks_overlapping_boot "${name}-b"
     return
   fi
+  # Pin the ordering, not just the park: the "released the volume" line is
+  # printed only when the flock -w wait returns, so seeing it BEFORE the
+  # first container dies means a broken wait that returned immediately —
+  # which the "starting PostgreSQL" grep alone could miss (postgres takes
+  # longer than the grep to log its first line).
+  if docker logs "${name}-b" 2>&1 | grep -q "previous container released the volume"; then
+    ko t_runtime_lock_blocks_overlapping_boot "second container exited the lock wait while the first still held the volume"
+    fail_dump t_runtime_lock_blocks_overlapping_boot "${name}-b"
+    return
+  fi
 
   # Kill the first container outright — SIGKILL included, the kernel must
   # release the flock — and the second boot should proceed to a healthy
   # postgres.
   docker rm -f "$name" >/dev/null
+  wait_for_log_line "${name}-b" "previous container released the volume" 60 \
+    || { ko t_runtime_lock_blocks_overlapping_boot "second container never logged the lock release after the first died"; fail_dump t_runtime_lock_blocks_overlapping_boot "${name}-b"; return; }
   wait_for_pg "${name}-b" || { ko t_runtime_lock_blocks_overlapping_boot "second container did not start after the first released the volume"; fail_dump t_runtime_lock_blocks_overlapping_boot "${name}-b"; return; }
 
   ok t_runtime_lock_blocks_overlapping_boot
@@ -420,6 +437,11 @@ t_unasked_clean_exit_is_nonzero() {
   # down until a human redeploys.
   local name=t-unasked-exit-${PG_VERSION}
   local vol=${name}-vol
+  # Asserts on wrapper.sh behavior — never trust a pre-existing tag.
+  if ! rebuild_image; then
+    ko "${FUNCNAME[0]}" "could not rebuild $IMAGE"
+    return
+  fi
   new_volume "$vol"
   docker rm -f "$name" >/dev/null 2>&1 || true
   docker run -d --name "$name" --label postgres-ssl-e2e=1 --network "$NET" \
@@ -466,6 +488,11 @@ t_requested_stop_still_exits_zero() {
   # keep the container's exit 0 — a stop must never look like a crash.
   local name=t-asked-exit-${PG_VERSION}
   local vol=${name}-vol
+  # Asserts on wrapper.sh behavior — never trust a pre-existing tag.
+  if ! rebuild_image; then
+    ko "${FUNCNAME[0]}" "could not rebuild $IMAGE"
+    return
+  fi
   new_volume "$vol"
   docker rm -f "$name" >/dev/null 2>&1 || true
   docker run -d --name "$name" --label postgres-ssl-e2e=1 --network "$NET" \

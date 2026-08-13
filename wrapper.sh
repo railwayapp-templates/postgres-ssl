@@ -95,6 +95,17 @@ fi
 # -----------------------------------------------------------------------------
 RUNTIME_LOCK_FILE="$EXPECTED_VOLUME_MOUNT_PATH/.railway-postgres-runtime.lock"
 RUNTIME_LOCK_WAIT_SECONDS="${RUNTIME_LOCK_WAIT_SECONDS:-300}"
+# Must be a whole number of seconds: `flock -w` rejects anything else with a
+# usage error, whose non-zero exit is indistinguishable from a hold timeout
+# below — so a typo'd override would surface as "previous container did not
+# release the volume" and instant-fail every boot DURING a real overlap,
+# exactly when the wait matters. Fall back loudly instead.
+case "$RUNTIME_LOCK_WAIT_SECONDS" in
+  ''|*[!0-9]*)
+    echo "wrapper: RUNTIME_LOCK_WAIT_SECONDS='${RUNTIME_LOCK_WAIT_SECONDS}' is not a whole number of seconds; using 300" >&2
+    RUNTIME_LOCK_WAIT_SECONDS=300
+    ;;
+esac
 if command -v flock >/dev/null 2>&1 && [ -d "$EXPECTED_VOLUME_MOUNT_PATH" ] \
   && ! { [ "$PGDATA" = "$EXPECTED_VOLUME_MOUNT_PATH" ] && [ ! -f "$PGDATA/PG_VERSION" ]; }; then
   # Brace-group-scoped stderr for the same reason as the upgrade lock above.
@@ -1877,6 +1888,15 @@ fork_old_datadir_reclaim
 # down because something unlinked its postmaster.pid — exit this container
 # nonzero so an ON_FAILURE restart policy can bring the database back,
 # instead of the container reporting exit 0 and staying down forever.
+#
+# The flag is a one-shot latch: a TERM/INT that never culminates in a stop
+# (an operator poking PID 1, a platform stop that gets cancelled) still
+# reclassifies a LATER unasked clean exit as requested, exit 0, no restart.
+# Accepted: bash defers trap execution until the foreground child returns,
+# so signal-delivery time cannot be recorded and a recency check is not
+# implementable in this design — and on Railway a TERM broadcast is always
+# followed by container removal, so a latched flag never coexists with a
+# live postgres for long.
 STOP_REQUESTED=0
 trap 'STOP_REQUESTED=1' TERM INT
 
