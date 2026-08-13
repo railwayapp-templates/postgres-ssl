@@ -366,6 +366,153 @@ t_vanilla_boot() {
   docker volume rm "$vol" >/dev/null
 }
 
+t_runtime_lock_blocks_overlapping_boot() {
+  # Two containers on the same volume: the second must not touch the data
+  # directory or start postgres until every process of the first is gone.
+  # This is the redeploy-overlap shape: a new container booting while the
+  # old postmaster is still shutting down ends with the old postmaster's
+  # exit unlinking the NEW postmaster.pid, and postgres kills itself on its
+  # next once-per-minute lock-file recheck.
+  local name=t-rtlock-${PG_VERSION}
+  local vol=${name}-vol
+  new_volume "$vol"
+  docker rm -f "$name" "${name}-b" >/dev/null 2>&1 || true
+  docker run -d --name "$name" --label postgres-ssl-e2e=1 --network "$NET" \
+    -e POSTGRES_PASSWORD=test \
+    -e PGDATA=/var/lib/postgresql/data/pgdata \
+    -v "$vol:/var/lib/postgresql/data" \
+    "$IMAGE" >/dev/null
+  # See t_requested_stop_still_exits_zero: outwait the initdb temp server.
+  wait_for_log_line "$name" "init process complete" 120 \
+    || { ko t_runtime_lock_blocks_overlapping_boot "initdb did not complete"; fail_dump t_runtime_lock_blocks_overlapping_boot "$name"; return; }
+  wait_for_pg "$name" || { ko t_runtime_lock_blocks_overlapping_boot "first container did not start"; fail_dump t_runtime_lock_blocks_overlapping_boot "$name"; return; }
+
+  # Overlapping boot on the same volume must park on the runtime lock.
+  docker run -d --name "${name}-b" --label postgres-ssl-e2e=1 --network "$NET" \
+    -e POSTGRES_PASSWORD=test \
+    -e PGDATA=/var/lib/postgresql/data/pgdata \
+    -v "$vol:/var/lib/postgresql/data" \
+    "$IMAGE" >/dev/null
+  wait_for_log_line "${name}-b" "another postgres container still holds this volume" 30 \
+    || { ko t_runtime_lock_blocks_overlapping_boot "second container did not report waiting on the runtime lock"; fail_dump t_runtime_lock_blocks_overlapping_boot "${name}-b"; return; }
+  if docker logs "${name}-b" 2>&1 | grep -q "starting PostgreSQL"; then
+    ko t_runtime_lock_blocks_overlapping_boot "second container started postgres while the first still held the volume"
+    fail_dump t_runtime_lock_blocks_overlapping_boot "${name}-b"
+    return
+  fi
+
+  # Kill the first container outright — SIGKILL included, the kernel must
+  # release the flock — and the second boot should proceed to a healthy
+  # postgres.
+  docker rm -f "$name" >/dev/null
+  wait_for_pg "${name}-b" || { ko t_runtime_lock_blocks_overlapping_boot "second container did not start after the first released the volume"; fail_dump t_runtime_lock_blocks_overlapping_boot "${name}-b"; return; }
+
+  ok t_runtime_lock_blocks_overlapping_boot
+  docker rm -f "${name}-b" >/dev/null
+  docker volume rm "$vol" >/dev/null
+}
+
+t_unasked_clean_exit_is_nonzero() {
+  # A postgres that shuts down CLEANLY without anyone asking (here: its
+  # postmaster.pid is unlinked and its once-per-minute lock-file recheck
+  # fires an immediate shutdown) must not leave the container exit 0 — an
+  # ON_FAILURE restart policy treats 0 as success and the database stays
+  # down until a human redeploys.
+  local name=t-unasked-exit-${PG_VERSION}
+  local vol=${name}-vol
+  new_volume "$vol"
+  docker rm -f "$name" >/dev/null 2>&1 || true
+  docker run -d --name "$name" --label postgres-ssl-e2e=1 --network "$NET" \
+    -e POSTGRES_PASSWORD=test \
+    -e PGDATA=/var/lib/postgresql/data/pgdata \
+    -v "$vol:/var/lib/postgresql/data" \
+    "$IMAGE" >/dev/null
+  # See t_requested_stop_still_exits_zero: outwait the initdb temp server.
+  wait_for_log_line "$name" "init process complete" 120 \
+    || { ko t_unasked_clean_exit_is_nonzero "initdb did not complete"; fail_dump t_unasked_clean_exit_is_nonzero "$name"; return; }
+  wait_for_pg "$name" || { ko t_unasked_clean_exit_is_nonzero "postgres did not start"; fail_dump t_unasked_clean_exit_is_nonzero "$name"; return; }
+
+  docker exec "$name" bash -c 'rm -f "$PGDATA/postmaster.pid"'
+
+  # The recheck runs once per minute; give it that plus shutdown slack.
+  local deadline=$(($(date +%s) + 100)) status=""
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    status=$(docker inspect -f '{{.State.Status}}' "$name" 2>/dev/null || echo "")
+    [ "$status" = "exited" ] && break
+    sleep 2
+  done
+  if [ "$status" != "exited" ]; then
+    ko t_unasked_clean_exit_is_nonzero "container did not exit after postgres self-shutdown"
+    fail_dump t_unasked_clean_exit_is_nonzero "$name"
+    return
+  fi
+
+  local exit_code
+  exit_code=$(docker inspect -f '{{.State.ExitCode}}' "$name")
+  assert_eq "$exit_code" "1" "container exit code after unasked clean postgres exit" \
+    || { ko t_unasked_clean_exit_is_nonzero ""; fail_dump t_unasked_clean_exit_is_nonzero "$name"; return; }
+  wait_for_log_line "$name" "no stop was requested" 10 \
+    || { ko t_unasked_clean_exit_is_nonzero "missing unasked-exit log line"; fail_dump t_unasked_clean_exit_is_nonzero "$name"; return; }
+
+  ok t_unasked_clean_exit_is_nonzero
+  docker rm -f "$name" >/dev/null
+  docker volume rm "$vol" >/dev/null
+}
+
+t_requested_stop_still_exits_zero() {
+  # The counterpart to t_unasked_clean_exit_is_nonzero: when the runtime
+  # DID ask us to stop (Railway's VM runtime delivers SIGTERM to every
+  # process in the container, wrapper included), a clean postgres exit must
+  # keep the container's exit 0 — a stop must never look like a crash.
+  local name=t-asked-exit-${PG_VERSION}
+  local vol=${name}-vol
+  new_volume "$vol"
+  docker rm -f "$name" >/dev/null 2>&1 || true
+  docker run -d --name "$name" --label postgres-ssl-e2e=1 --network "$NET" \
+    -e POSTGRES_PASSWORD=test \
+    -e PGDATA=/var/lib/postgresql/data/pgdata \
+    -v "$vol:/var/lib/postgresql/data" \
+    "$IMAGE" >/dev/null
+  # First boot on a fresh volume: pg_isready answers the initdb TEMP
+  # postmaster too, so wait for the entrypoint to hand off to the final
+  # server before signaling anything.
+  wait_for_log_line "$name" "init process complete" 120 \
+    || { ko t_requested_stop_still_exits_zero "initdb did not complete"; fail_dump t_requested_stop_still_exits_zero "$name"; return; }
+  wait_for_pg "$name" || { ko t_requested_stop_still_exits_zero "postgres did not start"; fail_dump t_requested_stop_still_exits_zero "$name"; return; }
+
+  # Simulate the runtime's stop: TERM to the wrapper (PID 1), then a clean
+  # postgres shutdown. The wrapper's trap only records the request; the
+  # shutdown itself is postgres's own.
+  docker exec "$name" kill -TERM 1
+  docker exec -u postgres "$name" bash -c 'pg_ctl stop -D "$PGDATA" -m fast -w'
+
+  local deadline=$(($(date +%s) + 30)) status=""
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    status=$(docker inspect -f '{{.State.Status}}' "$name" 2>/dev/null || echo "")
+    [ "$status" = "exited" ] && break
+    sleep 1
+  done
+  if [ "$status" != "exited" ]; then
+    ko t_requested_stop_still_exits_zero "container did not exit after requested stop"
+    fail_dump t_requested_stop_still_exits_zero "$name"
+    return
+  fi
+
+  local exit_code
+  exit_code=$(docker inspect -f '{{.State.ExitCode}}' "$name")
+  assert_eq "$exit_code" "0" "container exit code after requested stop" \
+    || { ko t_requested_stop_still_exits_zero ""; fail_dump t_requested_stop_still_exits_zero "$name"; return; }
+  if docker logs "$name" 2>&1 | grep -q "no stop was requested"; then
+    ko t_requested_stop_still_exits_zero "requested stop was misclassified as unasked"
+    fail_dump t_requested_stop_still_exits_zero "$name"
+    return
+  fi
+
+  ok t_requested_stop_still_exits_zero
+  docker rm -f "$name" >/dev/null
+  docker volume rm "$vol" >/dev/null
+}
+
 t_collation_refresh_no_permission_error() {
   # Regression: fork_collation_refresh's mktemp ran as root (mode 0600,
   # root-owned) while the gosu postgres psql call read it as the postgres
@@ -4531,6 +4678,9 @@ t_invalid_bucket_sentinel_cleared_on_disable() {
 
 ALL_TESTS=(
   t_vanilla_boot
+  t_runtime_lock_blocks_overlapping_boot
+  t_unasked_clean_exit_is_nonzero
+  t_requested_stop_still_exits_zero
   t_collation_refresh_no_permission_error
   t_invalid_bucket_skips_archive
   t_archiving_boot
