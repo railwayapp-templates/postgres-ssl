@@ -1,8 +1,12 @@
 name: Build and Push PostgreSQL Images
 
 on:
+  # Daily (was weekly): the content gate makes a quiet run publish nothing,
+  # so the only cost of the tighter cadence is the gate probes — and a
+  # Debian security fix or upstream re-mint now reaches the images within a
+  # day instead of up to a week, matching postgres-ha.
   schedule:
-    - cron: "0 0 * * 1"  # Every Monday at midnight UTC
+    - cron: "30 0 * * *"  # Daily at 00:30 UTC
   workflow_dispatch:
     inputs:
       force:
@@ -19,9 +23,81 @@ on:
 
 env:
   LATEST_POSTGRES_MAJOR: 16  # Change this to update which version gets tagged as 'latest'
+  # The single policy knob for which majors get (per-minor) builds. The
+  # X.Y minors within each major are discovered per run, never hardcoded.
+  POSTGRES_SUPPORTED_MAJORS: "13 14 15 16 17 18"
 
 jobs:
+  # Which postgres minors to build. Two sources, unioned (same scheme as
+  # postgres-ha):
+  #   1. every per-minor tag already published on ghcr — the PINNABLE
+  #      surface. Upstream never re-mints a superseded patch tag, so a
+  #      service pinned to :16.10 only receives refreshed layers if WE keep
+  #      rebuilding that tag;
+  #   2. the newest upstream minor of every supported major, so a fresh
+  #      patch release enters the set the day it ships.
+  # Fails closed: a registry listing error or an unresolvable major aborts
+  # the run rather than silently building a shrunken set.
+  discover-postgres-minors:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.discover.outputs.matrix }}
+    steps:
+      - name: Discover minors to build
+        id: discover
+        run: |
+          set -euo pipefail
+
+          # Newest upstream minor per supported major, via the Docker
+          # Registry v2 API (registry-1.docker.io) — the Hub website API
+          # hard-blocks shared GitHub runner IPs with persistent 403s.
+          HUB_TOKEN=$(curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 \
+            "https://auth.docker.io/token?service=registry.docker.io&scope=repository:library/postgres:pull" \
+            | jq -r .token)
+          [ -n "$HUB_TOKEN" ] && [ "$HUB_TOKEN" != "null" ]
+          UPSTREAM_MINORS=$(curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 \
+            -H "Authorization: Bearer $HUB_TOKEN" \
+            "https://registry-1.docker.io/v2/library/postgres/tags/list?n=10000" \
+            | jq -r '.tags[]' | grep -E '^[0-9]+\.[0-9]+$')
+
+          # Every per-minor tag we have ever published (anonymous pull token —
+          # the package is public).
+          GHCR_TOKEN=$(curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 \
+            "https://ghcr.io/token?scope=repository:${{ github.repository }}:pull" \
+            | jq -r .token)
+          [ -n "$GHCR_TOKEN" ] && [ "$GHCR_TOKEN" != "null" ]
+          PUBLISHED_MINORS=$(curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 \
+            -H "Authorization: Bearer $GHCR_TOKEN" \
+            "https://ghcr.io/v2/${{ github.repository }}/tags/list?n=10000" \
+            | jq -r '.tags[]' | grep -E '^[0-9]+\.[0-9]+$' || true)
+
+          INCLUDE="[]"
+          for MAJOR in $POSTGRES_SUPPORTED_MAJORS; do
+            LATEST=$(printf '%s\n' "$UPSTREAM_MINORS" | grep -E "^${MAJOR}\.[0-9]+$" | sort -V | tail -1)
+            if [ -z "$LATEST" ]; then
+              echo "::error::no upstream minor resolved for major ${MAJOR} — refusing to shrink the build set"
+              exit 1
+            fi
+            MINORS=$( { printf '%s\n' "$PUBLISHED_MINORS" | grep -E "^${MAJOR}\.[0-9]+$" || true; echo "$LATEST"; } | sort -uV)
+            for MINOR in $MINORS; do
+              IS_LATEST=$([ "$MINOR" = "$LATEST" ] && echo true || echo false)
+              INCLUDE=$(jq -c --arg major "$MAJOR" --arg minor "$MINOR" --argjson latest "$IS_LATEST" \
+                '. + [{major: $major, minor: $minor, latest: $latest}]' <<<"$INCLUDE")
+            done
+          done
+
+          printf '%s\n' "$PUBLISHED_MINORS" \
+            | grep -vE "^($(echo $POSTGRES_SUPPORTED_MAJORS | tr ' ' '|'))\." \
+            | sed 's/^/::warning::published minor tag outside supported majors, NOT rebuilt: /' || true
+
+          COUNT=$(jq 'length' <<<"$INCLUDE")
+          echo "building ${COUNT} minors: $(jq -r '[.[].minor] | join(", ")' <<<"$INCLUDE")"
+          echo "matrix=$(jq -c '{include: .}' <<<"$INCLUDE")" >> "$GITHUB_OUTPUT"
+
+  # One job per discovered minor: the minor tag is always pushed; the major
+  # tag (and :latest) rides along on whichever minor is that major's newest.
   build-postgres:
+    needs: discover-postgres-minors
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -29,21 +105,14 @@ jobs:
       id-token: write
 
     strategy:
-      matrix:
-        postgres_major: [13, 14, 15, 16, 17, 18]
+      # A single minor failing to build must not cancel the backfill of the
+      # rest of the pinnable surface.
+      fail-fast: false
+      matrix: ${{ fromJson(needs.discover-postgres-minors.outputs.matrix) }}
 
     steps:
       - name: Checkout sources
         uses: actions/checkout@v4
-
-      - name: Get latest PostgreSQL version
-        id: get_version
-        run: |
-          # Get the latest minor version for this major version
-          MINOR_VERSION=$(./get-postgres-version.sh ${{ matrix.postgres_major }})
-          echo "minor_version=${MINOR_VERSION}" >> $GITHUB_OUTPUT
-          
-          echo "Building PostgreSQL $MINOR_VERSION with tags: ${{ matrix.postgres_major }}, ${MINOR_VERSION}"
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -74,11 +143,11 @@ jobs:
         run: |
           set -o pipefail
           IMG="ghcr.io/${{ github.repository }}"
-          TAG="${{ steps.get_version.outputs.minor_version }}"
-          BASE="postgres:${{ steps.get_version.outputs.minor_version }}"
+          TAG="${{ matrix.minor }}"
+          BASE="postgres:${{ matrix.minor }}"
 
           GATE_OK=true
-          CODE_KEY=$(git ls-tree HEAD | grep -E "\.sh$|Dockerfile\.${{ matrix.postgres_major }}$" | sha256sum | cut -c1-16) || GATE_OK=false
+          CODE_KEY=$(git ls-tree HEAD | grep -E "\.sh$|Dockerfile\.${{ matrix.major }}$" | sha256sum | cut -c1-16) || GATE_OK=false
           BASE_DIGEST=$(docker buildx imagetools inspect "$BASE" --format '{{json .Manifest.Digest}}' | tr -d '"') || GATE_OK=false
           docker pull -q "$BASE" >/dev/null || GATE_OK=false
           PKG_KEY=$(docker run --rm "$BASE" bash -c "apt-get update -qq >/dev/null 2>&1; apt list --upgradable 2>/dev/null | sort" | sha256sum | cut -c1-16) || GATE_OK=false
@@ -111,29 +180,30 @@ jobs:
         if: steps.gate.outputs.changed == 'true'
         uses: docker/build-push-action@v5
         with:
-          file: Dockerfile.${{ matrix.postgres_major }}
+          file: Dockerfile.${{ matrix.major }}
           platforms: linux/arm64,linux/amd64
           push: true
           build-args: |
-            POSTGRES_VERSION=${{ steps.get_version.outputs.minor_version }}
+            POSTGRES_VERSION=${{ matrix.minor }}
             PKG_REFRESH=${{ steps.gate.outputs.key }}
           labels: |
             railway.content-key=${{ steps.gate.outputs.key }}
           tags: |
-            ghcr.io/${{ github.repository }}:${{ matrix.postgres_major }}
-            ghcr.io/${{ github.repository }}:${{ steps.get_version.outputs.minor_version }}
-            ${{ matrix.postgres_major == env.LATEST_POSTGRES_MAJOR && format('ghcr.io/{0}:latest', github.repository) || '' }}
+            ghcr.io/${{ github.repository }}:${{ matrix.minor }}
+            ${{ matrix.latest && format('ghcr.io/{0}:{1}', github.repository, matrix.major) || '' }}
+            ${{ matrix.latest && matrix.major == env.LATEST_POSTGRES_MAJOR && format('ghcr.io/{0}:latest', github.repository) || '' }}
 
       # Unchanged image: keep the :major (and :latest) pointers current
       # WITHOUT minting a new digest — imagetools create only adds tag
-      # references to the existing manifest index.
+      # references to the existing manifest index. Non-latest minors carry
+      # no pointers, so an unchanged one simply publishes nothing.
       - name: Refresh pointers on unchanged image
-        if: steps.gate.outputs.changed == 'false'
+        if: steps.gate.outputs.changed == 'false' && matrix.latest
         run: |
           IMG="ghcr.io/${{ github.repository }}"
-          SRC="$IMG:${{ steps.get_version.outputs.minor_version }}"
-          tags="-t $IMG:${{ matrix.postgres_major }}"
-          if [ "${{ matrix.postgres_major }}" = "${{ env.LATEST_POSTGRES_MAJOR }}" ]; then
+          SRC="$IMG:${{ matrix.minor }}"
+          tags="-t $IMG:${{ matrix.major }}"
+          if [ "${{ matrix.major }}" = "${{ env.LATEST_POSTGRES_MAJOR }}" ]; then
             tags="$tags -t $IMG:latest"
           fi
           docker buildx imagetools create $tags "$SRC"
