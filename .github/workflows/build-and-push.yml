@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: "0 0 * * 1"  # Every Monday at midnight UTC
   workflow_dispatch:
+    inputs:
+      force:
+        description: "Bypass the content gate and rebuild+push everything"
+        type: boolean
+        default: false
   push:
     branches:
       - main
@@ -55,7 +60,55 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Skip the build entirely — same digest, no fleet redeploys — unless
+      # something REAL moved: the repo code that reaches the image, the
+      # upstream base image, or Debian's pending-security-fix set for that
+      # base. The key is planted on the published image as a label;
+      # digest-tracking consumers (the vuln auto-update machinery runs
+      # tagMode "sha" against these images) therefore only see a new digest
+      # when there is something worth redeploying for. Fails OPEN to
+      # building — a gate error must never silently freeze a tag. The
+      # package probe runs on amd64 and stands proxy for both platforms.
+      - name: Content gate
+        id: gate
+        run: |
+          set -o pipefail
+          IMG="ghcr.io/${{ github.repository }}"
+          TAG="${{ steps.get_version.outputs.minor_version }}"
+          BASE="postgres:${{ steps.get_version.outputs.minor_version }}"
+
+          GATE_OK=true
+          CODE_KEY=$(git ls-tree HEAD | grep -E "\.sh$|Dockerfile\.${{ matrix.postgres_major }}$" | sha256sum | cut -c1-16) || GATE_OK=false
+          BASE_DIGEST=$(docker buildx imagetools inspect "$BASE" --format '{{json .Manifest.Digest}}' | tr -d '"') || GATE_OK=false
+          docker pull -q "$BASE" >/dev/null || GATE_OK=false
+          PKG_KEY=$(docker run --rm "$BASE" bash -c "apt-get update -qq >/dev/null 2>&1; apt list --upgradable 2>/dev/null | sort" | sha256sum | cut -c1-16) || GATE_OK=false
+
+          if [ "$GATE_OK" != "true" ] || [ -z "$CODE_KEY" ] || [ -z "$BASE_DIGEST" ] || [ -z "$PKG_KEY" ]; then
+            echo "::warning::content gate failed for ${TAG}; building unconditionally"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "key=gate-error-${{ github.sha }}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          KEY=$(printf '%s\n' "$CODE_KEY" "$BASE_DIGEST" "$PKG_KEY" | sha256sum | cut -c1-32)
+          echo "key=$KEY" >> "$GITHUB_OUTPUT"
+
+          PUBLISHED_KEY=$(docker buildx imagetools inspect "$IMG:$TAG" --format '{{json .Image}}' 2>/dev/null \
+            | jq -r '(.config // .["linux/amd64"].config) | .Labels["railway.content-key"] // empty' 2>/dev/null || true)
+
+          if [ "${{ github.event.inputs.force || 'false' }}" = "true" ]; then
+            echo "force requested — building"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          elif [ "$KEY" = "$PUBLISHED_KEY" ]; then
+            echo "unchanged (key $KEY) — skipping build; digest stays put"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed (key $KEY, published ${PUBLISHED_KEY:-<none>}) — building"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Build and push with multiple tags
+        if: steps.gate.outputs.changed == 'true'
         uses: docker/build-push-action@v5
         with:
           file: Dockerfile.${{ matrix.postgres_major }}
@@ -63,10 +116,27 @@ jobs:
           push: true
           build-args: |
             POSTGRES_VERSION=${{ steps.get_version.outputs.minor_version }}
+            PKG_REFRESH=${{ steps.gate.outputs.key }}
+          labels: |
+            railway.content-key=${{ steps.gate.outputs.key }}
           tags: |
             ghcr.io/${{ github.repository }}:${{ matrix.postgres_major }}
             ghcr.io/${{ github.repository }}:${{ steps.get_version.outputs.minor_version }}
             ${{ matrix.postgres_major == env.LATEST_POSTGRES_MAJOR && format('ghcr.io/{0}:latest', github.repository) || '' }}
+
+      # Unchanged image: keep the :major (and :latest) pointers current
+      # WITHOUT minting a new digest — imagetools create only adds tag
+      # references to the existing manifest index.
+      - name: Refresh pointers on unchanged image
+        if: steps.gate.outputs.changed == 'false'
+        run: |
+          IMG="ghcr.io/${{ github.repository }}"
+          SRC="$IMG:${{ steps.get_version.outputs.minor_version }}"
+          tags="-t $IMG:${{ matrix.postgres_major }}"
+          if [ "${{ matrix.postgres_major }}" = "${{ env.LATEST_POSTGRES_MAJOR }}" ]; then
+            tags="$tags -t $IMG:latest"
+          fi
+          docker buildx imagetools create $tags "$SRC"
 
 
   # One image per (source, target) major pair, carrying both majors' server
@@ -116,7 +186,49 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Same content gate as build-postgres (see that job for rationale).
+      # Single tag per pair, so an unchanged image needs no pointer refresh —
+      # the job simply publishes nothing.
+      - name: Content gate
+        id: gate
+        run: |
+          set -o pipefail
+          IMG="ghcr.io/${{ github.repository }}/upgrade"
+          TAG="${{ matrix.from }}-${{ matrix.to }}"
+          BASE="postgres:${{ matrix.to }}"
+
+          GATE_OK=true
+          CODE_KEY=$(git ls-tree HEAD | grep -E "\.sh$|Dockerfile\.upgrade$" | sha256sum | cut -c1-16) || GATE_OK=false
+          BASE_DIGEST=$(docker buildx imagetools inspect "$BASE" --format '{{json .Manifest.Digest}}' | tr -d '"') || GATE_OK=false
+          docker pull -q "$BASE" >/dev/null || GATE_OK=false
+          PKG_KEY=$(docker run --rm "$BASE" bash -c "apt-get update -qq >/dev/null 2>&1; apt list --upgradable 2>/dev/null | sort" | sha256sum | cut -c1-16) || GATE_OK=false
+
+          if [ "$GATE_OK" != "true" ] || [ -z "$CODE_KEY" ] || [ -z "$BASE_DIGEST" ] || [ -z "$PKG_KEY" ]; then
+            echo "::warning::content gate failed for upgrade:${TAG}; building unconditionally"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "key=gate-error-${{ github.sha }}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          KEY=$(printf '%s\n' "$CODE_KEY" "$BASE_DIGEST" "$PKG_KEY" | sha256sum | cut -c1-32)
+          echo "key=$KEY" >> "$GITHUB_OUTPUT"
+
+          PUBLISHED_KEY=$(docker buildx imagetools inspect "$IMG:$TAG" --format '{{json .Image}}' 2>/dev/null \
+            | jq -r '(.config // .["linux/amd64"].config) | .Labels["railway.content-key"] // empty' 2>/dev/null || true)
+
+          if [ "${{ github.event.inputs.force || 'false' }}" = "true" ]; then
+            echo "force requested — building"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          elif [ "$KEY" = "$PUBLISHED_KEY" ]; then
+            echo "unchanged (key $KEY) — skipping build; digest stays put"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed (key $KEY, published ${PUBLISHED_KEY:-<none>}) — building"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Build and push the upgrade job image
+        if: steps.gate.outputs.changed == 'true'
         uses: docker/build-push-action@v5
         with:
           file: Dockerfile.upgrade
@@ -125,5 +237,8 @@ jobs:
           build-args: |
             FROM_VERSION=${{ matrix.from }}
             TO_VERSION=${{ matrix.to }}
+            PKG_REFRESH=${{ steps.gate.outputs.key }}
+          labels: |
+            railway.content-key=${{ steps.gate.outputs.key }}
           tags: |
             ghcr.io/${{ github.repository }}/upgrade:${{ matrix.from }}-${{ matrix.to }}
