@@ -22,8 +22,14 @@ ENV PG_UPGRADE_TO=${TO_VERSION}
 # BOTH majors: pg_upgrade starts the old server (its loaded libraries must
 # resolve) and the new cluster must be able to load every library the old one
 # references, or --check fails with "loadable libraries" errors.
-RUN sed -ri "s/^(deb .*pgdg main).*$/\1 ${FROM_VERSION} ${TO_VERSION}/" /etc/apt/sources.list.d/pgdg.list \
+# CI content key (see the build workflow's content gate) — busts this layer
+# exactly when the repo code, the upstream base, or Debian's pending-fix set
+# moved, and keeps it byte-cached (stable digest) otherwise.
+ARG PKG_REFRESH=none
+RUN echo "refresh key: ${PKG_REFRESH}" \
+    && sed -ri "s/^(deb .*pgdg main).*$/\1 ${FROM_VERSION} ${TO_VERSION}/" /etc/apt/sources.list.d/pgdg.list \
     && apt-get update \
+    && apt-get upgrade -y \
     && apt-get install -y --no-install-recommends \
       postgresql-${FROM_VERSION} \
       postgresql-${FROM_VERSION}-pgvector \
