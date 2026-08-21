@@ -788,17 +788,24 @@ t_s3_unreachable_pg_stays_up() {
   alive=$(docker exec "$name" psql -U postgres -At -c "SELECT 1" 2>/dev/null || echo "DEAD")
   assert_eq "$alive" "1" "postgres alive after S3 outage" || { ko t_s3_unreachable_pg_stays_up ""; docker start "$MINIO" >/dev/null; return; }
 
-  # A fixed sleep here raced the archiver's own retry/backoff on a loaded
-  # runner: docker stop returning is not the same instant pgbackrest's
-  # archive-push actually observes the connection refusal and reports back to
-  # postgres, and that latency is exactly what varies under load. Poll
-  # instead of guessing a sleep long enough for the slowest runner.
+  # failed_count only climbs when a FOREGROUND archive-push observes the
+  # async worker's .error status file — and that file only exists after the
+  # async upload attempt burned its own network timeouts against the dead
+  # endpoint (60s+ when docker stop leaves the address blackholed instead of
+  # refusing — which of the two you get is not deterministic). Two
+  # consequences the old 30s single-shot poll raced (and lost on main twice
+  # in 8 days): the chain needs MORE TIME than any polite window, and it
+  # needs FRESH archive_command invocations after the error lands — the
+  # switches above all fire before the async attempt has failed. So keep
+  # switching WAL inside the poll and size the deadline for pgbackrest's own
+  # timeouts, not for the fastest runner.
   local failed_count=0
-  local deadline=$(($(date +%s) + 30))
+  local deadline=$(($(date +%s) + 180))
   while [ "$(date +%s)" -lt "$deadline" ]; do
+    docker exec "$name" psql -U postgres -c "INSERT INTO t SELECT g FROM generate_series(1,1000) g; SELECT pg_switch_wal();" >/dev/null 2>&1
     failed_count=$(docker exec "$name" psql -U postgres -At -c "SELECT failed_count FROM pg_stat_archiver" 2>/dev/null || echo 0)
     [ "$failed_count" -ge 1 ] && break
-    sleep 1
+    sleep 3
   done
   if [ "$failed_count" -lt 1 ]; then
     ko t_s3_unreachable_pg_stays_up "pg_stat_archiver.failed_count should grow under S3 outage; got $failed_count"
@@ -809,12 +816,16 @@ t_s3_unreachable_pg_stays_up() {
   log "restarting MinIO; archiver should catch up"
   docker start "$MINIO" >/dev/null
 
+  # Same async shape on the way back: the spool's queued segments retry when
+  # archive_command next fires, so keep switching WAL here too instead of
+  # waiting for a tick that may not come inside the window.
   local archived_count=0
-  deadline=$(($(date +%s) + 30))
+  deadline=$(($(date +%s) + 90))
   while [ "$(date +%s)" -lt "$deadline" ]; do
+    docker exec "$name" psql -U postgres -c "SELECT pg_switch_wal();" >/dev/null 2>&1
     archived_count=$(docker exec "$name" psql -U postgres -At -c "SELECT archived_count FROM pg_stat_archiver" 2>/dev/null || echo 0)
     [ "$archived_count" -ge 1 ] && break
-    sleep 1
+    sleep 3
   done
   if [ "$archived_count" -lt 1 ]; then
     ko t_s3_unreachable_pg_stays_up "archived_count did not climb after S3 came back; got $archived_count"
