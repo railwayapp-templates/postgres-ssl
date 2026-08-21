@@ -102,6 +102,15 @@ unset PGPORT
 # same unclean state we started from.
 UPGRADE_QUIESCE_TIMEOUT_SECONDS="${UPGRADE_QUIESCE_TIMEOUT_SECONDS:-600}"
 
+# pg_upgrade --link needs little space (hard links + fresh catalogs), but
+# "little" is not "none": the target cluster's initdb, pg_upgrade's dump/
+# restore work files, and its output dir all land on this same volume, and
+# running out MID-LINK leaves exactly the half-linked shape recover mode
+# exists to clean up. Refuse up front instead. The floor is deliberately
+# modest — a --link upgrade of any data size fits comfortably in it — and
+# overridable for pathological volumes.
+UPGRADE_MIN_FREE_MB="${UPGRADE_MIN_FREE_MB:-512}"
+
 EXPECTED_VOLUME_MOUNT_PATH="/var/lib/postgresql/data"
 VOLUME_ROOT="$EXPECTED_VOLUME_MOUNT_PATH"
 # The dispatcher must pass the SERVICE's own PGDATA to this container. The
@@ -599,6 +608,24 @@ run_pg_upgrade() {
 # init_new_cluster's history). Prove the slot is creatable the same way the
 # real run will create it, then remove the probe. Uses a distinct suffix so
 # it can never collide with (or destroy) a real in-flight upgrade directory.
+# Free-space precondition for both modes: a green check must mean the real
+# run will not die on a condition check could have seen (same rule as
+# probe_sibling_slot). An unreadable df is logged and skipped, never fatal —
+# the check exists to catch a nearly-full volume, not to add a new way for
+# a healthy one to fail.
+check_free_space() {
+  local avail_kb avail_mb
+  avail_kb=$(df -Pk "$VOLUME_ROOT" 2>/dev/null | awk 'NR==2 {print $4}')
+  if [ -z "${avail_kb:-}" ]; then
+    log "could not read free space on $VOLUME_ROOT; continuing without the free-space check"
+    return 0
+  fi
+  avail_mb=$(( avail_kb / 1024 ))
+  if [ "$avail_mb" -lt "$UPGRADE_MIN_FREE_MB" ]; then
+    die 2 "only ${avail_mb} MiB free on the volume (need at least ${UPGRADE_MIN_FREE_MB} MiB for the new cluster's catalogs and pg_upgrade's work files) — free up space or grow the volume, then re-run (override with UPGRADE_MIN_FREE_MB)"
+  fi
+}
+
 probe_sibling_slot() {
   local probe="${NEW_DATA_DIR}.preflight"
   rm -rf "$probe" 2>/dev/null
@@ -695,6 +722,7 @@ mode_check() {
   # Before the quiesce, so an unwritable volume root gets the precise
   # refusal instead of a generic quiesce failure.
   probe_sibling_slot
+  check_free_space
   # Quiesces an unclean cluster (WAL replay + clean shutdown — what the next
   # normal boot would do); see the header for why check is only strictly
   # read-only on a cleanly-shut-down volume.
@@ -1023,6 +1051,7 @@ mode_upgrade() {
   fi
   clear_stale_pidfile
   refuse_recovery_shapes
+  check_free_space
   ensure_clean_shutdown
   init_new_cluster "$NEW_DATA_DIR"
 
