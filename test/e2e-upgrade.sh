@@ -254,8 +254,12 @@ kill_pg() {
 # Sets JOB_OUT and JOB_RC.
 run_job() {
   local vol="$1" mode="${2:-upgrade}"
+  shift 2 2>/dev/null || true
+  # Trailing args are extra docker-run options (e.g. -e OVERRIDE=x),
+  # inserted before the image like any docker option must be.
   JOB_OUT=$(docker run --rm --label postgres-upgrade-e2e=1 \
     -e "PGDATA=$PGDATA_IN_VOLUME" \
+    "$@" \
     -v "$vol:/var/lib/postgresql/data" \
     "$JOB_IMAGE" "$mode" 2>&1)
   JOB_RC=$?
@@ -1186,6 +1190,27 @@ t_crash_mid_link_rolls_back_and_reruns() {
   stop_pg midlink-pg
 }
 
+# Running out of space MID-LINK leaves the half-linked shape recover mode
+# exists to clean up — both modes refuse up front instead. Docker named
+# volumes report the HOST filesystem's free space, so the deterministic way
+# to exercise the refusal is an absurd floor override; the default floor's
+# pass-path is exercised by every other test in this file.
+t_free_space_precondition_refuses() {
+  local vol="upg-e2e-freespace"
+  seed_from_cluster "$vol" || return 1
+
+  run_job "$vol" check -e "UPGRADE_MIN_FREE_MB=999999999"
+  assert_eq "$JOB_RC" 2 "check refused below the free-space floor" || { echo "$JOB_OUT" | tail -10; return 1; }
+  assert_contains "$JOB_OUT" "free up space or grow the volume" "actionable free-space message" || return 1
+
+  run_job "$vol" upgrade -e "UPGRADE_MIN_FREE_MB=999999999"
+  assert_eq "$JOB_RC" 2 "upgrade refused below the free-space floor" || { echo "$JOB_OUT" | tail -10; return 1; }
+  # Refused before any mutation: the volume still boots FROM and re-checks green.
+  assert_eq "$(volume_data_major "$vol")" "$FROM_VERSION" "volume untouched by the refusal" || return 1
+  run_job "$vol" check
+  assert_eq "$JOB_RC" 0 "check green again at the default floor" || { echo "$JOB_OUT" | tail -10; return 1; }
+}
+
 # recover mode is the workflow's automatic-availability arm: a job that died
 # BEFORE the commit point must be reversible to a bootable FROM-major volume
 # with no human involved and no upgrade redo. Reconstruct the same mid-link
@@ -1739,6 +1764,7 @@ ALL_TESTS=(
   t_check_pass
   t_check_blocker
   t_check_blocker_pre16_types
+  t_free_space_precondition_refuses
   t_refuses_wrong_major
   t_recovers_unclean_shutdown
   t_quiesce_crash_reports_server_error

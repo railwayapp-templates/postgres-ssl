@@ -80,7 +80,10 @@ jobs:
   # regression-tested anywhere in CI — pg_upgrade's own behavior here isn't
   # a clean "any pre-16 source" rule (14→15 fires neither check; see the
   # test's own docblock), so this cell is a pair confirmed to trigger both,
-  # not a stand-in for every pre-16 pair. The
+  # not a stand-in for every pre-16 pair. 14→17 is the multi-major-jump
+  # representative: build-and-push publishes all 10 forward pairs and the
+  # product's eligibility gate allows non-adjacent targets, but until this
+  # cell no multi-hop pair had ever been executed anywhere. The
   # harness builds its own images (FROM, TO, and the dual-binary job image),
   # so no buildx step is needed here.
   e2e-upgrade:
@@ -94,6 +97,7 @@ jobs:
           - { from: 16, to: 17 }
           - { from: 17, to: 18 }
           - { from: 15, to: 16 }
+          - { from: 14, to: 17 }
 
     steps:
       - name: Checkout sources
