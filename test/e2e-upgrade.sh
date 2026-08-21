@@ -1161,6 +1161,81 @@ t_crash_mid_link_rolls_back_and_reruns() {
   stop_pg midlink-pg
 }
 
+# recover mode is the workflow's automatic-availability arm: a job that died
+# BEFORE the commit point must be reversible to a bootable FROM-major volume
+# with no human involved and no upgrade redo. Reconstruct the same mid-link
+# crash shape as t_crash_mid_link_rolls_back_and_reruns, but resolve it with
+# recover instead of re-running the upgrade.
+t_recover_returns_midlink_crash_to_bootable() {
+  local vol="upg-e2e-recover"
+  seed_from_cluster "$vol" || return 1
+  run_job "$vol" upgrade
+  assert_eq "$JOB_RC" 0 "initial upgrade" || { echo "$JOB_OUT" | tail -20; return 1; }
+  in_volume "$vol" "
+    set -e
+    cd /var/lib/postgresql/data
+    rm -rf pgdata
+    mv pgdata.old-${FROM_VERSION} pgdata
+    mkdir -p pgdata.upgrade-${TO_VERSION}
+    echo ${TO_VERSION} > pgdata.upgrade-${TO_VERSION}/PG_VERSION
+    chown -R postgres:postgres pgdata.upgrade-${TO_VERSION}
+    rm -f $MARKER_PATH
+  " || return 1
+  in_volume "$vol" "test -f ${PGDATA_IN_VOLUME}/global/pg_control.old && test ! -f ${PGDATA_IN_VOLUME}/global/pg_control" \
+    || { echo "  premise broken: reconstructed old cluster is not in the disabled shape"; return 1; }
+
+  run_job "$vol" recover
+  assert_eq "$JOB_RC" 0 "recover exit code" || { echo "$JOB_OUT" | tail -30; return 1; }
+  assert_contains "$JOB_OUT" "restored global/pg_control" "the disable was reversed" || return 1
+  assert_contains "$JOB_OUT" '"mode":"recover"' "machine-readable recover result" || return 1
+  in_volume "$vol" "test ! -e ${PGDATA_IN_VOLUME}.upgrade-${TO_VERSION}" \
+    || { echo "  partial target dir survived recover"; return 1; }
+  assert_eq "$(volume_data_major "$vol")" "$FROM_VERSION" "data major is FROM after recover" || return 1
+
+  run_pg recover-pg "$vol" "$FROM_IMAGE" || return 1
+  wait_for_pg recover-pg || { fail_dump recover recover-pg; return 1; }
+  assert_eq "$(psql_in recover-pg 'SELECT count(*) FROM upgrade_canary')" "1000" "data intact after recover" || return 1
+  stop_pg recover-pg
+
+  # Idempotent: a second recover on the now-healthy FROM volume is a no-op
+  # success, which is what the workflow's retry semantics need.
+  run_job "$vol" recover
+  assert_eq "$JOB_RC" 0 "recover is idempotent on a healthy FROM volume" || { echo "$JOB_OUT" | tail -10; return 1; }
+}
+
+# recover must never roll BACKWARD over a committed upgrade: at or past the
+# commit point (upgraded marker, or the finished-run disk shape with the
+# completion sentinel) it refuses toward upgrade mode's roll-forward.
+t_recover_refuses_past_commit_point() {
+  local vol="upg-e2e-recover-refuse"
+  seed_from_cluster "$vol" || return 1
+
+  # Shape 1: phase=upgraded marker (the durable commit point).
+  in_volume "$vol" "printf '%s' '{\"phase\":\"upgraded\",\"from\":\"${FROM_VERSION}\",\"to\":\"${TO_VERSION}\"}' > $MARKER_PATH" || return 1
+  run_job "$vol" recover
+  assert_eq "$JOB_RC" 2 "refused on an upgraded marker" || { echo "$JOB_OUT" | tail -10; return 1; }
+  assert_contains "$JOB_OUT" "roll FORWARD" "points at upgrade mode" || return 1
+  in_volume "$vol" "rm -f $MARKER_PATH" || return 1
+
+  # Shape 2: no marker, but the finished-run disk shape (pg_control.old +
+  # completion sentinel in a TO-major target dir) — a lost marker write.
+  in_volume "$vol" "
+    set -e
+    cd /var/lib/postgresql/data
+    mv pgdata/global/pg_control pgdata/global/pg_control.old
+    mkdir -p pgdata.upgrade-${TO_VERSION}
+    echo ${TO_VERSION} > pgdata.upgrade-${TO_VERSION}/PG_VERSION
+    touch pgdata.upgrade-${TO_VERSION}/.railway_pg_upgrade_complete
+    chown -R postgres:postgres pgdata.upgrade-${TO_VERSION}
+  " || return 1
+  run_job "$vol" recover
+  assert_eq "$JOB_RC" 2 "refused on the finished-run disk shape" || { echo "$JOB_OUT" | tail -10; return 1; }
+  assert_contains "$JOB_OUT" "run upgrade mode to finish the swap" "points at upgrade mode" || return 1
+  # And the refusal touched nothing: the shape is still resolvable forward.
+  in_volume "$vol" "test -f ${PGDATA_IN_VOLUME}/global/pg_control.old && test -f ${PGDATA_IN_VOLUME}.upgrade-${TO_VERSION}/.railway_pg_upgrade_complete" \
+    || { echo "  refusal mutated the volume"; return 1; }
+}
+
 # pgdata.old-<from> is the rollback body and pins every pre-upgrade inode
 # (--link hardlinks); it must survive normal boots and be reclaimed in the
 # background once the upgraded database has been up past the grace period,
@@ -1665,6 +1740,8 @@ ALL_TESTS=(
   t_recovery_shapes_refused
   t_marker_lost_after_pg_upgrade_resumes
   t_crash_mid_link_rolls_back_and_reruns
+  t_recover_returns_midlink_crash_to_bootable
+  t_recover_refuses_past_commit_point
   t_old_datadir_reclaimed
   t_trailing_slash_pgdata
   t_upgrade_survives_root_owned_volume_root

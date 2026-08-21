@@ -29,6 +29,16 @@
 #              the workflow to decide roll-back vs roll-forward on resume.
 #   manifest — print the extensions available on the TARGET major as JSON.
 #              Feeds the dashboard preflight's extension check.
+#   recover  — roll-back ONLY, never redoes the upgrade: return a volume
+#              whose job died BEFORE the commit point (no marker) to a
+#              bootable FROM-major state — reverse pg_upgrade's pg_control
+#              disable if present, drop the partial target dir — so the
+#              workflow can restart the old image automatically instead of
+#              leaving the database down until a human clicks revert.
+#              Refuses (exit 2) anything at or past the commit point
+#              (upgraded/completed marker, or the finished-run disk shape):
+#              those roll FORWARD via upgrade mode. Idempotent — a volume
+#              already bootable on FROM is a success no-op.
 #
 # Marker contract (volume root, .railway-major-upgrade.json):
 #   absent               — nothing committed; any failure rolls back. One
@@ -209,10 +219,10 @@ if [ -z "$MODE" ]; then
   if [ "$#" -gt 0 ]; then
     for _arg in "$@"; do
       case "$_arg" in
-        check | upgrade | status | manifest) MODE="$_arg" ;;
+        check | upgrade | status | manifest | recover) MODE="$_arg" ;;
       esac
     done
-    [ -n "$MODE" ] || die 2 "no recognized mode among arguments: $* (expected one of: check, upgrade, status, manifest)"
+    [ -n "$MODE" ] || die 2 "no recognized mode among arguments: $* (expected one of: check, upgrade, status, manifest, recover)"
   fi
 fi
 MODE="${MODE:-upgrade}"
@@ -789,6 +799,78 @@ finish_swap() {
   exit 0
 }
 
+# Roll-back only — the workflow's automatic-availability arm for a job that
+# died BEFORE the commit point. Returns the volume to a bootable FROM-major
+# state and never redoes the upgrade (that is a fresh decision for the
+# workflow/user, not a side effect of recovery). Anything at or past the
+# commit point is refused toward upgrade mode's roll-forward: recover must
+# never discard a committed upgrade.
+mode_recover() {
+  check_mount
+  take_job_lock
+
+  refuse_unreadable_marker
+  local marker_phase marker_from marker_to
+  marker_phase="$(read_marker_field phase)"
+  marker_from="$(read_marker_field from)"
+  marker_to="$(read_marker_field to)"
+  case "$marker_phase" in
+    upgraded)
+      die 2 "marker phase 'upgraded' (${marker_from:-?} -> ${marker_to:-?}) — the commit point has passed; run upgrade mode to roll FORWARD instead (recover never discards a committed upgrade)"
+      ;;
+    completed)
+      # A completed marker of a PREVIOUS pair over FROM-major data is
+      # history, not state (same reading as upgrade mode); a completed
+      # SAME-pair marker over TO-major data means the upgrade finished —
+      # there is nothing to recover from.
+      if [ "$(data_major)" = "$TO_MAJOR" ]; then
+        die 2 "marker records a completed ${marker_from:-?} -> ${marker_to:-?} upgrade and the data directory is $TO_MAJOR — the upgrade finished; nothing to recover"
+      fi
+      ;;
+    "") ;;
+    *)
+      die 2 "marker phase '$marker_phase' is not this job's to resolve — refusing to recover over another writer's in-flight state"
+      ;;
+  esac
+
+  # Same disk-shape reading as upgrade mode's marker-less branch: the
+  # completion sentinel proves a FINISHED run whose marker write was lost —
+  # roll forward via upgrade mode, never backward. pg_control.old without it
+  # proves only that pg_upgrade DISABLED the old cluster before crashing
+  # mid-link; reversing the rename is safe (the target cluster has never
+  # been started, and linking never modifies the old cluster's files).
+  if [ -f "$PGDATA/global/pg_control.old" ]; then
+    if [ -f "$NEW_DATA_DIR/.railway_pg_upgrade_complete" ] \
+      && [ "$(cat "$NEW_DATA_DIR/PG_VERSION" 2>/dev/null)" = "$TO_MAJOR" ]; then
+      die 2 "the disk shape shows a FINISHED pg_upgrade (completion sentinel in the $TO_MAJOR dir) — run upgrade mode to finish the swap; recover never discards a finished upgrade"
+    fi
+    log "pg_control.old present without a completion sentinel — pg_upgrade crashed mid-link; restoring the old cluster's pg_control"
+    restore_disabled_pg_control
+  fi
+
+  # Drop the partial target dir so nothing half-linked lingers and a later
+  # fresh attempt starts clean. Its pg_upgrade logs are printed first — this
+  # is the last copy of WHY the run died. Removing hardlinks never touches
+  # the old cluster's files.
+  local cleaned_target="false"
+  if [ -d "$NEW_DATA_DIR" ]; then
+    print_check_details "$NEW_DATA_DIR"
+    rm -rf "$NEW_DATA_DIR"
+    cleaned_target="true"
+  fi
+
+  # The one promise this mode makes: the volume is bootable on FROM again.
+  local major
+  major="$(data_major)"
+  if [ "$major" != "$FROM_MAJOR" ]; then
+    die 3 "volume is not bootable on $FROM_MAJOR after recovery (data major: '${major:-unreadable}') — restore the pre-upgrade backup"
+  fi
+
+  result "$(jq -nc --arg from "$FROM_MAJOR" --arg to "$TO_MAJOR" --argjson cleaned "$cleaned_target" \
+    '{ok: true, mode: "recover", from: $from, to: $to, dataMajor: $from, cleanedTargetDir: $cleaned}')"
+  exit 0
+}
+
 mode_upgrade() {
   check_mount
   take_job_lock
@@ -955,5 +1037,6 @@ case "$MODE" in
   upgrade) mode_upgrade ;;
   status) mode_status ;;
   manifest) mode_manifest ;;
-  *) die 2 "unknown mode '$MODE' (expected check|upgrade|status|manifest)" ;;
+  recover) mode_recover ;;
+  *) die 2 "unknown mode '$MODE' (expected check|upgrade|status|manifest|recover)" ;;
 esac
