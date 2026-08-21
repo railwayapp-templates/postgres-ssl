@@ -1793,10 +1793,18 @@ fork_post_upgrade_analyze() {
 # belong to the PITR machinery (a leftover ALTER SYSTEM archive_command is
 # a known footgun), and connection paths / SSL file paths belong to the
 # entrypoint (a stale ssl_cert_file would refuse the next boot outright).
+# The preload GUCs and dynamic_library_path are skipped for a subtler
+# reason: ALTER SYSTEM validates them only syntactically — the libraries
+# load at postmaster start (shared_) or connection start (session_/local_),
+# so re-applying a value that names a library the new major's image doesn't
+# ship would pass here and then refuse every subsequent boot or connection,
+# which is the exact disaster class not carrying the file avoids. The image
+# also actively manages shared_preload_libraries itself (pg_stat_statements,
+# see ensure_pg_stat_statements above).
 # postgresql.conf itself is not re-applied: on this image it is initdb +
 # entrypoint output, not a user surface — its stash stays as reference.
 # One-shot across restarts via the marker's needsConfigReview flag.
-CONFIG_RESTORE_SKIP_GUCS="archive_mode archive_command archive_timeout restore_command recovery_target recovery_target_name recovery_target_time recovery_target_xid recovery_target_lsn recovery_target_inclusive recovery_target_timeline recovery_target_action primary_conninfo primary_slot_name listen_addresses port unix_socket_directories data_directory hba_file ident_file external_pid_file ssl ssl_cert_file ssl_key_file ssl_ca_file ssl_crl_file"
+CONFIG_RESTORE_SKIP_GUCS="archive_mode archive_command archive_timeout restore_command recovery_target recovery_target_name recovery_target_time recovery_target_xid recovery_target_lsn recovery_target_inclusive recovery_target_timeline recovery_target_action primary_conninfo primary_slot_name listen_addresses port unix_socket_directories data_directory hba_file ident_file external_pid_file ssl ssl_cert_file ssl_key_file ssl_ca_file ssl_crl_file shared_preload_libraries session_preload_libraries local_preload_libraries dynamic_library_path"
 
 fork_post_upgrade_config_restore() {
   [ -f "$UPGRADE_MARKER_FILE" ] || return 0
@@ -1814,7 +1822,7 @@ fork_post_upgrade_config_restore() {
     for _ in $(seq 1 120); do
       if pg_isready -q -h /var/run/postgresql -p 5432 2>/dev/null; then
         echo "post-upgrade: re-applying ALTER SYSTEM settings from $(basename "$stash")"
-        applied=0 skipped=0 rejected=0
+        applied=0 skipped=0 rejected=0 unreachable=0
         while IFS= read -r line; do
           case "$line" in ''|'#'*) continue ;; esac
           key="${line%%=*}"; key="$(printf '%s' "$key" | tr -d '[:space:]')"
@@ -1829,18 +1837,29 @@ fork_post_upgrade_config_restore() {
               echo "post-upgrade:   $key: image-managed, not re-applied"
               skipped=$((skipped + 1)); continue ;;
           esac
-          if out=$(psql -h /var/run/postgresql -p 5432 -U "${POSTGRES_USER:-postgres}" -d postgres -v ON_ERROR_STOP=1               -c "ALTER SYSTEM SET \"$key\" = $value" 2>&1); then
+          rc=0
+          out=$(psql -h /var/run/postgresql -p 5432 -U "${POSTGRES_USER:-postgres}" -d postgres -v ON_ERROR_STOP=1 \
+            -c "ALTER SYSTEM SET \"$key\" = $value" 2>&1 </dev/null) || rc=$?
+          if [ "$rc" -eq 0 ]; then
             applied=$((applied + 1))
+          elif [ "$rc" -eq 2 ]; then
+            # psql exit 2 = the connection could not be established or went
+            # bad — infrastructure, not a verdict on the GUC. Any other
+            # nonzero is the server rejecting this statement, which is the
+            # expected shape for a GUC the new major removed. (A stash whose
+            # every line is a removed GUC must still clear the flag — "all
+            # rejected" alone is NOT evidence of a connectivity problem.)
+            echo "post-upgrade:   $key: could not reach postgres ($(printf '%s' "$out" | tail -1))"
+            unreachable=$((unreachable + 1))
           else
             echo "post-upgrade:   $key: not re-applied ($(printf '%s' "$out" | tail -1))"
             rejected=$((rejected + 1))
           fi
         done < "$stash"
-        if [ "$applied" -eq 0 ] && [ "$skipped" -eq 0 ] && [ "$rejected" -gt 0 ]; then
-          # Every single statement failed — that is a connectivity/auth
-          # problem, not the expected removed-GUC rejections. Keep the flag
-          # so the next boot retries.
-          echo "post-upgrade: ALTER SYSTEM restore could not run; will retry on next boot"
+        if [ "$unreachable" -gt 0 ]; then
+          # Some settings never got a server verdict; keep the flag so the
+          # next boot retries (re-applying is idempotent).
+          echo "post-upgrade: ALTER SYSTEM restore could not reach postgres for ${unreachable} setting(s); will retry on next boot"
           exit 0
         fi
         psql -h /var/run/postgresql -p 5432 -U "${POSTGRES_USER:-postgres}" -d postgres -Atc "SELECT pg_reload_conf()" >/dev/null 2>&1 || true
@@ -1860,25 +1879,88 @@ fork_post_upgrade_config_restore() {
 # pg_depend.refobjversion, PG14 reverted it); what IS tracked is
 # per-collation: the database default's datcollversion (PG15+) and each
 # named collation's collversion. So: detect staleness per collation, map
-# stale collations to the indexes that depend on them (pg_index.indcollation),
+# suspect collations to the indexes that depend on them (pg_index.indcollation),
 # REINDEX exactly that set CONCURRENTLY in the background, and only then
 # refresh the version stamps — never the reverse. When no collation is stale
-# (the common case) this flips the flag with zero work. One-shot across
-# restarts via the marker's needsReindex flag; any failure keeps the flag so
-# the next boot retries. While this flag is up, fork_collation_refresh's
-# blind version refresh stands down — refreshing stamps without rebuilding
-# is exactly the wart this replaces.
+# (the common case) this flips the flag with zero work.
+#
+# Two places where the recorded stamps CANNOT be trusted, so the suspect set
+# is widened instead of comparing:
+# - Pre-15 sources have no datcollversion at all: pg_upgrade stamps the new
+#   database with the CURRENT library's version, so "not stale" there means
+#   nothing. With no baseline, every versioned collation is suspect.
+# - initdb-created (predefined, oid < 16384) collations are re-created by
+#   the new cluster's initdb with current stamps — pg_dump only carries
+#   user-created ones — so their staleness is inferred per PROVIDER: if any
+#   preserved stamp of a provider (the database default's, or a user-created
+#   collation's) proves that library changed, every predefined collation of
+#   that provider is suspect too.
+#
+# One-shot across restarts via the marker's needsReindex flag; any failure
+# keeps the flag so the next boot retries. While this flag is up,
+# fork_collation_refresh's blind version refresh stands down — refreshing
+# stamps without rebuilding is exactly the wart this replaces.
 fork_post_upgrade_reindex() {
   [ -f "$UPGRADE_MARKER_FILE" ] || return 0
   [ "$(jq -r '.needsReindex // false' "$UPGRADE_MARKER_FILE" 2>/dev/null)" = "true" ] || return 0
+  local rx_from_major rx_baseline_unknown
+  rx_from_major="$(jq -r '.from // empty' "$UPGRADE_MARKER_FILE" 2>/dev/null)"
+  rx_baseline_unknown=0
+  if [ -n "$rx_from_major" ] && [ "$rx_from_major" -lt 15 ] 2>/dev/null; then
+    rx_baseline_unknown=1
+  fi
   (
     # Same connection shape as fork_post_upgrade_analyze: the cluster's
     # actual superuser over the local socket — a custom-POSTGRES_USER
     # cluster has no 'postgres' role at all.
     _rx_psql() { psql -h /var/run/postgresql -p 5432 -U "${POSTGRES_USER:-postgres}" -v ON_ERROR_STOP=1 "$@"; }
-    # Indexes whose indcollation vector contains a given collation oid.
-    _rx_indexes_for_coll() {
-      _rx_psql -d "$1" -Atc "SELECT DISTINCT format('%I.%I', n.nspname, c.relname) FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_namespace n ON n.oid = c.relnamespace, unnest(string_to_array(i.indcollation::text, ' ')::oid[]) u(collid) WHERE u.collid = $2 AND n.nspname NOT IN ('pg_catalog', 'pg_toast', 'information_schema')"
+    # One pass per database: build the suspect collation set (stale stamps,
+    # plus the widenings described above), then every index depending on it.
+    # Output lines are "<is_exclusion> <schema-qualified name>": exclusion-
+    # constraint indexes cannot be rebuilt CONCURRENTLY (REINDEX raises an
+    # error when one is named directly), so they take the non-concurrent
+    # path. relkind 'i' only — a partitioned parent ('I') has no storage and
+    # naming it would rebuild every leaf a second time. pg_temp schemas are
+    # other sessions' business; system catalogs can't be reindexed
+    # concurrently and ship on C-locale name columns anyway.
+    _rx_suspect_indexes() {
+      _rx_psql -d "$1" -Atc "
+        WITH stale_user AS (
+          SELECT oid, collprovider FROM pg_collation
+          WHERE oid >= 16384 AND collversion IS NOT NULL
+            AND collversion IS DISTINCT FROM pg_collation_actual_version(oid)
+        ), dflt AS (
+          SELECT datlocprovider AS p,
+                 (datcollversion IS NOT NULL AND datcollversion IS DISTINCT FROM pg_database_collation_actual_version(oid)) AS stale,
+                 (pg_database_collation_actual_version(oid) IS NOT NULL) AS versioned
+          FROM pg_database WHERE datname = current_database()
+        ), stale_providers AS (
+          SELECT collprovider AS p FROM stale_user
+          UNION SELECT p FROM dflt WHERE stale
+        ), suspect AS (
+          SELECT oid FROM stale_user
+          UNION SELECT oid FROM pg_collation
+            WHERE $rx_baseline_unknown = 1 AND oid >= 16384
+              AND pg_collation_actual_version(oid) IS NOT NULL
+          UNION SELECT c.oid FROM pg_collation c
+            WHERE c.oid < 16384 AND c.collname <> 'default'
+              AND pg_collation_actual_version(c.oid) IS NOT NULL
+              AND ($rx_baseline_unknown = 1 OR c.collprovider IN (SELECT p FROM stale_providers))
+          UNION SELECT c.oid FROM pg_collation c, dflt d
+            WHERE c.collname = 'default'
+              AND (d.stale OR ($rx_baseline_unknown = 1 AND d.versioned))
+        )
+        SELECT DISTINCT (EXISTS (SELECT 1 FROM pg_constraint x WHERE x.conindid = i.indexrelid AND x.contype = 'x'))::int
+               || ' ' || format('%I.%I', n.nspname, c.relname)
+        FROM pg_index i
+        JOIN pg_class c ON c.oid = i.indexrelid
+        JOIN pg_namespace n ON n.oid = c.relnamespace,
+             unnest(string_to_array(i.indcollation::text, ' ')::oid[]) u(collid)
+        WHERE u.collid IN (SELECT oid FROM suspect)
+          AND c.relkind = 'i'
+          AND n.nspname NOT IN ('pg_catalog', 'pg_toast', 'information_schema')
+          AND n.nspname NOT LIKE 'pg_temp%'
+          AND n.nspname NOT LIKE 'pg_toast_temp%'"
     }
     i=0
     while ! pg_isready -q -h /var/run/postgresql -p 5432 2>/dev/null; do
@@ -1886,67 +1968,81 @@ fork_post_upgrade_reindex() {
     done
     pg_major=$(cat "$PGDATA/PG_VERSION" 2>/dev/null || echo "0")
     if [ "$pg_major" -lt 15 ] 2>/dev/null; then
-      # No collation-version tracking at all before 15 — nothing to compare
-      # against; leave the flag for a future major to resolve.
+      # Defensive only: the upgrade job's supported range (14-18) can never
+      # land BELOW 15, and pre-15 has no version tracking to drive this.
       exit 0
+    fi
+    if [ "$rx_baseline_unknown" = "1" ]; then
+      echo "post-upgrade: upgraded from PG${rx_from_major} — no collation-version baseline survives pg_upgrade from a pre-15 source, so every collation-dependent index is treated as suspect"
     fi
     dbs=$(_rx_psql -d postgres -Atc "SELECT datname FROM pg_database WHERE datallowconn AND NOT datistemplate" 2>/dev/null) || {
       echo "post-upgrade: reindex check could not list databases; will retry on next boot"
       exit 0
     }
     total_reindexed=0 failed=0
-    for db in $dbs; do
+    while IFS= read -r db; do
+      [ -n "$db" ] || continue
       # Leftovers of a crashed prior CONCURRENTLY attempt are invalid
       # *_ccnew indexes; drop them before retrying.
       _rx_psql -d "$db" -Atc "SELECT format('%I.%I', n.nspname, c.relname) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace JOIN pg_index i ON i.indexrelid = c.oid WHERE NOT i.indisvalid AND c.relname ~ '_ccnew[0-9]*$'" 2>/dev/null \
         | while IFS= read -r junk; do
             [ -n "$junk" ] || continue
-            _rx_psql -d "$db" -c "DROP INDEX CONCURRENTLY IF EXISTS $junk" >/dev/null 2>&1 || true
+            _rx_psql -d "$db" -c "DROP INDEX CONCURRENTLY IF EXISTS $junk" >/dev/null 2>&1 </dev/null || true
           done
 
       db_failed=0
-      default_stale=$(_rx_psql -d "$db" -Atc "SELECT (datcollversion IS DISTINCT FROM pg_database_collation_actual_version(oid))::int FROM pg_database WHERE datname = current_database() AND datcollversion IS NOT NULL" 2>/dev/null) || { failed=$((failed+1)); continue; }
-      stale_named=$(_rx_psql -d "$db" -Atc "SELECT oid FROM pg_collation WHERE collversion IS NOT NULL AND collversion IS DISTINCT FROM pg_collation_actual_version(oid)" 2>/dev/null) || { failed=$((failed+1)); continue; }
+      # Stamp-stale sets drive the REFRESH step below — only stamps that
+      # really are behind get refreshed (the widened suspects above already
+      # carry current stamps, initdb/createdb just wrote them).
+      default_stale=$(_rx_psql -d "$db" -Atc "SELECT (datcollversion IS DISTINCT FROM pg_database_collation_actual_version(oid))::int FROM pg_database WHERE datname = current_database() AND datcollversion IS NOT NULL" 2>/dev/null) || { echo "post-upgrade: $db: collation staleness check failed; will retry on next boot"; failed=$((failed+1)); continue; }
+      stale_named=$(_rx_psql -d "$db" -Atc "SELECT oid FROM pg_collation WHERE collversion IS NOT NULL AND collversion IS DISTINCT FROM pg_collation_actual_version(oid)" 2>/dev/null) || { echo "post-upgrade: $db: collation staleness check failed; will retry on next boot"; failed=$((failed+1)); continue; }
+      suspect_indexes=$(_rx_suspect_indexes "$db" 2>/dev/null) || { echo "post-upgrade: $db: suspect-index enumeration failed; will retry on next boot"; failed=$((failed+1)); continue; }
 
-      stale_oids="$stale_named"
-      if [ "$default_stale" = "1" ]; then
-        default_oid=$(_rx_psql -d "$db" -Atc "SELECT oid FROM pg_collation WHERE collname = 'default'" 2>/dev/null)
-        stale_oids="$stale_oids $default_oid"
-      fi
-
-      for coll_oid in $stale_oids; do
-        [ -n "$coll_oid" ] || continue
-        for idx in $(_rx_indexes_for_coll "$db" "$coll_oid"); do
-          [ -n "$idx" ] || continue
+      while IFS=' ' read -r is_excl idx; do
+        [ -n "$idx" ] || continue
+        if [ "$is_excl" = "1" ]; then
+          echo "post-upgrade: reindexing $db.$idx non-concurrently (exclusion constraint; collation version changed)"
+          rx_cmd="REINDEX INDEX $idx"
+        else
           echo "post-upgrade: reindexing $db.$idx (collation version changed)"
-          if _rx_psql -d "$db" -c "REINDEX INDEX CONCURRENTLY $idx" >/dev/null 2>&1; then
-            total_reindexed=$((total_reindexed + 1))
-          else
-            echo "post-upgrade:   $db.$idx: reindex failed; will retry on next boot"
-            db_failed=1
-          fi
-        done
-      done
+          rx_cmd="REINDEX INDEX CONCURRENTLY $idx"
+        fi
+        if rx_out=$(_rx_psql -d "$db" -c "$rx_cmd" 2>&1 </dev/null); then
+          total_reindexed=$((total_reindexed + 1))
+        else
+          echo "post-upgrade:   $db.$idx: reindex failed; will retry on next boot ($(printf '%s' "$rx_out" | tail -1))"
+          db_failed=1
+        fi
+      done <<EOF_SUSPECT_INDEXES
+$suspect_indexes
+EOF_SUSPECT_INDEXES
 
       if [ "$db_failed" -eq 0 ]; then
         # Rebuilds done — NOW the version stamps may say current.
+        # regcollation renders a schema-qualified, quoted-as-needed name.
         for coll_oid in $stale_named; do
           [ -n "$coll_oid" ] || continue
-          _rx_psql -d "$db" -c "DO \$\$ DECLARE n text; BEGIN SELECT format('%I.%I', collnamespace::regnamespace, collname) INTO n FROM pg_collation WHERE oid = $coll_oid; EXECUTE format('ALTER COLLATION %s REFRESH VERSION', n); END \$\$" >/dev/null 2>&1 || true
+          _rx_psql -d "$db" -c "DO \$\$ BEGIN EXECUTE format('ALTER COLLATION %s REFRESH VERSION', ${coll_oid}::regcollation); END \$\$" >/dev/null 2>&1 || true
         done
         if [ "$default_stale" = "1" ]; then
-          _rx_psql -d postgres -c "ALTER DATABASE \"$db\" REFRESH COLLATION VERSION" >/dev/null 2>&1 || true
+          _rx_psql -d "$db" -c "DO \$\$ BEGIN EXECUTE format('ALTER DATABASE %I REFRESH COLLATION VERSION', current_database()); END \$\$" >/dev/null 2>&1 || true
         fi
       else
         failed=$((failed + 1))
       fi
-    done
+    done <<EOF_DBS
+$dbs
+EOF_DBS
     if [ "$failed" -gt 0 ]; then
       exit 0
     fi
     update_upgrade_marker '.needsReindex = false' || true
     if [ "$total_reindexed" -eq 0 ]; then
-      echo "post-upgrade: collation library unchanged — no reindex needed"
+      if [ "$rx_baseline_unknown" = "1" ]; then
+        echo "post-upgrade: no collation-dependent indexes to rebuild"
+      else
+        echo "post-upgrade: collation library unchanged — no reindex needed"
+      fi
     else
       echo "post-upgrade: reindexed ${total_reindexed} collation-dependent index(es)"
     fi

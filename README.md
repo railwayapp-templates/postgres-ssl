@@ -480,9 +480,18 @@ files at the volume root as `.pre-upgrade-<from>-postgresql.conf` /
 re-applied one GUC at a time via `ALTER SYSTEM` — a GUC the new major
 removed fails only its own statement (logged), never the boot; GUCs the
 image itself manages (archiving/recovery machinery, connection paths, SSL
-file paths) are never re-applied. `postgresql.conf` itself is initdb +
-entrypoint output, not a user surface, so only its stash remains as
-reference.
+file paths) are never re-applied, and neither are the preload GUCs
+(`shared_preload_libraries` & co.) or `dynamic_library_path`: `ALTER SYSTEM`
+validates those only syntactically — the libraries load at postmaster or
+connection start — so re-applying a value naming a library the new major's
+image doesn't ship would pass the statement and then refuse every subsequent
+boot, the exact failure not carrying the file exists to avoid (they stay in
+the stash for manual review, and the image manages `pg_stat_statements`
+preloading itself). A statement the server *rejects* still counts as a
+verdict; only settings that never reached the server (connection lost
+mid-restore, psql exit 2) keep the flag for a retry on the next boot.
+`postgresql.conf` itself is initdb + entrypoint output, not a user surface,
+so only its stash remains as reference.
 
 #### Disk reclaim and rollback window
 
@@ -519,10 +528,28 @@ upgrade window, so the database serves immediately either way:
   per index: PG13 added `pg_depend.refobjversion`, PG14 reverted it): the
   database default's `datcollversion` and each named collation's
   `collversion` against their `*_actual_version()`.
-- Only the indexes depending on a stale collation are rebuilt, with
-  `REINDEX INDEX CONCURRENTLY` (system catalogs excluded — they cannot be
-  reindexed concurrently and ship on C-locale name columns). Leftover
-  invalid `*_ccnew` indexes from an interrupted attempt are dropped first.
+- The recorded stamps can't always be trusted, and where they can't the
+  suspect set is **widened instead of compared**: pg_upgrade from a pre-15
+  source has no `datcollversion` to carry, so the new database is stamped
+  with the *current* library's version and "not stale" there means nothing —
+  every collation-dependent index is treated as suspect. And initdb-created
+  (predefined) collations are re-stamped current by the new cluster's initdb
+  even from 15+ sources — pg_dump only carries user-created ones — so their
+  staleness is inferred per *provider*: any preserved stamp (the database
+  default's, or a user-created collation's) proving that library changed
+  marks every predefined collation of that provider suspect too. The one
+  undetectable residue: a 15+ upgrade where a provider's library changed but
+  no preserved stamp of that provider exists anywhere *and* an index uses
+  only its predefined collations.
+- Only the indexes depending on a suspect collation are rebuilt, with
+  `REINDEX INDEX CONCURRENTLY` — except indexes backing exclusion
+  constraints, which PostgreSQL refuses to rebuild concurrently and are
+  rare enough to take the short non-concurrent lock instead. System
+  catalogs are excluded (they cannot be reindexed concurrently and ship on
+  C-locale name columns), as are other sessions' `pg_temp` schemas;
+  partitioned parents are skipped in favor of their leaves (a parent
+  rebuild would redo every leaf a second time). Leftover invalid `*_ccnew`
+  indexes from an interrupted attempt are dropped first.
 - The version stamps are refreshed only **after** the rebuilds succeed —
   never the reverse. While `needsReindex` is up, the boot-time blind
   collation-version refresh stands down (refreshing stamps without

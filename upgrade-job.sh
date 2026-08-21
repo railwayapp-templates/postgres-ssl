@@ -829,13 +829,19 @@ finish_swap() {
   # built it — and the source cluster may have run on an older base image.
   # We can't read the OLD runtime image's glibc from here, so record the flag
   # unconditionally; the runtime wrapper self-heals it on first boot — it
-  # enumerates collation-version-stale indexes from the catalog (PG15+
-  # records per-index collation versions) and reindexes exactly that set,
-  # CONCURRENTLY, in the background: zero work when the library didn't
-  # change, no operator in the loop when it did.
+  # detects staleness per COLLATION (no supported PostgreSQL tracks it per
+  # index: PG13 added pg_depend.refobjversion, PG14 reverted it), maps
+  # suspect collations to their dependent indexes, and reindexes exactly
+  # that set, CONCURRENTLY, in the background: zero work when the library
+  # didn't change, no operator in the loop when it did. Pre-15 sources have
+  # no recorded baseline to compare (datcollversion is PG15+, and pg_upgrade
+  # re-stamps initdb-created collations), so the wrapper treats every
+  # collation-dependent index as suspect there instead of declaring them
+  # current.
   # needsConfigReview: postgresql{,.auto}.conf were not carried (see
-  # stash_old_config) — the dashboard surfaces "re-apply your ALTER SYSTEM
-  # settings" off this flag, pointing at the stashed reference copies.
+  # stash_old_config) — the runtime wrapper re-applies the stashed auto.conf
+  # itself, one GUC at a time; the stashed reference copies stay at the
+  # volume root.
   write_marker "$(jq -nc \
     --arg from "$FROM_MAJOR" --arg to "$TO_MAJOR" --arg old "$(basename "$OLD_KEEP_DIR")" \
     '{phase: "completed", from: $from, to: $to, oldDataDir: $old, needsAnalyze: true, needsReindex: true, needsConfigReview: true, completedAt: (now | todate)}')"
