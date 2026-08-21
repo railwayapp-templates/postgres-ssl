@@ -759,9 +759,10 @@ carry_cluster_config() {
 # 16, …), and an unrecognized parameter in those files refuses the whole
 # boot. The user's tuning must not silently evaporate either, so keep
 # reference copies at the volume root — they outlive the old dir's reclaim —
-# and the completed marker records needsConfigReview so the dashboard can
-# surface "re-apply your ALTER SYSTEM settings" instead of the user
-# discovering it via a post-upgrade max_connections regression.
+# and the completed marker records needsConfigReview; the runtime wrapper
+# then re-applies the stashed auto.conf itself on first boot, one GUC at a
+# time (a GUC the new major removed fails only its own statement, logged),
+# so the user's tuning comes back without anyone in the loop.
 stash_old_config() {
   local src="$1" f
   for f in postgresql.conf postgresql.auto.conf; do
@@ -827,9 +828,11 @@ finish_swap() {
   # collatable columns (text/varchar btree) is only valid for the glibc that
   # built it — and the source cluster may have run on an older base image.
   # We can't read the OLD runtime image's glibc from here, so record the flag
-  # unconditionally and let the operator/dashboard drive the REINDEX; an
-  # automatic REINDEX of an arbitrarily large database inside the upgrade
-  # window is the wrong default (documented follow-up in the README).
+  # unconditionally; the runtime wrapper self-heals it on first boot — it
+  # enumerates collation-version-stale indexes from the catalog (PG15+
+  # records per-index collation versions) and reindexes exactly that set,
+  # CONCURRENTLY, in the background: zero work when the library didn't
+  # change, no operator in the loop when it did.
   # needsConfigReview: postgresql{,.auto}.conf were not carried (see
   # stash_old_config) — the dashboard surfaces "re-apply your ALTER SYSTEM
   # settings" off this flag, pointing at the stashed reference copies.

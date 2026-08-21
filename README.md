@@ -475,10 +475,14 @@ removed, and one unrecognized parameter there refuses the whole boot. The
 user's tuning must not silently evaporate either, so the job stashes both
 files at the volume root as `.pre-upgrade-<from>-postgresql.conf` /
 `.pre-upgrade-<from>-postgresql.auto.conf` (they outlive the old data dir's
-24 h reclaim) and records `needsConfigReview: true` in the completed marker —
-surfacing "re-apply your `ALTER SYSTEM` settings" is the dashboard's job,
-because the alternative is the user discovering it via a post-upgrade
-`max_connections` regression.
+24 h reclaim) and records `needsConfigReview: true` in the completed marker.
+`wrapper.sh` then self-heals it on the next boot: the stashed `auto.conf` is
+re-applied one GUC at a time via `ALTER SYSTEM` — a GUC the new major
+removed fails only its own statement (logged), never the boot; GUCs the
+image itself manages (archiving/recovery machinery, connection paths, SSL
+file paths) are never re-applied. `postgresql.conf` itself is initdb +
+entrypoint output, not a user surface, so only its stash remains as
+reference.
 
 #### Disk reclaim and rollback window
 
@@ -502,17 +506,31 @@ another `${PGDATA}.old-*` name to get it out of the way — the background
 reclaim above matches that whole glob and would delete it once the grace
 period passes; move it outside the prefix entirely.
 
-#### Collation caveat (known follow-up)
+#### Collation self-heal
 
 `pg_upgrade` preserves index files verbatim, but indexes on collatable
-columns (text/varchar btrees) are only valid for the glibc that built them,
-and the target image's glibc may differ from whatever built the source
-cluster. The marker records `needsReindex: true` on every upgrade — the
-image deliberately does **not** auto-`REINDEX` (rebuilding every text index
-on an arbitrarily large database inside the upgrade window is the wrong
-default). Surfacing that flag and driving the reindex is the dashboard's
-follow-up; `wrapper.sh`'s collation-version refresh only silences the
-version-mismatch warnings, it does not rebuild indexes.
+columns (text/varchar btrees) are only valid for the collation library that
+built them, and the target image's glibc may differ from whatever built the
+source cluster. The marker records `needsReindex: true` on every upgrade and
+`wrapper.sh` self-heals it in the background on the next boot — outside the
+upgrade window, so the database serves immediately either way:
+
+- Staleness is detected **per collation** (no supported PostgreSQL tracks it
+  per index: PG13 added `pg_depend.refobjversion`, PG14 reverted it): the
+  database default's `datcollversion` and each named collation's
+  `collversion` against their `*_actual_version()`.
+- Only the indexes depending on a stale collation are rebuilt, with
+  `REINDEX INDEX CONCURRENTLY` (system catalogs excluded — they cannot be
+  reindexed concurrently and ship on C-locale name columns). Leftover
+  invalid `*_ccnew` indexes from an interrupted attempt are dropped first.
+- The version stamps are refreshed only **after** the rebuilds succeed —
+  never the reverse. While `needsReindex` is up, the boot-time blind
+  collation-version refresh stands down (refreshing stamps without
+  rebuilding would silently declare stale indexes current, which is exactly
+  the wart this replaces).
+- Same library on both sides (the common case) means an empty stale set and
+  the flag clears with zero work; any failure keeps the flag and the next
+  boot retries.
 
 ### Archive re-anchoring
 

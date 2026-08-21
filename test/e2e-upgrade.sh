@@ -1261,6 +1261,94 @@ t_recover_refuses_past_commit_point() {
     || { echo "  refusal mutated the volume"; return 1; }
 }
 
+# The wrapper self-heals BOTH post-upgrade config concerns without an
+# operator: ALTER SYSTEM settings come back one GUC at a time (a GUC the new
+# major removed fails only its own statement; image-managed GUCs are never
+# re-applied), and the database restarts clean afterwards.
+t_config_restore_self_heals() {
+  local vol="upg-e2e-confheal"
+  fresh_volume "$vol" || return 1
+  run_pg confheal-pg "$vol" "$FROM_IMAGE" || return 1
+  wait_for_pg confheal-pg || { fail_dump confheal confheal-pg; return 1; }
+  psql_must confheal-pg "ALTER SYSTEM SET work_mem = '7654kB'" || return 1
+  psql_must confheal-pg "ALTER SYSTEM SET archive_command = 'should-never-carry'" || return 1
+  if [ "$FROM_VERSION" -le 16 ] && [ "$TO_VERSION" -ge 17 ]; then
+    # Removed in 17 — exercises the per-GUC rejection path.
+    psql_must confheal-pg "ALTER SYSTEM SET old_snapshot_threshold = '10min'" || return 1
+  fi
+  stop_pg confheal-pg
+
+  run_job "$vol" upgrade
+  assert_eq "$JOB_RC" 0 "upgrade" || { echo "$JOB_OUT" | tail -20; return 1; }
+
+  run_pg confheal2-pg "$vol" "$TO_IMAGE" || return 1
+  wait_for_pg confheal2-pg || { fail_dump confheal2 confheal2-pg; return 1; }
+  local deadline=$(($(date +%s) + 120))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    [ "$(marker_field "$vol" needsConfigReview)" = "false" ] && break
+    sleep 5
+  done
+  assert_eq "$(marker_field "$vol" needsConfigReview)" "false" "config review self-healed" || { fail_dump confheal2 confheal2-pg; return 1; }
+  assert_eq "$(psql_in confheal2-pg 'SHOW work_mem')" "7654kB" "user tuning re-applied" || return 1
+  local logs
+  logs=$(docker logs confheal2-pg 2>&1)
+  assert_contains "$logs" "archive_command: image-managed" "image-managed GUC never re-applied" || return 1
+  if [ "$FROM_VERSION" -le 16 ] && [ "$TO_VERSION" -ge 17 ]; then
+    assert_contains "$logs" "old_snapshot_threshold: not re-applied" "removed GUC rejected per-statement, boot unharmed" || return 1
+  fi
+  # The restored auto.conf must not refuse the NEXT boot either.
+  docker restart confheal2-pg >/dev/null
+  wait_for_pg confheal2-pg || { fail_dump confheal2-restart confheal2-pg; return 1; }
+  assert_eq "$(psql_in confheal2-pg 'SHOW work_mem')" "7654kB" "tuning survives restart" || return 1
+  stop_pg confheal2-pg
+}
+
+# The wrapper self-heals collation drift: per-collation staleness detection
+# (datcollversion / collversion), REINDEX CONCURRENTLY of exactly the
+# dependent indexes, and only then the version-stamp refresh. Same library
+# across the test images = the zero-work path; a faked datcollversion forces
+# the rebuild path deterministically.
+t_reindex_self_heals() {
+  local vol="upg-e2e-reindexheal"
+  fresh_volume "$vol" || return 1
+  run_pg rxheal-pg "$vol" "$FROM_IMAGE" || return 1
+  wait_for_pg rxheal-pg || { fail_dump rxheal rxheal-pg; return 1; }
+  psql_must rxheal-pg "CREATE TABLE ct(a text); INSERT INTO ct SELECT g::text FROM generate_series(1,500) g; CREATE INDEX ct_a_idx ON ct(a)" || return 1
+  stop_pg rxheal-pg
+  run_job "$vol" upgrade
+  assert_eq "$JOB_RC" 0 "upgrade" || { echo "$JOB_OUT" | tail -20; return 1; }
+
+  run_pg rxheal2-pg "$vol" "$TO_IMAGE" || return 1
+  wait_for_pg rxheal2-pg || { fail_dump rxheal2 rxheal2-pg; return 1; }
+  local deadline=$(($(date +%s) + 120))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    [ "$(marker_field "$vol" needsReindex)" = "false" ] && break
+    sleep 5
+  done
+  assert_eq "$(marker_field "$vol" needsReindex)" "false" "reindex flag self-cleared" || { fail_dump rxheal2 rxheal2-pg; return 1; }
+  assert_contains "$(docker logs rxheal2-pg 2>&1)" "no reindex needed" "zero-work path logged" || return 1
+
+  # Force the stale shape: fake the recorded default-collation version,
+  # re-arm the flag, restart — the fork must rebuild ct_a_idx, and only
+  # then refresh the stamp back to current.
+  psql_must rxheal2-pg "SET allow_system_table_mods = on; UPDATE pg_database SET datcollversion = '0.fake' WHERE datname = current_database()" || return 1
+  in_volume "$vol" "jq '.needsReindex = true' $MARKER_PATH > /tmp/m && cat /tmp/m > $MARKER_PATH" || return 1
+  docker restart rxheal2-pg >/dev/null
+  wait_for_pg rxheal2-pg || { fail_dump rxheal2-restart rxheal2-pg; return 1; }
+  deadline=$(($(date +%s) + 180))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    [ "$(marker_field "$vol" needsReindex)" = "false" ] && break
+    sleep 5
+  done
+  assert_eq "$(marker_field "$vol" needsReindex)" "false" "forced reindex completed" || { fail_dump rxheal2b rxheal2-pg; return 1; }
+  local logs
+  logs=$(docker logs rxheal2-pg 2>&1)
+  assert_contains "$logs" "reindexing" "stale-dependent index actually rebuilt" || return 1
+  assert_eq "$(psql_in rxheal2-pg 'SELECT (datcollversion IS NOT DISTINCT FROM pg_database_collation_actual_version(oid))::int FROM pg_database WHERE datname = current_database()')" "1" "version stamp refreshed only after the rebuild" || return 1
+  assert_eq "$(psql_in rxheal2-pg "SELECT count(*) FROM ct WHERE a = '250'")" "1" "index answers queries" || return 1
+  stop_pg rxheal2-pg
+}
+
 # pgdata.old-<from> is the rollback body and pins every pre-upgrade inode
 # (--link hardlinks); it must survive normal boots and be reclaimed in the
 # background once the upgraded database has been up past the grace period,
@@ -1749,6 +1837,8 @@ ALL_TESTS=(
   t_manifest_mode
   t_ssl_survives_upgrade
   t_analyze_staged
+  t_config_restore_self_heals
+  t_reindex_self_heals
   t_old_image_on_upgraded_data
   t_mismatch_boot_failstop
   t_boot_refused_mid_upgrade
