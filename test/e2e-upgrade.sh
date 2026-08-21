@@ -472,6 +472,31 @@ t_recovers_unclean_shutdown() {
   stop_pg unclean2-pg
 }
 
+# The quiesce start's failure line must be SELF-DIAGNOSING: die()'s one line
+# is the only output that survives into the platform's progress record (the
+# job log dies with its container), so a postmaster that DIES during
+# recovery must be reported as a crash carrying the server's own last error
+# — never the misleading "within Ns" timeout wording — and a fast death
+# earns exactly one in-job retry first. Emptying pg_wal makes recovery PANIC
+# immediately ("could not locate a valid checkpoint record"): deterministic
+# fast death, both attempts.
+t_quiesce_crash_reports_server_error() {
+  local vol="upg-e2e-quiesce-crash"
+  fresh_volume "$vol" || return 1
+  run_pg quiesce-pg "$vol" "$FROM_IMAGE" || return 1
+  wait_for_pg quiesce-pg || { fail_dump quiesce quiesce-pg; return 1; }
+  psql_must quiesce-pg "CREATE TABLE quiesce_canary (id int)" || return 1
+  kill_pg quiesce-pg
+  in_volume "$vol" "rm -f ${PGDATA_IN_VOLUME}/pg_wal/0*" || return 1
+
+  run_job "$vol" check
+  assert_eq "$JOB_RC" 3 "check dies on a crash-dead quiesce" || { echo "$JOB_OUT" | tail -30; return 1; }
+  assert_contains "$JOB_OUT" "retrying once" "fast death earned one in-job retry" || return 1
+  assert_contains "$JOB_OUT" "failed to start for crash recovery" "crash wording, not timeout wording" || return 1
+  assert_contains "$JOB_OUT" "last server error:" "server's own error line surfaced in the die() line" || return 1
+}
+
+
 # A second concurrent job on the same volume is refused (activity-retry race).
 t_refuses_concurrent_job() {
   local vol="upg-e2e-concurrent"
@@ -1641,6 +1666,7 @@ ALL_TESTS=(
   t_check_blocker_pre16_types
   t_refuses_wrong_major
   t_recovers_unclean_shutdown
+  t_quiesce_crash_reports_server_error
   t_refuses_concurrent_job
   t_upgrade_happy_path
   t_upgrade_idempotent

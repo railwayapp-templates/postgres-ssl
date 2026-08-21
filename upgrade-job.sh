@@ -392,10 +392,29 @@ ensure_clean_shutdown() {
   # a WAL-replay failure is exactly the moment the FATAL lines matter, and
   # discarding them leaves the job log with nothing but a generic message.
   local quiesce_log="/tmp/pg-quiesce.log"
-  rm -f "$quiesce_log"
-  as_postgres "$OLD_BINDIR/pg_ctl" -D "$PGDATA" -w -t "$UPGRADE_QUIESCE_TIMEOUT_SECONDS" -l "$quiesce_log" \
-    -o "-c listen_addresses='' -k /tmp" start >/dev/null 2>&1 \
-    || { print_quiesce_log "$quiesce_log"; die 3 "the old server could not start to complete crash recovery within ${UPGRADE_QUIESCE_TIMEOUT_SECONDS}s (server log above; override with UPGRADE_QUIESCE_TIMEOUT_SECONDS)"; }
+  # A start that dies FAST (well under the -t deadline) has repeatedly shown
+  # up as a transient of the just-attached volume/container rather than a
+  # real WAL-replay failure, and an interrupted recovery persists no progress
+  # (see above) — so one bounded in-job retry is safe and cheap. A start that
+  # burned the whole deadline gets no retry: the second attempt would replay
+  # the same WAL from scratch into the same deadline.
+  local quiesce_started elapsed attempt
+  for attempt in 1 2; do
+    rm -f "$quiesce_log"
+    quiesce_started="$(date +%s)"
+    if as_postgres "$OLD_BINDIR/pg_ctl" -D "$PGDATA" -w -t "$UPGRADE_QUIESCE_TIMEOUT_SECONDS" -l "$quiesce_log" \
+      -o "-c listen_addresses='' -k /tmp" start >/dev/null 2>&1; then
+      break
+    fi
+    elapsed=$(( $(date +%s) - quiesce_started ))
+    print_quiesce_log "$quiesce_log"
+    if [ "$attempt" -eq 1 ] && [ "$elapsed" -lt $(( UPGRADE_QUIESCE_TIMEOUT_SECONDS / 2 )) ]; then
+      log "old server start for crash recovery failed fast (${elapsed}s) — retrying once (server log above)"
+      sleep 5
+      continue
+    fi
+    die 3 "$(quiesce_start_failure_reason "$quiesce_log" "$quiesce_started")"
+  done
   as_postgres "$OLD_BINDIR/pg_ctl" -D "$PGDATA" -w -t "$UPGRADE_QUIESCE_TIMEOUT_SECONDS" -m fast stop >/dev/null 2>&1 \
     || { print_quiesce_log "$quiesce_log"; die 3 "the old server did not shut down cleanly after recovery within ${UPGRADE_QUIESCE_TIMEOUT_SECONDS}s (server log above)"; }
 
@@ -416,6 +435,30 @@ print_quiesce_log() {
   # RAILWAY_UPGRADE_RESULT: sentinel and forge a result line.
   tail -100 "$1" | sed 's/^/  server: /'
   echo "----- end of old server log -----"
+}
+
+# One self-diagnosing line for a failed quiesce start. pg_ctl -w exits the
+# same way whether the postmaster DIED during recovery or recovery was merely
+# still running at the -t deadline — and the die() line below is the ONLY
+# part of this job's output that survives into the upgrade/rehearsal progress
+# record (the full log dies with the job's container), so that line must
+# carry the distinction plus the server's own last fatal line. pg_ctl's
+# readiness probes leave benign "FATAL: the database system is starting up"
+# entries in the server log for the whole recovery — those never count as
+# the failure reason. die() JSON-encodes the message (jq --arg), so embedded
+# server-log bytes can't forge a result line; length still bounded here to
+# keep the blocker readable.
+quiesce_start_failure_reason() {
+  local quiesce_log="$1" started="$2"
+  local elapsed=$(( $(date +%s) - started ))
+  local reason
+  reason="$(grep -a -E "(PANIC|FATAL):" "$quiesce_log" 2>/dev/null \
+    | grep -v "the database system is starting up" | tail -1 | cut -c1-300)"
+  if [ -z "$reason" ] && [ "$elapsed" -ge $(( UPGRADE_QUIESCE_TIMEOUT_SECONDS - 2 )) ]; then
+    echo "the old server did not finish crash recovery within ${UPGRADE_QUIESCE_TIMEOUT_SECONDS}s (still recovering after ${elapsed}s — large WAL backlog or slow disk; override with UPGRADE_QUIESCE_TIMEOUT_SECONDS; server log above)"
+  else
+    echo "the old server failed to start for crash recovery after ${elapsed}s${reason:+ — last server error: ${reason}} (server log above)"
+  fi
 }
 
 # Reverse pg_upgrade's disable of the old cluster. pg_upgrade renames
