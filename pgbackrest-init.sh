@@ -53,6 +53,15 @@ mkdir -p "$PGDATA/conf.d"
 chmod 0750 "$PGDATA/conf.d"
 
 archive_timeout="${POSTGRES_ARCHIVE_TIMEOUT:-60}"
+# archive_timeout=0 turns the WAL hand-off off entirely — the RPO bound
+# this knob exists to set. A malformed value must fail the init loudly
+# instead of degrading to whatever bash makes of it.
+case "$archive_timeout" in
+  ''|0|*[!0-9]*)
+    echo "pgbackrest: POSTGRES_ARCHIVE_TIMEOUT='${POSTGRES_ARCHIVE_TIMEOUT}' is not a positive integer; refusing to write an archive config with it" >&2
+    exit 1
+    ;;
+esac
 # track_commit_timestamp lets pg_last_committed_xact() return the wall-clock
 # time of the last commit. The PITR picker uses that as its upper bound:
 # `recovery_target_time` only matches commit record timestamps, so on an idle
@@ -86,12 +95,26 @@ echo "pgbackrest: archive config written to ${PGDATA}/conf.d/pgbackrest.conf dur
 # correct PGBACKREST_REPO1_PATH from the marker — no race with the bootstrap
 # subshell in wrapper.sh, no archive-push fired against the wrong path.
 if [ ! -f "$PGDATA/.pgbackrest_repo_path" ] && [ -f "$PGDATA/global/pg_control" ]; then
-  sysid=$(pg_controldata "$PGDATA" 2>/dev/null \
+  # pg_controldata failing must not pass silently (set -e alone does not
+  # cover a pipeline without pipefail): an empty sysid here skips the
+  # marker block and the first archive-push fires against an unanchored
+  # repo path. Fail the init instead.
+  if ! pg_controldata_out=$(pg_controldata "$PGDATA" 2>/dev/null); then
+    echo "pgbackrest: pg_controldata failed on $PGDATA; cannot derive the system identifier" >&2
+    exit 1
+  fi
+  sysid=$(printf '%s\n' "$pg_controldata_out" \
     | awk -F: '/Database system identifier/ { gsub(/[ \t]/,"",$2); print $2 }')
   if [ -n "$sysid" ]; then
     cluster_path="${WAL_ARCHIVE_PATH:-/pgbackrest}/cluster-${sysid}"
-    echo "$cluster_path" > "$PGDATA/.pgbackrest_repo_path"
-    chmod 0640 "$PGDATA/.pgbackrest_repo_path"
+    # Publish via tmp+rename: a torn in-place write leaves an empty marker
+    # that still passes the -f gate and anchors the whole stack to an empty
+    # repo path.
+    cluster_path_tmp="${PGDATA}/.pgbackrest_repo_path.tmp"
+    echo "$cluster_path" > "$cluster_path_tmp" \
+      && chmod 0640 "$cluster_path_tmp" \
+      && mv "$cluster_path_tmp" "$PGDATA/.pgbackrest_repo_path" \
+      || { echo "pgbackrest: failed to write the repo-path marker atomically" >&2; exit 1; }
     echo "pgbackrest: per-cluster repo path = ${cluster_path}"
     # Fingerprint the cluster that path was derived from. wrapper.sh compares
     # it against the live cluster on every boot and re-anchors archiving to a
@@ -100,8 +123,14 @@ if [ ! -f "$PGDATA/.pgbackrest_repo_path" ] && [ -f "$PGDATA/global/pg_control" 
     # it here rather than letting wrapper.sh backfill it next boot means the
     # first boot after initdb already carries a derived fingerprint instead of
     # an adopted one.
+    anchor_tmp="${PGDATA}/.pgbackrest_repo_anchor.tmp"
     printf 'sysid=%s\npg_version=%s\n' "$sysid" "$(cat "$PGDATA/PG_VERSION")" \
-      > "$PGDATA/.pgbackrest_repo_anchor"
-    chmod 0640 "$PGDATA/.pgbackrest_repo_anchor"
+      > "$anchor_tmp" \
+      && chmod 0640 "$anchor_tmp" \
+      && mv "$anchor_tmp" "$PGDATA/.pgbackrest_repo_anchor" \
+      || { echo "pgbackrest: failed to write the repo anchor atomically" >&2; exit 1; }
+  else
+    echo "pgbackrest: pg_controldata produced no system identifier; refusing to anchor the repo path" >&2
+    exit 1
   fi
 fi
