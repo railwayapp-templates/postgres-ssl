@@ -4121,12 +4121,19 @@ t_pitr_missing_wal_segment_fatals() {
   target=$(docker exec "$src_name" psql -U postgres -At -c "SELECT now()::timestamptz(0)")
   sleep 3
 
-  # Single post-target INSERT, then switch_wal so the segment carrying its
-  # commit ships and becomes the LATEST archived segment.
-  docker exec "$src_name" psql -U postgres -c "INSERT INTO pitrtest VALUES (3); SELECT pg_switch_wal();" >/dev/null
+  # Single post-target INSERT. Capture the insert LSN right after the commit
+  # so the exact segment carrying that commit is known by name — the probe
+  # loop below may pg_switch_wal() extra (empty) segments, so "the LATEST
+  # archived segment" is not reliably the one carrying the only commit dated
+  # after the target.
+  docker exec "$src_name" psql -U postgres -c "INSERT INTO pitrtest VALUES (3);" >/dev/null
+  local commit_lsn
+  commit_lsn=$(docker exec "$src_name" psql -U postgres -At -c "SELECT pg_current_wal_insert_lsn()")
+  docker exec "$src_name" psql -U postgres -c "SELECT pg_switch_wal();" >/dev/null
 
-  # Wait for archive head to advance past target. Probing pg_stat_archiver
-  # is deterministic; trust the wrapper to keep archive_command running.
+  # Wait for archive head to advance past target (the commit's segment
+  # shipped). Probing pg_stat_archiver is deterministic; trust the wrapper
+  # to keep archive_command running.
   local d=$(($(date +%s) + 60))
   while [ "$(date +%s)" -lt "$d" ]; do
     local last_archived
@@ -4139,22 +4146,24 @@ t_pitr_missing_wal_segment_fatals() {
     sleep 2
   done
 
-  # Identify and delete the LATEST archived segment. By construction it
-  # contains id=3's commit (the only commit dated > target). Pre-target
-  # segments stay so backup-recovery can reach min_recovery_endpoint and
-  # the early WAL replay is well-formed; the gap is strictly at the
-  # post-target frontier.
-  local segments last
-  segments=$(mc "mc find local/${BUCKET}${src_path}/archive --name '00000001*.zst' 2>/dev/null | sort")
-  local n
-  n=$(echo "$segments" | grep -c .)
-  if [ "$n" -lt 3 ]; then
-    ko t_pitr_missing_wal_segment_fatals "expected ≥3 archived WAL segments in bucket; got $n"
+  # Delete exactly the segment carrying id=3's commit — the first commit
+  # dated after the target. Recovery must read that record to know where to
+  # stop, so removing it forces the loud-refuse path deterministically;
+  # extra empty segments the probe loop shipped stay behind, harmlessly.
+  # Segment size is 16MB → segment number = LSN >> 24 (wal segment naming:
+  # timeline + logid + logseg, each %08X).
+  local lsn_hi lsn_lo seg_prefix victims n
+  lsn_hi=${commit_lsn%%/*}
+  lsn_lo=${commit_lsn##*/}
+  seg_prefix=$(printf '00000001%08X%08X' "$((16#${lsn_hi}))" "$(( (16#${lsn_lo}) >> 24 ))")
+  victims=$(mc "mc find local/${BUCKET}${src_path}/archive --name '${seg_prefix}*.zst' 2>/dev/null | sort")
+  n=$(echo "$victims" | grep -c .)
+  if [ "$n" -ne 1 ]; then
+    ko t_pitr_missing_wal_segment_fatals "expected exactly 1 archived copy of segment ${seg_prefix} (LSN ${commit_lsn}); got $n"
     return
   fi
-  last=$(echo "$segments" | tail -1)
-  mc "mc rm '${last}'" >/dev/null
-  note "deleted latest segment $last (the only one with records > target)"
+  mc "mc rm '${victims}'" >/dev/null
+  note "deleted segment ${seg_prefix} (carries the only commit dated > target)"
 
   new_volume "$rest_vol"
   docker rm -f "$rest_name" >/dev/null 2>&1 || true
