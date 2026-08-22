@@ -625,10 +625,15 @@ run_pg_upgrade() {
 check_free_space() {
   local avail_kb avail_mb
   avail_kb=$(df -Pk "$VOLUME_ROOT" 2>/dev/null | awk 'NR==2 {print $4}')
-  if [ -z "${avail_kb:-}" ]; then
-    log "could not read free space on $VOLUME_ROOT; continuing without the free-space check"
-    return 0
-  fi
+  # Non-numeric garbage must take the same documented warn+proceed path as an
+  # empty read: without this, alpha output dies with a misleading "0 MiB free"
+  # and digit-prefixed garbage aborts the whole job through set -u.
+  case "${avail_kb:-}" in
+    ''|*[!0-9]*)
+      log "could not read free space on $VOLUME_ROOT (df returned '${avail_kb:-}'); continuing without the free-space check"
+      return 0
+      ;;
+  esac
   avail_mb=$(( avail_kb / 1024 ))
   if [ "$avail_mb" -lt "$UPGRADE_MIN_FREE_MB" ]; then
     die 2 "only ${avail_mb} MiB free on the volume (need at least ${UPGRADE_MIN_FREE_MB} MiB for the new cluster's catalogs and pg_upgrade's work files) — free up space or grow the volume, then re-run (override with UPGRADE_MIN_FREE_MB)"
