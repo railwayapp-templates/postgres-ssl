@@ -17,26 +17,37 @@ SSL_V3_EXT="$SSL_DIR/v3.ext"
 
 POSTGRES_CONF_FILE="$PGDATA/postgresql.conf"
 
-# A malformed day count must fail loudly, not degrade silently: bash
-# arithmetic would turn a typo into a nonsense value and openssl into a
-# cert that expires at birth, and SSL_CERT_DAYS=0 issues a certificate
-# that is expired the moment it is written.
-SSL_CERT_DAYS_VALUE="${SSL_CERT_DAYS:-820}"
-case "$SSL_CERT_DAYS_VALUE" in
-  ''|0|*[!0-9]*)
-    echo "init-ssl: SSL_CERT_DAYS='${SSL_CERT_DAYS}' is not a positive integer; refusing to issue certificates with it" >&2
-    exit 1
-    ;;
-esac
-
 # Idempotency: docker-entrypoint-initdb.d runs on first init only, but a
 # re-execution (manual run, unusual entrypoint ordering) must not rotate a
 # CA that clients have pinned into their trust stores — that is an outage.
-# Regenerate only when the set is absent or incomplete, and say so.
-if [ -f "$SSL_ROOT_CRT" ] && [ -f "$SSL_SERVER_CRT" ] && [ -f "$SSL_SERVER_KEY" ]; then
-  echo "init-ssl: certificates already present in $SSL_DIR; keeping them"
+# Keep is keyed on VALIDITY, never mere existence: wrapper.sh re-runs this
+# script precisely to REPLACE certs that are not x509v3 (no SAN) or that
+# expire within 30 days, so an existence-only keep would turn both of those
+# heals into no-ops. Keep only a complete set whose server.crt passes the
+# SAME two tests wrapper.sh uses to decide a re-run is needed (checkend
+# 2592000 = 30 days; DNS:localhost in the text output as the v3/SAN probe),
+# so the two can never disagree; anything else regenerates.
+if [ -f "$SSL_ROOT_CRT" ] && [ -f "$SSL_SERVER_CRT" ] && [ -f "$SSL_SERVER_KEY" ] \
+  && openssl x509 -checkend 2592000 -noout -in "$SSL_SERVER_CRT" >/dev/null 2>&1 \
+  && openssl x509 -noout -text -in "$SSL_SERVER_CRT" 2>/dev/null | grep -q "DNS:localhost"; then
+  echo "init-ssl: valid certificates already present in $SSL_DIR; keeping them"
 else
-  echo "init-ssl: certificate set incomplete or absent in $SSL_DIR; generating"
+  echo "init-ssl: certificates absent, incomplete, expiring within 30 days, or missing the x509v3 SAN in $SSL_DIR; generating"
+
+# A malformed day count must not stop the database: this script runs under
+# wrapper.sh's set -e on every renewal (the checkend re-run above), so an
+# exit here would crash-loop a healthy database the day its certificate
+# crosses the 30-day window. Bash arithmetic would turn a typo into a
+# nonsense value and openssl into a cert that expires at birth (and
+# SSL_CERT_DAYS=0 is expired the moment it is written) — so WARN loudly and
+# fall back to the default instead.
+SSL_CERT_DAYS_VALUE="${SSL_CERT_DAYS:-820}"
+case "$SSL_CERT_DAYS_VALUE" in
+  ''|0|*[!0-9]*)
+    echo "init-ssl: SSL_CERT_DAYS='${SSL_CERT_DAYS}' is not a positive integer; using 820 (a bad value must never stop certificate issuance)" >&2
+    SSL_CERT_DAYS_VALUE=820
+    ;;
+esac
 
 # Use sudo to create the directory as root
 sudo mkdir -p "$SSL_DIR"
