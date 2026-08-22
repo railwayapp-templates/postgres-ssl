@@ -85,9 +85,22 @@ keyUsage = digitalSignature, nonRepudiation, keyEncipherment, dataEncipherment
 subjectAltName = ${SSL_SAN}
 EOF
 
+# -CAcreateserial only CREATES the serial file when absent — a present-but-torn
+# root.srl (e.g. a volume restored from a snapshot that caught a cert write
+# before it synced; 2026-08-22: a rehearsal copy crash-looped on
+# "Unable to load number from .../root.srl ... a2i_ASN1_INTEGER:short line")
+# makes openssl fail and, under set -e, kills the whole boot. Everything is
+# being re-signed anyway, so a fresh serial is always correct here.
+rm -f "$SSL_DIR/root.srl"
 openssl x509 -req -in "$SSL_SERVER_CSR" -extfile "$SSL_V3_EXT" -extensions v3_req -text -days "$SSL_CERT_DAYS_VALUE" -CA "$SSL_ROOT_CRT" -CAkey "$SSL_ROOT_KEY" -CAcreateserial -out "$SSL_SERVER_CRT"
 
 chown postgres:postgres "$SSL_SERVER_CRT"
+
+# Flush the freshly written certs to disk: a snapshot taken moments after this
+# boot (upgrade rehearsals snapshot the live volume; users take backups) must
+# capture a complete certs/ dir, not the torn state this block just learned to
+# recover from.
+sync "$SSL_DIR"/* "$SSL_DIR" 2>/dev/null || sync
 
 fi
 
