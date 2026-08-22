@@ -558,6 +558,29 @@ upgrade window, so the database serves immediately either way:
 - Same library on both sides (the common case) means an empty stale set and
   the flag clears with zero work; any failure keeps the flag and the next
   boot retries.
+- `POST_UPGRADE_REINDEX_DISABLED=1` opts out of the automatic reindex
+  entirely: every rebuild **and** every stamp refresh is skipped (refreshing
+  without rebuilding would mask the staleness), `needsReindex` stays set,
+  and the skip is logged. Default behavior is unchanged when unset.
+
+Scope and caveats for both post-upgrade self-heals (this reindex and the
+`ALTER SYSTEM` restore above):
+
+- They act only on markers written by the current upgrade job, which records
+  a `stashedAutoConf` field. A legacy marker (no such field) predates the
+  self-heal and its flags belong to the dashboard-driven flow — the wrapper
+  logs that it found one, skips, and leaves the flags set. Retroactively
+  adopting an old marker would replay a months-old `auto.conf` stash over
+  re-tuning done since, and (for ≥15 sources) trust collation stamps the old
+  boot-time blind refresh already overwrote.
+- "No operator in the loop" is a property of this **standalone** image:
+  postgres-ha cluster members boot a different image without these forks,
+  so on HA volumes the flags never self-clear and the dashboard-driven flow
+  resolves them.
+- The self-heal covers upgrades only. A plain image rebuild that ships a
+  newer glibc/ICU **without** a major upgrade leaves no marker, and on such
+  boots `wrapper.sh`'s collation-version refresh still only silences the
+  version-mismatch warnings — it does not rebuild indexes.
 
 ### Archive re-anchoring
 
