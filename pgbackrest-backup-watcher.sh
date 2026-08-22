@@ -127,35 +127,46 @@ FULL_RETRY_BACKOFF_SECONDS="${WAL_BACKUP_FULL_RETRY_BACKOFF_SECONDS:-600}"
 # trips and drops segments.
 WAL_LAG_GAP_THRESHOLD_SEGMENTS="${WAL_LAG_GAP_THRESHOLD_SEGMENTS:-32}"
 
+# A malformed numeric knob must never degrade silently: bash arithmetic
+# evaluates non-numeric strings to 0, and 0 here means "periodic fulls
+# disabled" — a typo like 168h would silently stop the weekly full and
+# erode PITR windows. But exiting is worse: there is NO supervisor
+# (wrapper.sh forks a single watcher, no respawn — deliberate, see
+# fork_pgbackrest_backup_watcher), so a refusal at startup silently
+# disables the initial backup, gap recovery, LSN-lag detection, and the
+# WAL heartbeat until the next deploy. WARN loudly and fall back to the
+# knob's documented default instead — the watcher must keep running.
+sanitize_uint() {
+  # $1 = env var name (for the log line), $2 = variable to repair, $3 = default
+  local value="${!2}"
+  case "$value" in
+    ''|*[!0-9]*)
+      echo "pgbackrest-watcher: $1='$value' is not a non-negative integer; using the default ($3) — a bad knob must never stop the watcher" >&2
+      printf -v "$2" '%s' "$3"
+      ;;
+  esac
+}
+sanitize_uint WAL_BACKUP_POLL_INTERVAL_SECONDS POLL_INTERVAL_SECONDS 60
+sanitize_uint WAL_BACKUP_GAP_RECOVERY_BACKOFF_SECONDS GAP_RECOVERY_BACKOFF_SECONDS 600
+sanitize_uint WAL_BACKUP_FULL_INTERVAL_HOURS FULL_INTERVAL_HOURS 168
+sanitize_uint WAL_BACKUP_DIFF_INTERVAL_HOURS DIFF_INTERVAL_HOURS 24
+sanitize_uint WAL_BACKUP_CATALOG_VERIFY_INTERVAL_SECONDS CATALOG_VERIFY_INTERVAL_SECONDS 3600
+sanitize_uint WAL_BACKUP_FULL_RETRY_BACKOFF_SECONDS FULL_RETRY_BACKOFF_SECONDS 600
+sanitize_uint WAL_LAG_GAP_THRESHOLD_SEGMENTS WAL_LAG_GAP_THRESHOLD_SEGMENTS 32
+
 # Resolved cadence in seconds. WAL_BACKUP_FULL_INTERVAL_SECONDS overrides
 # the hours setting — bash arithmetic precludes fractional hours, so the
 # e2e harness needs a second-level knob to exercise retention rollover
 # inside a single test cycle. 0 means "no periodic full" (gap-recovery
 # and NEEDS_INITIAL_BACKUP still fire); any positive value sets the
 # cadence. Defaults to FULL_INTERVAL_HOURS * 3600 when unset, preserving
-# existing prod behavior.
+# existing prod behavior. Computed only AFTER the hours knobs are
+# sanitized above — an arithmetic expansion over a malformed hours value
+# would abort the assignment and leave the variable unset under set -u.
 FULL_INTERVAL_SECONDS="${WAL_BACKUP_FULL_INTERVAL_SECONDS:-$((FULL_INTERVAL_HOURS * 3600))}"
 DIFF_INTERVAL_SECONDS="${WAL_BACKUP_DIFF_INTERVAL_SECONDS:-$((DIFF_INTERVAL_HOURS * 3600))}"
-
-# A malformed numeric knob must never degrade silently: bash arithmetic
-# evaluates non-numeric strings to 0, and 0 here means "periodic fulls
-# disabled" — a typo like 168h would silently stop the weekly full and
-# erode PITR windows. Refuse to run with it; the supervisor restarts the
-# watcher and the log line is unmissable.
-require_uint() {
-  # $1 = env var name, $2 = resolved value
-  case "$2" in
-    ''|*[!0-9]*)
-      echo "pgbackrest-watcher: $1='$2' is not a non-negative integer; refusing to run (bash would evaluate it as 0)" >&2
-      exit 1
-      ;;
-  esac
-}
-require_uint WAL_BACKUP_FULL_INTERVAL_HOURS "$FULL_INTERVAL_HOURS"
-require_uint WAL_BACKUP_DIFF_INTERVAL_HOURS "$DIFF_INTERVAL_HOURS"
-require_uint WAL_BACKUP_FULL_INTERVAL_SECONDS "$FULL_INTERVAL_SECONDS"
-require_uint WAL_BACKUP_DIFF_INTERVAL_SECONDS "$DIFF_INTERVAL_SECONDS"
-require_uint WAL_BACKUP_CATALOG_VERIFY_INTERVAL_SECONDS "$CATALOG_VERIFY_INTERVAL_SECONDS"
+sanitize_uint WAL_BACKUP_FULL_INTERVAL_SECONDS FULL_INTERVAL_SECONDS "$((FULL_INTERVAL_HOURS * 3600))"
+sanitize_uint WAL_BACKUP_DIFF_INTERVAL_SECONDS DIFF_INTERVAL_SECONDS "$((DIFF_INTERVAL_HOURS * 3600))"
 
 log() { echo "pgbackrest-watcher: $*"; }
 
