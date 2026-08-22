@@ -309,7 +309,11 @@ check_mount() {
   fi
 }
 
-JOB_LOCK_FILE="$VOLUME_ROOT/.railway-major-upgrade.lock"
+JOB_LOCK_FILE="$VOLUME_ROOT/.railway-volume.lock"
+# Pre-rename path (see wrapper.sh): runtimes built before the rename hold
+# THIS file shared for their container's lifetime and know nothing of the
+# new name, so the job locks both.
+LEGACY_JOB_LOCK_FILE="$VOLUME_ROOT/.railway-major-upgrade.lock"
 
 # Exclusive flock on the volume-root lock file, held for this job's lifetime.
 # The runtime image (wrapper.sh) holds the SAME file with a SHARED flock for
@@ -323,6 +327,12 @@ JOB_LOCK_FILE="$VOLUME_ROOT/.railway-major-upgrade.lock"
 # incumbent before this container starts) remains the first line of defense;
 # this is the in-image backstop that turns a workflow bug into a refusal
 # instead of a corrupted volume.
+#
+# The legacy path is CREATED here, not if-exists-probed: the create-open
+# converges every racer on one inode, so even a pre-rename runtime booting
+# concurrently contends on the same lock with no check-then-create window.
+# (Unlike the wrapper, the job runs only during a real upgrade — a
+# major-upgrade-named file on an upgraded volume is true evidence.)
 take_job_lock() {
   command -v flock >/dev/null 2>&1 \
     || { log "flock not available; continuing without the upgrade lock"; return 0; }
@@ -337,6 +347,17 @@ take_job_lock() {
     return 0
   fi
   if ! flock -n 9; then
+    die 2 "the volume is in use — another upgrade job, or a still-running database container, holds the upgrade lock"
+  fi
+  [ -s "$JOB_LOCK_FILE" ] || printf '%s\n' \
+    "Advisory flock rendezvous between the Postgres container and Railway maintenance jobs." \
+    "Created on every boot; its presence is not a record of any upgrade or other event." \
+    >>"$JOB_LOCK_FILE" 2>/dev/null || true
+  if ! { exec 10>>"$LEGACY_JOB_LOCK_FILE"; } 2>/dev/null; then
+    log "could not open $LEGACY_JOB_LOCK_FILE; continuing without the legacy upgrade lock"
+    return 0
+  fi
+  if ! flock -n 10; then
     die 2 "the volume is in use — another upgrade job, or a still-running database container, holds the upgrade lock"
   fi
 }

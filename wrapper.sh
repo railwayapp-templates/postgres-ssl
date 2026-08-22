@@ -48,8 +48,18 @@ fi
 # creating the lock file inside an empty PGDATA would make docker-entrypoint
 # skip initdb (it checks `ls -A`), and that layout can't take an in-place
 # upgrade anyway (no sibling slot on the volume for the new data dir).
+#
+# The file was named .railway-major-upgrade.lock until the rename below:
+# a name that reads as an event marker, plus a ctime refreshed by whichever
+# boot first recreated it, kept being cited during data-loss forensics as
+# evidence that an automatic major upgrade had run — when every boot of
+# every volume creates it. The lock now lives at a neutral name and carries
+# a self-describing note; the legacy path is still locked (below) whenever
+# it exists, so mixed-build runtime/job pairings keep excluding each other,
+# but it is never created here again.
 # -----------------------------------------------------------------------------
-UPGRADE_LOCK_FILE="$EXPECTED_VOLUME_MOUNT_PATH/.railway-major-upgrade.lock"
+UPGRADE_LOCK_FILE="$EXPECTED_VOLUME_MOUNT_PATH/.railway-volume.lock"
+LEGACY_UPGRADE_LOCK_FILE="$EXPECTED_VOLUME_MOUNT_PATH/.railway-major-upgrade.lock"
 if command -v flock >/dev/null 2>&1 && [ -d "$EXPECTED_VOLUME_MOUNT_PATH" ] \
   && ! { [ "$PGDATA" = "$EXPECTED_VOLUME_MOUNT_PATH" ] && [ ! -f "$PGDATA/PG_VERSION" ]; }; then
   # The 2>/dev/null MUST be scoped by the brace group, never put on the exec
@@ -65,8 +75,36 @@ if command -v flock >/dev/null 2>&1 && [ -d "$EXPECTED_VOLUME_MOUNT_PATH" ] \
       echo "The database must not start until it finishes; retry the deploy once the upgrade completes."
       exit 1
     fi
+    # Self-describing, written once while the lock is held: bare lock files
+    # keep getting read as event markers during forensics on a dead volume.
+    [ -s "$UPGRADE_LOCK_FILE" ] || printf '%s\n' \
+      "Advisory flock rendezvous between the Postgres container and Railway maintenance jobs." \
+      "Created on every boot; its presence is not a record of any upgrade or other event." \
+      >>"$UPGRADE_LOCK_FILE" 2>/dev/null || true
   else
     echo "wrapper: could not open $UPGRADE_LOCK_FILE; continuing without the upgrade lock" >&2
+  fi
+  # Transition: builds from before the rename rendezvous on the legacy path,
+  # so contend there too whenever the file exists — an upgrade job from an
+  # earlier build must still refuse to run against this live database, and
+  # this boot must still refuse while such a job is mid-flight. if-exists
+  # only: old volumes already carry the file (every old boot created it);
+  # a volume that never booted an old build has no old-build peer to
+  # exclude, and never creating it here is the point of the rename.
+  if [ -f "$LEGACY_UPGRADE_LOCK_FILE" ]; then
+    if { exec 10>>"$LEGACY_UPGRADE_LOCK_FILE"; } 2>/dev/null; then
+      if ! flock -n -s 10; then
+        echo "A major version upgrade job is currently running against this volume."
+        echo "The database must not start until it finishes; retry the deploy once the upgrade completes."
+        exit 1
+      fi
+      [ -s "$LEGACY_UPGRADE_LOCK_FILE" ] || printf '%s\n' \
+        "Legacy name of .railway-volume.lock (see that file). Older image builds create this" \
+        "file on EVERY boot; its presence is not evidence that a major version upgrade ran." \
+        >>"$LEGACY_UPGRADE_LOCK_FILE" 2>/dev/null || true
+    else
+      echo "wrapper: could not open $LEGACY_UPGRADE_LOCK_FILE; continuing without the legacy upgrade lock" >&2
+    fi
   fi
 fi
 

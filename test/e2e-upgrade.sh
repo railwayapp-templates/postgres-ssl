@@ -508,13 +508,47 @@ t_refuses_concurrent_job() {
   # Hold the lock from a sleeper container, then try a real job.
   docker run -d --name lockholder --label postgres-upgrade-e2e=1 \
     -v "$vol:/var/lib/postgresql/data" --entrypoint /bin/sh "$JOB_IMAGE" \
-    -c "exec 9>/var/lib/postgresql/data/.railway-major-upgrade.lock; flock 9; sleep 60" >/dev/null
+    -c "exec 9>/var/lib/postgresql/data/.railway-volume.lock; flock 9; sleep 60" >/dev/null
   sleep 2
   run_job "$vol" upgrade
   local rc="$JOB_RC" out="$JOB_OUT"
   docker rm -f lockholder >/dev/null 2>&1
   assert_eq "$rc" 2 "second job refused" || { echo "$out" | tail -10; return 1; }
   assert_contains "$out" "holds the upgrade lock" "lock message" || return 1
+}
+
+# The rename's transition contract: builds from before it rendezvous on the
+# legacy .railway-major-upgrade.lock, and both directions must still exclude.
+# A pre-rename runtime (shared holder on the legacy path) refuses the job,
+# and a pre-rename job (exclusive holder on the legacy path) refuses a boot.
+t_legacy_lock_still_excludes() {
+  local vol="upg-e2e-legacylock"
+  seed_from_cluster "$vol" || return 1
+
+  # Direction 1: old runtime alive → new job refused. Old wrapper holds the
+  # legacy path SHARED for its container's lifetime; simulate exactly that.
+  docker run -d --name legacy-rt-holder --label postgres-upgrade-e2e=1 \
+    -v "$vol:/var/lib/postgresql/data" --entrypoint /bin/sh "$JOB_IMAGE" \
+    -c "exec 9>>/var/lib/postgresql/data/.railway-major-upgrade.lock; flock -s 9; sleep 60" >/dev/null
+  sleep 2
+  run_job "$vol" upgrade
+  local rc="$JOB_RC" out="$JOB_OUT"
+  docker rm -f legacy-rt-holder >/dev/null 2>&1
+  assert_eq "$rc" 2 "job refused while a pre-rename runtime holds the legacy lock" \
+    || { echo "$out" | tail -10; return 1; }
+  assert_contains "$out" "holds the upgrade lock" "legacy lock message" || return 1
+
+  # Direction 2: old job mid-flight → new runtime refuses to boot. Old jobs
+  # hold the legacy path EXCLUSIVELY; the wrapper contends on it whenever the
+  # file exists (it does here — direction 1 created it).
+  docker run -d --name legacy-job-holder --label postgres-upgrade-e2e=1 \
+    -v "$vol:/var/lib/postgresql/data" --entrypoint /bin/sh "$JOB_IMAGE" \
+    -c "exec 9>>/var/lib/postgresql/data/.railway-major-upgrade.lock; flock 9; sleep 60" >/dev/null
+  sleep 2
+  rc=0
+  expect_boot_refusal "$vol" "$FROM_IMAGE" "upgrade job is currently running" || rc=1
+  docker rm -f legacy-job-holder >/dev/null 2>&1
+  return "$rc"
 }
 
 # The whole point: upgrade succeeds, marker completes, the TO image boots,
@@ -1065,7 +1099,7 @@ t_runtime_refused_while_job_locked() {
   seed_from_cluster "$vol" || return 1
   docker run -d --name rt-lockholder --label postgres-upgrade-e2e=1 \
     -v "$vol:/var/lib/postgresql/data" --entrypoint /bin/sh "$JOB_IMAGE" \
-    -c "exec 9>/var/lib/postgresql/data/.railway-major-upgrade.lock; flock 9; sleep 60" >/dev/null
+    -c "exec 9>/var/lib/postgresql/data/.railway-volume.lock; flock 9; sleep 60" >/dev/null
   sleep 2
   local rc=0
   expect_boot_refusal "$vol" "$FROM_IMAGE" "upgrade job is currently running" || rc=1
@@ -1789,6 +1823,7 @@ ALL_TESTS=(
   t_foreign_pair_upgraded_marker_refused
   t_job_refused_while_runtime_live
   t_runtime_refused_while_job_locked
+  t_legacy_lock_still_excludes
   t_recovery_shapes_refused
   t_marker_lost_after_pg_upgrade_resumes
   t_crash_mid_link_rolls_back_and_reruns
