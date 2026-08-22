@@ -137,6 +137,26 @@ WAL_LAG_GAP_THRESHOLD_SEGMENTS="${WAL_LAG_GAP_THRESHOLD_SEGMENTS:-32}"
 FULL_INTERVAL_SECONDS="${WAL_BACKUP_FULL_INTERVAL_SECONDS:-$((FULL_INTERVAL_HOURS * 3600))}"
 DIFF_INTERVAL_SECONDS="${WAL_BACKUP_DIFF_INTERVAL_SECONDS:-$((DIFF_INTERVAL_HOURS * 3600))}"
 
+# A malformed numeric knob must never degrade silently: bash arithmetic
+# evaluates non-numeric strings to 0, and 0 here means "periodic fulls
+# disabled" — a typo like 168h would silently stop the weekly full and
+# erode PITR windows. Refuse to run with it; the supervisor restarts the
+# watcher and the log line is unmissable.
+require_uint() {
+  # $1 = env var name, $2 = resolved value
+  case "$2" in
+    ''|*[!0-9]*)
+      echo "pgbackrest-watcher: $1='$2' is not a non-negative integer; refusing to run (bash would evaluate it as 0)" >&2
+      exit 1
+      ;;
+  esac
+}
+require_uint WAL_BACKUP_FULL_INTERVAL_HOURS "$FULL_INTERVAL_HOURS"
+require_uint WAL_BACKUP_DIFF_INTERVAL_HOURS "$DIFF_INTERVAL_HOURS"
+require_uint WAL_BACKUP_FULL_INTERVAL_SECONDS "$FULL_INTERVAL_SECONDS"
+require_uint WAL_BACKUP_DIFF_INTERVAL_SECONDS "$DIFF_INTERVAL_SECONDS"
+require_uint WAL_BACKUP_CATALOG_VERIFY_INTERVAL_SECONDS "$CATALOG_VERIFY_INTERVAL_SECONDS"
+
 log() { echo "pgbackrest-watcher: $*"; }
 
 # State file is `key=value\n`-shaped: trivially read/written by bash without
