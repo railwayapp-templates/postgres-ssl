@@ -29,12 +29,18 @@ ARG PKG_REFRESH=none
 RUN echo "refresh key: ${PKG_REFRESH}" \
     && sed -ri "s/^(deb .*pgdg main).*$/\1 ${FROM_VERSION} ${TO_VERSION}/" /etc/apt/sources.list.d/pgdg.list \
     && apt-get update \
+    # Hold both majors' server/client packages across the OS upgrade, the
+    # same invariant the runtime images enforce (#118): the upgrade job's
+    # binaries must stay on the pinned minors it was built with, not float
+    # to whatever PGDG shipped since.
+    && apt-mark hold postgresql-${FROM_VERSION} postgresql-client-${FROM_VERSION} postgresql-${TO_VERSION} postgresql-client-${TO_VERSION} \
     && apt-get upgrade -y \
     && apt-get install -y --no-install-recommends \
       postgresql-${FROM_VERSION} \
       postgresql-${FROM_VERSION}-pgvector \
       postgresql-${TO_VERSION}-pgvector \
       jq \
+    && apt-mark unhold postgresql-${FROM_VERSION} postgresql-client-${FROM_VERSION} postgresql-${TO_VERSION} postgresql-client-${TO_VERSION} \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --chmod=755 upgrade-job.sh /usr/local/bin/upgrade-job.sh
