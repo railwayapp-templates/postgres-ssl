@@ -1369,9 +1369,14 @@ EOF
   # post-promote cleanup branch below.
 
   if [ -f "$PITR_STAGING_FILE" ] && [ ! -f "$PGDATA/recovery.signal" ]; then
+    # Done marker first: a SIGKILL between `rm` staging and `touch` done
+    # used to re-arm recovery.signal on a timeline that already promoted
+    # (see t_pitr_sentinel_blocks_retrigger). If we die after the touch,
+    # the next boot short-circuits on $PITR_DONE_MARKER and leftover
+    # staging is harmless.
+    touch "$PITR_DONE_MARKER"
     rm -f "$PITR_STAGING_FILE"
     rm -f "$PGBACKREST_RECOVERY_CONF"
-    touch "$PITR_DONE_MARKER"
     echo "pgbackrest: previous PITR replay completed; marker written"
     return 0
   fi
