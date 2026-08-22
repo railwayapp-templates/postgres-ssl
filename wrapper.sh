@@ -1800,15 +1800,26 @@ fork_post_upgrade_analyze() {
 # ship would pass here and then refuse every subsequent boot or connection,
 # which is the exact disaster class not carrying the file avoids. The image
 # also actively manages shared_preload_libraries itself (pg_stat_statements,
-# see ensure_pg_stat_statements above).
+# see add_pg_stat_statements above).
 # postgresql.conf itself is not re-applied: on this image it is initdb +
 # entrypoint output, not a user surface — its stash stays as reference.
 # One-shot across restarts via the marker's needsConfigReview flag.
-CONFIG_RESTORE_SKIP_GUCS="archive_mode archive_command archive_timeout restore_command recovery_target recovery_target_name recovery_target_time recovery_target_xid recovery_target_lsn recovery_target_inclusive recovery_target_timeline recovery_target_action primary_conninfo primary_slot_name listen_addresses port unix_socket_directories data_directory hba_file ident_file external_pid_file ssl ssl_cert_file ssl_key_file ssl_ca_file ssl_crl_file shared_preload_libraries session_preload_libraries local_preload_libraries dynamic_library_path"
+CONFIG_RESTORE_SKIP_GUCS="archive_mode archive_command archive_timeout archive_library archive_cleanup_command restore_command recovery_end_command recovery_target recovery_target_name recovery_target_time recovery_target_xid recovery_target_lsn recovery_target_inclusive recovery_target_timeline recovery_target_action primary_conninfo primary_slot_name listen_addresses port unix_socket_directories data_directory hba_file ident_file external_pid_file ssl ssl_cert_file ssl_key_file ssl_ca_file ssl_crl_file shared_preload_libraries session_preload_libraries local_preload_libraries dynamic_library_path"
 
 fork_post_upgrade_config_restore() {
   [ -f "$UPGRADE_MARKER_FILE" ] || return 0
   [ "$(jq -r '.needsConfigReview // false' "$UPGRADE_MARKER_FILE" 2>/dev/null)" = "true" ] || return 0
+  # Generation gate: only markers written by the new-generation upgrade job
+  # (the one that stashes auto.conf and records stashedAutoConf) hand their
+  # flags to this fork. A legacy marker's needsConfigReview predates the
+  # self-heal and belongs to the dashboard-driven flow — on such a volume
+  # the stash (when one exists at all) can be months old, and replaying it
+  # would overwrite every ALTER SYSTEM re-tune the user has done since.
+  # Skip AND keep the flag; never retroactively adopt another flow's state.
+  if [ "$(jq 'has("stashedAutoConf")' "$UPGRADE_MARKER_FILE" 2>/dev/null)" != "true" ]; then
+    echo "post-upgrade: legacy upgrade marker (no stashedAutoConf field) — config-restore self-heal skipped; needsConfigReview stays set for the dashboard-driven flow"
+    return 0
+  fi
   local from_major stash
   from_major="$(jq -r '.from // empty' "$UPGRADE_MARKER_FILE" 2>/dev/null)"
   stash="$EXPECTED_VOLUME_MOUNT_PATH/.pre-upgrade-${from_major}-postgresql.auto.conf"
@@ -1817,14 +1828,18 @@ fork_post_upgrade_config_restore() {
     # (stashedAutoConf). Missing-but-expected means the stash copy failed
     # at upgrade time — clearing the flag here would silently drop the
     # user's ALTER SYSTEM tuning; keep the flag and say so instead.
-    expect_stash="$(jq -r '.stashedAutoConf // "absent"' "$UPGRADE_MARKER_FILE" 2>/dev/null)"
+    # Plain `.stashedAutoConf` (never `// absent`): jq's `//` treats a
+    # literal false as absent, and the field is a real boolean on markers
+    # written since the --argjson fix while older volumes still carry the
+    # legacy string form — jq -r renders both as "true"/"false".
+    expect_stash="$(jq -r '.stashedAutoConf' "$UPGRADE_MARKER_FILE" 2>/dev/null)"
     if [ "$expect_stash" = "true" ]; then
       echo "post-upgrade: the upgrade marker expects a stashed postgresql.auto.conf, but $stash is missing; keeping needsConfigReview set — recover the stash (a copy survives in the kept old data dir) or clear the flag manually" >&2
       return 0
     fi
-    # No ALTER SYSTEM settings existed before the upgrade (or a
-    # pre-stashedAutoConf marker with the stash gone): the review is
-    # trivially complete.
+    # No ALTER SYSTEM settings existed before the upgrade (the generation
+    # gate above guarantees the marker carries stashedAutoConf, so a stash
+    # was never written): the review is trivially complete.
     update_upgrade_marker '.needsConfigReview = false' || true
     return 0
   fi
@@ -1842,6 +1857,14 @@ fork_post_upgrade_config_restore() {
           # ALTER SYSTEM verbatim.
           value="$(printf '%s' "$value" | sed 's/^[[:space:]]*//')"
           [ -n "$key" ] || continue
+          # wal_level is special-cased rather than skip-listed: on a
+          # non-archiving image restoring it is harmless, but with archiving
+          # enabled a stashed 'minimal' would refuse the next boot
+          # (archive_mode=on requires wal_level >= replica).
+          if [ "$key" = "wal_level" ] && [ -n "${WAL_ARCHIVE_BUCKET:-}" ]; then
+            echo "post-upgrade:   wal_level: not re-applied (archiving is enabled on this image; a stashed value below 'replica' would refuse the next boot)"
+            skipped=$((skipped + 1)); continue
+          fi
           case " $CONFIG_RESTORE_SKIP_GUCS " in
             *" $key "*)
               echo "post-upgrade:   $key: image-managed, not re-applied"
@@ -1913,6 +1936,27 @@ fork_post_upgrade_config_restore() {
 fork_post_upgrade_reindex() {
   [ -f "$UPGRADE_MARKER_FILE" ] || return 0
   [ "$(jq -r '.needsReindex // false' "$UPGRADE_MARKER_FILE" 2>/dev/null)" = "true" ] || return 0
+  # Generation gate, same as fork_post_upgrade_config_restore: a legacy
+  # marker (no stashedAutoConf field) predates this self-heal, and on those
+  # volumes the flag belongs to the dashboard-driven flow. Worse than mere
+  # ownership: for source >= 15 the old blind fork_collation_refresh already
+  # re-stamped the collation versions on the first post-upgrade boot, so the
+  # detector below would read "collation library unchanged" (false) and
+  # clear the flag with zero rebuilds — permanently masking real staleness.
+  # Skip AND keep the flag.
+  if [ "$(jq 'has("stashedAutoConf")' "$UPGRADE_MARKER_FILE" 2>/dev/null)" != "true" ]; then
+    echo "post-upgrade: legacy upgrade marker (no stashedAutoConf field) — reindex self-heal skipped; needsReindex stays set for the dashboard-driven flow"
+    return 0
+  fi
+  # Operator kill switch: skip every rebuild AND every stamp refresh, keep
+  # the flag (clearing it would declare the indexes healthy), and say so.
+  # Same truthy convention as WAL_HEARTBEAT_DISABLED. While the flag is up
+  # the boot-time blind collation refresh keeps standing down too, so the
+  # staleness evidence survives for whoever the operator hands it to.
+  if [ "${POST_UPGRADE_REINDEX_DISABLED:-0}" = "1" ]; then
+    echo "post-upgrade: reindex skipped by operator request (POST_UPGRADE_REINDEX_DISABLED=1); needsReindex stays set and no version stamps are refreshed"
+    return 0
+  fi
   local rx_from_major rx_baseline_unknown
   rx_from_major="$(jq -r '.from // empty' "$UPGRADE_MARKER_FILE" 2>/dev/null)"
   rx_baseline_unknown=0
@@ -1959,15 +2003,31 @@ fork_post_upgrade_reindex() {
           UNION SELECT c.oid FROM pg_collation c, dflt d
             WHERE c.collname = 'default'
               AND (d.stale OR ($rx_baseline_unknown = 1 AND d.versioned))
+        ), suspect_index_oids AS (
+          -- indcollation covers key columns only; a pg_depend edge is the
+          -- sole record of some collation dependencies (a partial-index
+          -- predicate's COLLATE, an index expression's). Without the union,
+          -- those indexes would be skipped here and the REFRESH VERSION
+          -- step would then stamp their collations current — permanently
+          -- masking the staleness.
+          SELECT i.indexrelid AS oid
+          FROM pg_index i,
+               unnest(string_to_array(i.indcollation::text, ' ')::oid[]) u(collid)
+          WHERE u.collid IN (SELECT oid FROM suspect)
+          UNION
+          SELECT d.objid
+          FROM pg_depend d
+          WHERE d.classid = 'pg_class'::regclass
+            AND d.refclassid = 'pg_collation'::regclass
+            AND d.refobjid IN (SELECT oid FROM suspect)
         )
         SELECT DISTINCT (EXISTS (SELECT 1 FROM pg_constraint x WHERE x.conindid = i.indexrelid AND x.contype = 'x'))::int
                || ' ' || format('%I.%I', n.nspname, c.relname)
-        FROM pg_index i
+        FROM suspect_index_oids s
+        JOIN pg_index i ON i.indexrelid = s.oid
         JOIN pg_class c ON c.oid = i.indexrelid
-        JOIN pg_namespace n ON n.oid = c.relnamespace,
-             unnest(string_to_array(i.indcollation::text, ' ')::oid[]) u(collid)
-        WHERE u.collid IN (SELECT oid FROM suspect)
-          AND c.relkind = 'i'
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE c.relkind = 'i'
           AND n.nspname NOT IN ('pg_catalog', 'pg_toast', 'information_schema')
           AND n.nspname NOT LIKE 'pg_temp%'
           AND n.nspname NOT LIKE 'pg_toast_temp%'"
