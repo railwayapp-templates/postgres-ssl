@@ -94,12 +94,28 @@ PGWAL_THRESHOLD_MB="${WAL_DROP_THRESHOLD_MB:-5120}"
 # A malformed numeric knob must never degrade silently: bash arithmetic
 # evaluates non-numeric strings to 0, and a 0 threshold here means "drop
 # WAL on ANY archive failure" — a typo like 5gb would silently truncate
-# PITR. Refuse to run with it instead; Postgres retries archive_command
-# and the log line is unmissable.
+# PITR. But refusing to run is worse: this script IS archive_command, so an
+# exit here fails every invocation forever, Postgres retains WAL, and the
+# disk fills with the anti-disk-fill escape hatch disabled. Log loudly and
+# fall back to the same volume-proportional threshold wrapper.sh's
+# compute_volume_thresholds would have exported absent the override —
+# min(5 GiB, ~50% of volume), floor 128 MiB; 5 GiB when the volume size is
+# unreadable. Archiving keeps working; only the destructive drop stays
+# gated, on a sane threshold.
 case "$PGWAL_THRESHOLD_MB" in
   ''|*[!0-9]*)
-    echo "pgbackrest-wrapper: WAL_DROP_THRESHOLD_MB='${WAL_DROP_THRESHOLD_MB}' is not a non-negative integer; refusing to run (bash arithmetic would evaluate it as 0 and drop WAL on any failure)" >&2
-    exit 1
+    FALLBACK_THRESHOLD_MB=5120
+    VOLUME_TOTAL_KIB=$(df -Pk "${RAILWAY_VOLUME_MOUNT_PATH:-/var/lib/postgresql/data}" 2>/dev/null | awk 'NR==2 { print $2 }')
+    case "$VOLUME_TOTAL_KIB" in
+      ''|*[!0-9]*) : ;;
+      *)
+        FALLBACK_THRESHOLD_MB=$(( VOLUME_TOTAL_KIB / 1024 / 2 ))
+        [ "$FALLBACK_THRESHOLD_MB" -gt 5120 ] && FALLBACK_THRESHOLD_MB=5120
+        [ "$FALLBACK_THRESHOLD_MB" -lt 128 ] && FALLBACK_THRESHOLD_MB=128
+        ;;
+    esac
+    echo "pgbackrest-wrapper: WAL_DROP_THRESHOLD_MB='${WAL_DROP_THRESHOLD_MB}' is not a non-negative integer; using the computed default ${FALLBACK_THRESHOLD_MB} MiB instead (bash arithmetic would evaluate it as 0 and drop WAL on any failure; refusing to run would fail every archive_command and fill the disk)" >&2
+    PGWAL_THRESHOLD_MB="$FALLBACK_THRESHOLD_MB"
     ;;
 esac
 PGWAL_THRESHOLD_BYTES=$(( PGWAL_THRESHOLD_MB * 1024 * 1024 ))

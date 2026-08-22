@@ -888,8 +888,12 @@ finish_swap() {
   # stash_old_config) — the runtime wrapper re-applies the stashed auto.conf
   # itself, one GUC at a time; the stashed reference copies stay at the
   # volume root.
+  # --argjson (not --arg) so stashedAutoConf lands as a real JSON boolean;
+  # STASHED_AUTOCONF only ever holds the literal "true"/"false". Markers
+  # already written with the legacy string form exist on volumes, so every
+  # reader (wrapper.sh) accepts both shapes.
   write_marker "$(jq -nc \
-    --arg from "$FROM_MAJOR" --arg to "$TO_MAJOR" --arg old "$(basename "$OLD_KEEP_DIR")" --arg stashed "$STASHED_AUTOCONF" \
+    --arg from "$FROM_MAJOR" --arg to "$TO_MAJOR" --arg old "$(basename "$OLD_KEEP_DIR")" --argjson stashed "$STASHED_AUTOCONF" \
     '{phase: "completed", from: $from, to: $to, oldDataDir: $old, stashedAutoConf: $stashed, needsAnalyze: true, needsReindex: true, needsConfigReview: true, completedAt: (now | todate)}')"
   log "upgrade $FROM_MAJOR -> $TO_MAJOR complete"
   result "$(jq -nc --arg from "$FROM_MAJOR" --arg to "$TO_MAJOR" \

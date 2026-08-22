@@ -53,15 +53,17 @@ mkdir -p "$PGDATA/conf.d"
 chmod 0750 "$PGDATA/conf.d"
 
 archive_timeout="${POSTGRES_ARCHIVE_TIMEOUT:-60}"
-# archive_timeout=0 turns the WAL hand-off off entirely — the RPO bound
-# this knob exists to set. A malformed value must fail the init loudly
-# instead of degrading to whatever bash makes of it.
-case "$archive_timeout" in
-  ''|0|*[!0-9]*)
-    echo "pgbackrest: POSTGRES_ARCHIVE_TIMEOUT='${POSTGRES_ARCHIVE_TIMEOUT}' is not a positive integer; refusing to write an archive config with it" >&2
-    exit 1
-    ;;
-esac
+# Accept everything Postgres itself accepts for this GUC: a bare integer or
+# an integer with a time unit ('5min', '1h', …), including 0 — a legitimate
+# value that turns the forced segment switch off. On anything else WARN and
+# default to 60: exiting here fails the whole initdb under set -e, killing a
+# fresh service over a knob typo — and only on the fresh-init path, since
+# wrapper.sh's existing-DB reapply has no such gate (refused once, accepted
+# on restart is the wrong shape for a validation to have).
+if ! printf '%s' "$archive_timeout" | grep -qE '^[0-9]+(ms|s|min|h|d)?$'; then
+  echo "pgbackrest: POSTGRES_ARCHIVE_TIMEOUT='${POSTGRES_ARCHIVE_TIMEOUT}' is not a valid archive_timeout (integer with optional ms/s/min/h/d unit); using 60" >&2
+  archive_timeout=60
+fi
 # track_commit_timestamp lets pg_last_committed_xact() return the wall-clock
 # time of the last commit. The PITR picker uses that as its upper bound:
 # `recovery_target_time` only matches commit record timestamps, so on an idle
