@@ -91,6 +91,17 @@ if [ -z "${WAL_ARCHIVE_BUCKET:-}" ]; then
 fi
 
 PGWAL_THRESHOLD_MB="${WAL_DROP_THRESHOLD_MB:-5120}"
+# A malformed numeric knob must never degrade silently: bash arithmetic
+# evaluates non-numeric strings to 0, and a 0 threshold here means "drop
+# WAL on ANY archive failure" — a typo like 5gb would silently truncate
+# PITR. Refuse to run with it instead; Postgres retries archive_command
+# and the log line is unmissable.
+case "$PGWAL_THRESHOLD_MB" in
+  ''|*[!0-9]*)
+    echo "pgbackrest-wrapper: WAL_DROP_THRESHOLD_MB='${WAL_DROP_THRESHOLD_MB}' is not a non-negative integer; refusing to run (bash arithmetic would evaluate it as 0 and drop WAL on any failure)" >&2
+    exit 1
+    ;;
+esac
 PGWAL_THRESHOLD_BYTES=$(( PGWAL_THRESHOLD_MB * 1024 * 1024 ))
 
 # Per-cluster repo-path: read the marker written by pgbackrest-init.sh /
@@ -131,8 +142,11 @@ fi
 # write paths (archive-push is a PUT). Railway revokes the bucket credentials
 # when the bucket is deleted, so in practice pgBackRest sees InvalidAccessKeyId
 # on the PUT. Both errors mean no recovery without operator action — drop
-# immediately rather than accumulating WAL up to the threshold.
-if printf '%s\n' "$pgb_out" | grep -qE 'NoSuchBucket|InvalidAccessKeyId'; then
+# immediately rather than accumulating WAL up to the threshold. The async
+# spool's .error file carries the same verdicts in async mode, where the
+# foreground output does not — grep both.
+if { printf '%s\n' "$pgb_out"; [ -f "$SPOOL_ERR" ] && cat "$SPOOL_ERR"; } \
+  | grep -qE 'NoSuchBucket|InvalidAccessKeyId'; then
   echo "pgbackrest-wrapper: bucket gone or credentials revoked; dropping ${WAL_FILE} immediately" >&2
   touch "$PGDATA/.pgbackrest_gap_pending" 2>/dev/null || true
   exit 0
