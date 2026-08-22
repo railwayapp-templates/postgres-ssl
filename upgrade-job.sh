@@ -256,6 +256,15 @@ refuse_unreadable_marker() {
 # leaves the new directory entry volatile on ext4/xfs.
 write_marker() {
   local json="$1"
+  # A jq failure upstream (OOM, missing binary) substitutes an empty string
+  # for the JSON — writing that as "the commit point" leaves the volume in
+  # a state the runtime wrapper refuses to boot and roll-forward-only
+  # recovery refuses to fix, while the workflow saw exit 0. Every marker
+  # this job writes carries a phase; one without it is not a marker.
+  case "$json" in
+    *phase*) : ;;
+    *) die 3 "refusing to write an upgrade marker without a phase (got: '${json:-<empty>}' — did jq fail?)" ;;
+  esac
   local tmp="${MARKER_FILE}.tmp"
   echo "$json" > "$tmp" || die 3 "failed to write the upgrade marker temp file"
   sync "$tmp" || die 3 "failed to fsync the upgrade marker temp file"
@@ -763,12 +772,21 @@ carry_cluster_config() {
 # then re-applies the stashed auto.conf itself on first boot, one GUC at a
 # time (a GUC the new major removed fails only its own statement, logged),
 # so the user's tuning comes back without anyone in the loop.
+# Records whether a postgresql.auto.conf stash is expected at the volume
+# root, so the runtime wrapper can tell "nothing to restore" apart from
+# "the stash was expected but is missing" (a cp failure here) — the second
+# must keep the needsConfigReview flag, not clear it.
+STASHED_AUTOCONF="false"
+
 stash_old_config() {
   local src="$1" f
   for f in postgresql.conf postgresql.auto.conf; do
     [ -f "$src/$f" ] || continue
-    cp -p "$src/$f" "$VOLUME_ROOT/.pre-upgrade-${FROM_MAJOR}-${f}" 2>/dev/null \
-      || log "could not stash $f at the volume root (non-fatal; the copy in $(basename "$OLD_KEEP_DIR") remains until reclaim)"
+    if cp -p "$src/$f" "$VOLUME_ROOT/.pre-upgrade-${FROM_MAJOR}-${f}" 2>/dev/null; then
+      [ "$f" = "postgresql.auto.conf" ] && STASHED_AUTOCONF="true"
+    else
+      log "could not stash $f at the volume root (non-fatal; the copy in $(basename "$OLD_KEEP_DIR") remains until reclaim)"
+    fi
   done
 }
 
@@ -843,8 +861,8 @@ finish_swap() {
   # itself, one GUC at a time; the stashed reference copies stay at the
   # volume root.
   write_marker "$(jq -nc \
-    --arg from "$FROM_MAJOR" --arg to "$TO_MAJOR" --arg old "$(basename "$OLD_KEEP_DIR")" \
-    '{phase: "completed", from: $from, to: $to, oldDataDir: $old, needsAnalyze: true, needsReindex: true, needsConfigReview: true, completedAt: (now | todate)}')"
+    --arg from "$FROM_MAJOR" --arg to "$TO_MAJOR" --arg old "$(basename "$OLD_KEEP_DIR")" --arg stashed "$STASHED_AUTOCONF" \
+    '{phase: "completed", from: $from, to: $to, oldDataDir: $old, stashedAutoConf: $stashed, needsAnalyze: true, needsReindex: true, needsConfigReview: true, completedAt: (now | todate)}')"
   log "upgrade $FROM_MAJOR -> $TO_MAJOR complete"
   result "$(jq -nc --arg from "$FROM_MAJOR" --arg to "$TO_MAJOR" \
     '{ok: true, mode: "upgrade", phase: "completed", from: $from, to: $to}')"

@@ -1813,8 +1813,18 @@ fork_post_upgrade_config_restore() {
   from_major="$(jq -r '.from // empty' "$UPGRADE_MARKER_FILE" 2>/dev/null)"
   stash="$EXPECTED_VOLUME_MOUNT_PATH/.pre-upgrade-${from_major}-postgresql.auto.conf"
   if [ -z "$from_major" ] || [ ! -f "$stash" ]; then
-    # No ALTER SYSTEM settings existed before the upgrade (or the stash is
-    # gone): the review is trivially complete.
+    # The upgrade marker records whether an auto.conf stash was expected
+    # (stashedAutoConf). Missing-but-expected means the stash copy failed
+    # at upgrade time — clearing the flag here would silently drop the
+    # user's ALTER SYSTEM tuning; keep the flag and say so instead.
+    expect_stash="$(jq -r '.stashedAutoConf // "absent"' "$UPGRADE_MARKER_FILE" 2>/dev/null)"
+    if [ "$expect_stash" = "true" ]; then
+      echo "post-upgrade: the upgrade marker expects a stashed postgresql.auto.conf, but $stash is missing; keeping needsConfigReview set — recover the stash (a copy survives in the kept old data dir) or clear the flag manually" >&2
+      return 0
+    fi
+    # No ALTER SYSTEM settings existed before the upgrade (or a
+    # pre-stashedAutoConf marker with the stash gone): the review is
+    # trivially complete.
     update_upgrade_marker '.needsConfigReview = false' || true
     return 0
   fi
