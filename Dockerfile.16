@@ -33,4 +33,4 @@ COPY --chmod=755 pgbackrest-backup-watcher.sh /usr/local/bin/pgbackrest-backup-w
 COPY --chmod=755 wrapper.sh /usr/local/bin/wrapper.sh
 
 ENTRYPOINT ["wrapper.sh"]
-CMD ["postgres", "--port=5432"]
+CMD ["postgres", "-p", "5432", "-c", "listen_addresses=*"]

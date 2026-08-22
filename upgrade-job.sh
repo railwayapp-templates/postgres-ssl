@@ -265,6 +265,15 @@ refuse_unreadable_marker() {
 # leaves the new directory entry volatile on ext4/xfs.
 write_marker() {
   local json="$1"
+  # A jq failure upstream (OOM, missing binary) substitutes an empty string
+  # for the JSON — writing that as "the commit point" leaves the volume in
+  # a state the runtime wrapper refuses to boot and roll-forward-only
+  # recovery refuses to fix, while the workflow saw exit 0. Every marker
+  # this job writes carries a phase; one without it is not a marker.
+  case "$json" in
+    *phase*) : ;;
+    *) die 3 "refusing to write an upgrade marker without a phase (got: '${json:-<empty>}' — did jq fail?)" ;;
+  esac
   local tmp="${MARKER_FILE}.tmp"
   echo "$json" > "$tmp" || die 3 "failed to write the upgrade marker temp file"
   sync "$tmp" || die 3 "failed to fsync the upgrade marker temp file"
@@ -787,15 +796,25 @@ carry_cluster_config() {
 # 16, …), and an unrecognized parameter in those files refuses the whole
 # boot. The user's tuning must not silently evaporate either, so keep
 # reference copies at the volume root — they outlive the old dir's reclaim —
-# and the completed marker records needsConfigReview so the dashboard can
-# surface "re-apply your ALTER SYSTEM settings" instead of the user
-# discovering it via a post-upgrade max_connections regression.
+# and the completed marker records needsConfigReview; the runtime wrapper
+# then re-applies the stashed auto.conf itself on first boot, one GUC at a
+# time (a GUC the new major removed fails only its own statement, logged),
+# so the user's tuning comes back without anyone in the loop.
+# Records whether a postgresql.auto.conf stash is expected at the volume
+# root, so the runtime wrapper can tell "nothing to restore" apart from
+# "the stash was expected but is missing" (a cp failure here) — the second
+# must keep the needsConfigReview flag, not clear it.
+STASHED_AUTOCONF="false"
+
 stash_old_config() {
   local src="$1" f
   for f in postgresql.conf postgresql.auto.conf; do
     [ -f "$src/$f" ] || continue
-    cp -p "$src/$f" "$VOLUME_ROOT/.pre-upgrade-${FROM_MAJOR}-${f}" 2>/dev/null \
-      || log "could not stash $f at the volume root (non-fatal; the copy in $(basename "$OLD_KEEP_DIR") remains until reclaim)"
+    if cp -p "$src/$f" "$VOLUME_ROOT/.pre-upgrade-${FROM_MAJOR}-${f}" 2>/dev/null; then
+      [ "$f" = "postgresql.auto.conf" ] && STASHED_AUTOCONF="true"
+    else
+      log "could not stash $f at the volume root (non-fatal; the copy in $(basename "$OLD_KEEP_DIR") remains until reclaim)"
+    fi
   done
 }
 
@@ -855,15 +874,23 @@ finish_swap() {
   # collatable columns (text/varchar btree) is only valid for the glibc that
   # built it — and the source cluster may have run on an older base image.
   # We can't read the OLD runtime image's glibc from here, so record the flag
-  # unconditionally and let the operator/dashboard drive the REINDEX; an
-  # automatic REINDEX of an arbitrarily large database inside the upgrade
-  # window is the wrong default (documented follow-up in the README).
+  # unconditionally; the runtime wrapper self-heals it on first boot — it
+  # detects staleness per COLLATION (no supported PostgreSQL tracks it per
+  # index: PG13 added pg_depend.refobjversion, PG14 reverted it), maps
+  # suspect collations to their dependent indexes, and reindexes exactly
+  # that set, CONCURRENTLY, in the background: zero work when the library
+  # didn't change, no operator in the loop when it did. Pre-15 sources have
+  # no recorded baseline to compare (datcollversion is PG15+, and pg_upgrade
+  # re-stamps initdb-created collations), so the wrapper treats every
+  # collation-dependent index as suspect there instead of declaring them
+  # current.
   # needsConfigReview: postgresql{,.auto}.conf were not carried (see
-  # stash_old_config) — the dashboard surfaces "re-apply your ALTER SYSTEM
-  # settings" off this flag, pointing at the stashed reference copies.
+  # stash_old_config) — the runtime wrapper re-applies the stashed auto.conf
+  # itself, one GUC at a time; the stashed reference copies stay at the
+  # volume root.
   write_marker "$(jq -nc \
-    --arg from "$FROM_MAJOR" --arg to "$TO_MAJOR" --arg old "$(basename "$OLD_KEEP_DIR")" \
-    '{phase: "completed", from: $from, to: $to, oldDataDir: $old, needsAnalyze: true, needsReindex: true, needsConfigReview: true, completedAt: (now | todate)}')"
+    --arg from "$FROM_MAJOR" --arg to "$TO_MAJOR" --arg old "$(basename "$OLD_KEEP_DIR")" --arg stashed "$STASHED_AUTOCONF" \
+    '{phase: "completed", from: $from, to: $to, oldDataDir: $old, stashedAutoConf: $stashed, needsAnalyze: true, needsReindex: true, needsConfigReview: true, completedAt: (now | todate)}')"
   log "upgrade $FROM_MAJOR -> $TO_MAJOR complete"
   result "$(jq -nc --arg from "$FROM_MAJOR" --arg to "$TO_MAJOR" \
     '{ok: true, mode: "upgrade", phase: "completed", from: $from, to: $to}')"

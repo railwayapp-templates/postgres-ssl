@@ -1286,6 +1286,171 @@ t_recover_refuses_past_commit_point() {
     || { echo "  refusal mutated the volume"; return 1; }
 }
 
+# The wrapper self-heals BOTH post-upgrade config concerns without an
+# operator: ALTER SYSTEM settings come back one GUC at a time (a GUC the new
+# major removed fails only its own statement; image-managed GUCs are never
+# re-applied), and the database restarts clean afterwards.
+t_config_restore_self_heals() {
+  local vol="upg-e2e-confheal"
+  fresh_volume "$vol" || return 1
+  run_pg confheal-pg "$vol" "$FROM_IMAGE" || return 1
+  wait_for_pg confheal-pg || { fail_dump confheal confheal-pg; return 1; }
+  psql_must confheal-pg "ALTER SYSTEM SET work_mem = '7654kB'" || return 1
+  psql_must confheal-pg "ALTER SYSTEM SET archive_command = 'should-never-carry'" || return 1
+  # Boot-validated, statement-tolerant: ALTER SYSTEM accepts this even when
+  # the target image doesn't ship a named library — the refusal only comes
+  # at the NEXT postmaster start. The restore must never re-apply it.
+  psql_must confheal-pg "ALTER SYSTEM SET shared_preload_libraries = 'pg_stat_statements'" || return 1
+  if [ "$FROM_VERSION" -le 16 ] && [ "$TO_VERSION" -ge 17 ]; then
+    # Removed in 17 — exercises the per-GUC rejection path.
+    psql_must confheal-pg "ALTER SYSTEM SET old_snapshot_threshold = '10min'" || return 1
+  fi
+  stop_pg confheal-pg
+
+  run_job "$vol" upgrade
+  assert_eq "$JOB_RC" 0 "upgrade" || { echo "$JOB_OUT" | tail -20; return 1; }
+
+  run_pg confheal2-pg "$vol" "$TO_IMAGE" || return 1
+  wait_for_pg confheal2-pg || { fail_dump confheal2 confheal2-pg; return 1; }
+  local deadline=$(($(date +%s) + 120))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    [ "$(marker_field "$vol" needsConfigReview)" = "false" ] && break
+    sleep 5
+  done
+  assert_eq "$(marker_field "$vol" needsConfigReview)" "false" "config review self-healed" || { fail_dump confheal2 confheal2-pg; return 1; }
+  assert_eq "$(psql_in confheal2-pg 'SHOW work_mem')" "7654kB" "user tuning re-applied" || return 1
+  local logs
+  logs=$(docker logs confheal2-pg 2>&1)
+  assert_contains "$logs" "archive_command: image-managed" "image-managed GUC never re-applied" || return 1
+  assert_contains "$logs" "shared_preload_libraries: image-managed" "boot-validated preload GUC never re-applied" || return 1
+  if [ "$FROM_VERSION" -le 16 ] && [ "$TO_VERSION" -ge 17 ]; then
+    assert_contains "$logs" "old_snapshot_threshold: not re-applied" "removed GUC rejected per-statement, boot unharmed" || return 1
+  fi
+  # The restored auto.conf must not refuse the NEXT boot either.
+  docker restart confheal2-pg >/dev/null
+  wait_for_pg confheal2-pg || { fail_dump confheal2-restart confheal2-pg; return 1; }
+  assert_eq "$(psql_in confheal2-pg 'SHOW work_mem')" "7654kB" "tuning survives restart" || return 1
+  stop_pg confheal2-pg
+}
+
+# A stash whose EVERY line is a GUC the new major removed is a full set of
+# server verdicts, not a connectivity failure — the flag must clear instead
+# of retrying forever. (A real boot always writes max_connections into
+# auto.conf, so this shape has to be constructed by rewriting the stash
+# after the upgrade — it models a volume whose stash predates the wrapper's
+# auto.conf writes, or a hand-pruned stash.)
+t_config_restore_all_rejected() {
+  if [ "$FROM_VERSION" -gt 16 ] || [ "$TO_VERSION" -lt 17 ]; then
+    echo "  (skipped: needs a GUC removed between $FROM_VERSION and $TO_VERSION; old_snapshot_threshold covers <=16 -> >=17)"
+    return 0
+  fi
+  local vol="upg-e2e-confrej"
+  fresh_volume "$vol" || return 1
+  run_pg confrej-pg "$vol" "$FROM_IMAGE" || return 1
+  wait_for_pg confrej-pg || { fail_dump confrej confrej-pg; return 1; }
+  stop_pg confrej-pg
+
+  run_job "$vol" upgrade
+  assert_eq "$JOB_RC" 0 "upgrade" || { echo "$JOB_OUT" | tail -20; return 1; }
+  in_volume "$vol" "printf \"old_snapshot_threshold = '10min'\\n\" > /var/lib/postgresql/data/.pre-upgrade-${FROM_VERSION}-postgresql.auto.conf" || return 1
+
+  run_pg confrej2-pg "$vol" "$TO_IMAGE" || return 1
+  wait_for_pg confrej2-pg || { fail_dump confrej2 confrej2-pg; return 1; }
+  local deadline=$(($(date +%s) + 120))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    [ "$(marker_field "$vol" needsConfigReview)" = "false" ] && break
+    sleep 5
+  done
+  assert_eq "$(marker_field "$vol" needsConfigReview)" "false" "all-rejected stash still completes the review" || { fail_dump confrej2 confrej2-pg; return 1; }
+  local logs
+  logs=$(docker logs confrej2-pg 2>&1)
+  assert_contains "$logs" "old_snapshot_threshold: not re-applied" "removed GUC rejected per-statement" || return 1
+  assert_contains "$logs" "0 applied, 0 image-managed, 1 rejected" "rejected-only tally, no bogus connectivity retry" || return 1
+  stop_pg confrej2-pg
+}
+
+# The wrapper self-heals collation drift: per-collation staleness detection
+# (datcollversion / collversion), REINDEX CONCURRENTLY of exactly the
+# dependent indexes, and only then the version-stamp refresh. Same library
+# across the test images = the zero-work path (pre-15 sources have no
+# baseline and rebuild everything instead); a faked datcollversion plus a
+# faked named-collation version forces the rebuild path deterministically,
+# across the awkward shapes: an exclusion-constraint index (no CONCURRENTLY
+# support), quote-needing schema/index/collation names, and a partitioned
+# index (leaves rebuilt, parent skipped).
+t_reindex_self_heals() {
+  local vol="upg-e2e-reindexheal"
+  fresh_volume "$vol" || return 1
+  run_pg rxheal-pg "$vol" "$FROM_IMAGE" || return 1
+  wait_for_pg rxheal-pg || { fail_dump rxheal rxheal-pg; return 1; }
+  psql_must rxheal-pg "CREATE TABLE ct(a text); INSERT INTO ct SELECT g::text FROM generate_series(1,500) g; CREATE INDEX ct_a_idx ON ct(a)" || return 1
+  # Exclusion-constraint index on a collatable column: REINDEX CONCURRENTLY
+  # refuses these outright, so the fork must fall back to the short
+  # non-concurrent rebuild instead of failing the database forever.
+  psql_must rxheal-pg "CREATE EXTENSION btree_gist; CREATE TABLE ex(r text, EXCLUDE USING gist (r WITH =)); INSERT INTO ex VALUES ('ea'), ('eb')" || return 1
+  # Quote-needing names end-to-end (schema, index, named collation): these
+  # break on any shell word-splitting or double-quoting of identifiers.
+  psql_must rxheal-pg "CREATE SCHEMA \"Weird Schema\"; CREATE COLLATION \"Weird Schema\".\"my coll\" (provider = icu, locale = 'en-US'); CREATE TABLE \"Weird Schema\".\"w t\"(a text COLLATE \"Weird Schema\".\"my coll\"); INSERT INTO \"Weird Schema\".\"w t\" VALUES ('x1'), ('x2'); CREATE INDEX \"w idx\" ON \"Weird Schema\".\"w t\"(a)" || return 1
+  # Partitioned index: only the leaves have storage; naming the parent would
+  # rebuild every leaf a second time.
+  psql_must rxheal-pg "CREATE TABLE pt(a text) PARTITION BY LIST (a); CREATE TABLE pt1 PARTITION OF pt FOR VALUES IN ('x','y'); INSERT INTO pt VALUES ('x'),('y'); CREATE INDEX pt_a_idx ON pt(a)" || return 1
+  stop_pg rxheal-pg
+  run_job "$vol" upgrade
+  assert_eq "$JOB_RC" 0 "upgrade" || { echo "$JOB_OUT" | tail -20; return 1; }
+
+  run_pg rxheal2-pg "$vol" "$TO_IMAGE" || return 1
+  wait_for_pg rxheal2-pg || { fail_dump rxheal2 rxheal2-pg; return 1; }
+  local deadline=$(($(date +%s) + 120))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    [ "$(marker_field "$vol" needsReindex)" = "false" ] && break
+    sleep 5
+  done
+  assert_eq "$(marker_field "$vol" needsReindex)" "false" "reindex flag self-cleared" || { fail_dump rxheal2 rxheal2-pg; return 1; }
+  local logs
+  logs=$(docker logs rxheal2-pg 2>&1)
+  if [ "$FROM_VERSION" -lt 15 ]; then
+    # Pre-15 sources carry no datcollversion baseline: pg_upgrade stamps the
+    # new database current, so "not stale" proves nothing — the fork must
+    # say so and rebuild everything rather than declare a zero-work heal.
+    assert_contains "$logs" "treated as suspect" "pre-15 source: baseline-unknown path taken" || return 1
+    assert_contains "$logs" "reindexing" "pre-15 source: indexes actually rebuilt" || return 1
+  elif ! echo "$logs" | grep -Eq "no reindex needed|reindexed [0-9]+ collation-dependent"; then
+    # Same base distro on both images means zero work; a genuinely different
+    # glibc/ICU between them makes a real rebuild the correct outcome too.
+    echo "  expected the zero-work or completed-rebuild log after first boot"
+    echo "  actual (tail): $(echo "$logs" | tail -5)"
+    return 1
+  fi
+
+  # Force the stale shape: fake the recorded default-collation version AND
+  # the named collation's version, re-arm the flag, restart — the fork must
+  # rebuild the dependent indexes (concurrently, non-concurrently for the
+  # exclusion index, leaves-only for the partitioned one) and only then
+  # refresh the stamps back to current.
+  psql_must rxheal2-pg "SET allow_system_table_mods = on; UPDATE pg_database SET datcollversion = '0.fake' WHERE datname = current_database()" || return 1
+  psql_must rxheal2-pg "SET allow_system_table_mods = on; UPDATE pg_collation SET collversion = '0.fake' WHERE collname = 'my coll'" || return 1
+  in_volume "$vol" "jq '.needsReindex = true' $MARKER_PATH > /tmp/m && cat /tmp/m > $MARKER_PATH" || return 1
+  docker restart rxheal2-pg >/dev/null
+  wait_for_pg rxheal2-pg || { fail_dump rxheal2-restart rxheal2-pg; return 1; }
+  deadline=$(($(date +%s) + 180))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    [ "$(marker_field "$vol" needsReindex)" = "false" ] && break
+    sleep 5
+  done
+  assert_eq "$(marker_field "$vol" needsReindex)" "false" "forced reindex completed" || { fail_dump rxheal2b rxheal2-pg; return 1; }
+  logs=$(docker logs rxheal2-pg 2>&1)
+  assert_contains "$logs" "reindexing" "stale-dependent index actually rebuilt" || return 1
+  assert_contains "$logs" "non-concurrently (exclusion constraint" "exclusion index took the non-concurrent path" || return 1
+  assert_contains "$logs" '"Weird Schema"."w idx"' "quote-needing index survived identifier plumbing" || return 1
+  assert_contains "$logs" "pt1_a_idx" "partition leaf index rebuilt" || return 1
+  assert_not_contains "$logs" "public.pt_a_idx " "partitioned parent skipped (leaves carry the storage)" || return 1
+  assert_eq "$(psql_in rxheal2-pg 'SELECT (datcollversion IS NOT DISTINCT FROM pg_database_collation_actual_version(oid))::int FROM pg_database WHERE datname = current_database()')" "1" "default version stamp refreshed only after the rebuild" || return 1
+  assert_eq "$(psql_in rxheal2-pg "SELECT (collversion IS NOT DISTINCT FROM pg_collation_actual_version(oid))::int FROM pg_collation WHERE collname = 'my coll'")" "1" "named collation stamp refreshed (quoted schema + name)" || return 1
+  assert_eq "$(psql_in rxheal2-pg "SELECT count(*) FROM ct WHERE a = '250'")" "1" "index answers queries" || return 1
+  assert_eq "$(psql_in rxheal2-pg "SELECT count(*) FROM \"Weird Schema\".\"w t\" WHERE a = 'x1'")" "1" "quoted-collation index answers queries" || return 1
+  stop_pg rxheal2-pg
+}
+
 # pgdata.old-<from> is the rollback body and pins every pre-upgrade inode
 # (--link hardlinks); it must survive normal boots and be reclaimed in the
 # background once the upgraded database has been up past the grace period,
@@ -1775,6 +1940,9 @@ ALL_TESTS=(
   t_manifest_mode
   t_ssl_survives_upgrade
   t_analyze_staged
+  t_config_restore_self_heals
+  t_config_restore_all_rejected
+  t_reindex_self_heals
   t_old_image_on_upgraded_data
   t_mismatch_boot_failstop
   t_boot_refused_mid_upgrade

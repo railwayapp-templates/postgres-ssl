@@ -29,12 +29,19 @@ ARG PKG_REFRESH=none
 RUN echo "refresh key: ${PKG_REFRESH}" \
     && sed -ri "s/^(deb .*pgdg main).*$/\1 ${FROM_VERSION} ${TO_VERSION}/" /etc/apt/sources.list.d/pgdg.list \
     && apt-get update \
+    # Hold the BASE image's installed PG packages (the target major) across
+    # the OS upgrade, the same invariant the runtime images enforce (#118).
+    # The source major is NOT installed in the base — it is installed after
+    # the upgrade — and holding a package that apt must still install makes
+    # its reverse-dependencies uninstallable ("not selected for install").
+    && apt-mark hold postgresql-${TO_VERSION} postgresql-client-${TO_VERSION} \
     && apt-get upgrade -y \
     && apt-get install -y --no-install-recommends \
       postgresql-${FROM_VERSION} \
       postgresql-${FROM_VERSION}-pgvector \
       postgresql-${TO_VERSION}-pgvector \
       jq \
+    && apt-mark unhold postgresql-${TO_VERSION} postgresql-client-${TO_VERSION} \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --chmod=755 upgrade-job.sh /usr/local/bin/upgrade-job.sh
