@@ -269,12 +269,14 @@ wait_for_pg() {
 }
 
 # Wait for the cluster to finish recovery and promote (i.e.
-# pg_is_in_recovery() returns 'f'). pg_isready / wait_for_pg returns true
-# during archive recovery — postgres accepts read-only connections before
-# the promote completes — which can let restart-mid-flight tests rip the
-# container before recovery flushes recovery.signal. Use this helper after
-# wait_for_pg in tests that depend on the cluster being fully promoted
-# (e.g. a second boot must NOT re-stage recovery).
+# pg_is_in_recovery() returns 'f'). On PITR replay paths the image stages
+# hot_standby=off, so pg_isready / wait_for_pg now fails until the promote
+# ("the database system is starting up") and implicitly waits it out — but
+# keep using this helper after wait_for_pg in tests that depend on the
+# cluster being fully promoted (e.g. a second boot must NOT re-stage
+# recovery): it asserts the promoted state EXPLICITLY, covers recovery
+# paths that don't stage hot_standby=off (crash recovery, standby.signal),
+# and doesn't depend on the staging being in place.
 wait_for_promoted() {
   local container="$1" deadline=$(($(date +%s) + 120))
   while [ "$(date +%s)" -lt "$deadline" ]; do
@@ -1951,6 +1953,18 @@ t_empty_volume_restore_from_s3() {
   fi
   if docker exec "$rest_name" test -f /var/lib/postgresql/data/.pitr_staging; then
     ko t_empty_volume_restore_from_s3 ".pitr_staging must not be written on the empty-volume restore path"
+    return
+  fi
+
+  # The replay-window guard must have been staged: `pgbackrest restore`
+  # leaves hot_standby at its default (on), which would let clients read
+  # the base-backup state mid-replay. The wrapper stages hot_standby=off in
+  # its own conf.d file; it survives until the next boot's
+  # configure_pgbackrest_recovery sees recovery genuinely done (removal is
+  # covered by t_restored_marker_persists_across_restarts).
+  if ! docker exec "$rest_name" test -f /var/lib/postgresql/data/conf.d/pgbackrest-restore-hot-standby.conf; then
+    ko t_empty_volume_restore_from_s3 "conf.d/pgbackrest-restore-hot-standby.conf missing — replaying fork would be readable at the base-backup state"
+    fail_dump t_empty_volume_restore_from_s3 "$rest_name"
     return
   fi
 
@@ -3729,6 +3743,16 @@ t_restored_marker_persists_across_restarts() {
     fail_dump t_restored_marker_persists_across_restarts "$rest_name"
     return
   fi
+  # The replay-window hot_standby=off staging must not survive promotion:
+  # configure_pgbackrest_recovery removes it on the first boot that finds
+  # recovery genuinely done. Leaving it behind is harmless to a promoted
+  # primary (hot_standby is only consulted during recovery) but would leak
+  # replay-scoped config into the service's steady-state conf.d.
+  if docker exec "$rest_name" test -f /var/lib/postgresql/data/conf.d/pgbackrest-restore-hot-standby.conf; then
+    ko t_restored_marker_persists_across_restarts "conf.d/pgbackrest-restore-hot-standby.conf survived the post-promote boot"
+    fail_dump t_restored_marker_persists_across_restarts "$rest_name"
+    return
+  fi
 
   ok t_restored_marker_persists_across_restarts
   note ".pgbackrest_restored survived restart; configure_pgbackrest_recovery deferred"
@@ -3753,8 +3777,10 @@ t_restored_marker_persists_across_restarts() {
 # enough of a replay window to reliably catch mid-flight. This test builds
 # its own source with a bulk insert between the base backup and the target
 # so recovery has real, measurable replay work, then force-kills the
-# restore as soon as it accepts connections (wait_for_pg returns true
-# during recovery, before promote) rather than racing a fixed sleep.
+# restore as soon as its restore_command starts fetching WAL (archive-get
+# traffic in docker logs) rather than racing a fixed sleep — the replaying
+# fork stages hot_standby=off, so it accepts no connections until promote
+# and readiness probes can't serve as the mid-replay signal.
 t_recovery_conf_persists_across_restart_mid_replay() {
   local src_name=t-src-heavy-${PG_VERSION}
   local src_vol=${src_name}-vol
@@ -3852,20 +3878,27 @@ t_recovery_conf_persists_across_restart_mid_replay() {
     -v "$rest_vol:/var/lib/postgresql/data" \
     "$IMAGE" >/dev/null
 
-  # Tight-poll pg_isready and kill the instant it succeeds — wait_for_pg
-  # returns true during recovery, before promote, so this catches the
-  # restore genuinely mid-replay instead of racing a fixed sleep against
-  # an unknown promote time.
+  # Catch the restore genuinely mid-replay via pgbackrest's archive-get
+  # traffic: restore_command only starts fetching WAL once the postmaster
+  # is up and replaying, and the lines land in docker logs on every major
+  # (postgres's own server LOG lines don't, on all of them). This used to
+  # tight-poll pg_isready — that only worked because hot_standby defaulted
+  # on and postgres accepted read-only connections mid-replay; the image
+  # now stages hot_standby=off for the whole replay (clients get "the
+  # database system is starting up" until promote), so pg_isready fails by
+  # design until recovery finishes, exactly what the mid-replay read-race
+  # fix wants. Also a wider catch window: archive-get begins at redo start,
+  # not at consistent-state.
   local caught=0 i
   for i in $(seq 1 600); do
-    if docker exec "$rest_name" pg_isready -U postgres -q 2>/dev/null; then
+    if docker logs "$rest_name" 2>&1 | grep -q "archive-get command begin"; then
       caught=1
       break
     fi
     local status
     status=$(docker inspect -f '{{.State.Status}}' "$rest_name" 2>/dev/null || echo "")
     if [ "$status" = "exited" ]; then
-      ko t_recovery_conf_persists_across_restart_mid_replay "1st boot exited before becoming ready"
+      ko t_recovery_conf_persists_across_restart_mid_replay "1st boot exited before starting replay"
       fail_dump t_recovery_conf_persists_across_restart_mid_replay "$rest_name"
       docker rm -f "$src_name" "$rest_name" >/dev/null; docker volume rm "$src_vol" "$rest_vol" >/dev/null
       return
@@ -3873,7 +3906,7 @@ t_recovery_conf_persists_across_restart_mid_replay() {
     sleep 0.2
   done
   if [ "$caught" -ne 1 ]; then
-    ko t_recovery_conf_persists_across_restart_mid_replay "1st boot never became ready"
+    ko t_recovery_conf_persists_across_restart_mid_replay "1st boot never started replaying (no archive-get traffic)"
     fail_dump t_recovery_conf_persists_across_restart_mid_replay "$rest_name"
     docker rm -f "$src_name" "$rest_name" >/dev/null; docker volume rm "$src_vol" "$rest_vol" >/dev/null
     return

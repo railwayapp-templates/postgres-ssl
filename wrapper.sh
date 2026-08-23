@@ -461,6 +461,15 @@ PGBACKREST_RECOVERY_S3_CONF="/etc/pgbackrest/pgbackrest-recovery-source.conf"
 PGBACKREST_CONFD_DIR="$PGDATA/conf.d"
 PGBACKREST_ARCHIVE_CONF="$PGBACKREST_CONFD_DIR/pgbackrest.conf"
 PGBACKREST_RECOVERY_CONF="$PGBACKREST_CONFD_DIR/pgbackrest-recovery.conf"
+# Companion to the empty-volume restore path: `pgbackrest restore` writes the
+# recovery params into postgresql.auto.conf itself (so the conf.d recovery
+# file above is never staged on that path), but it does NOT turn hot_standby
+# off — leaving the replaying fork readable at the base-backup state before
+# redo reaches the target. This one-line conf.d file closes that window; it
+# is removed by configure_pgbackrest_recovery once recovery is genuinely done
+# (post-promote), and by clear_pgbackrest_state_if_disabled when the recovery
+# role is dropped.
+PGBACKREST_RESTORE_STANDBY_CONF="$PGBACKREST_CONFD_DIR/pgbackrest-restore-hot-standby.conf"
 PGBACKREST_SPOOL_DIR="$PGDATA/pgbackrest-spool"
 
 # PITR staging stamps. .pitr_staging is written when a replay is handed off
@@ -1168,6 +1177,7 @@ clear_pgbackrest_state_if_disabled() {
     [ -f "$PITR_STAGING_FILE" ] && rm -f "$PITR_STAGING_FILE" && removed=1
     [ -f "$PITR_DONE_MARKER" ] && rm -f "$PITR_DONE_MARKER" && removed=1
     [ -f "$PGBACKREST_RESTORED_MARKER" ] && rm -f "$PGBACKREST_RESTORED_MARKER" && removed=1
+    [ -f "$PGBACKREST_RESTORE_STANDBY_CONF" ] && rm -f "$PGBACKREST_RESTORE_STANDBY_CONF" && removed=1
   fi
   if [ -z "${WAL_ARCHIVE_BUCKET:-}" ] && [ -z "${WAL_RECOVER_FROM_BUCKET:-}" ]; then
     [ -f "$PGBACKREST_CONF_FILE" ] && rm -f "$PGBACKREST_CONF_FILE" && removed=1
@@ -1348,6 +1358,14 @@ pg1-port=5432
 EOF
     chown postgres:postgres "$PGBACKREST_RECOVERY_S3_CONF"
     chmod 0640 "$PGBACKREST_RECOVERY_S3_CONF"
+  else
+    # Recovery genuinely finished (promoted): drop the empty-volume restore
+    # path's hot_standby=off staging so the setting cannot outlive the
+    # replay it protected. Readability itself already returned at promote —
+    # hot_standby is only consulted during recovery — this just keeps the
+    # conf.d of a promoted service clean, mirroring the staging path's
+    # deletion of $PGBACKREST_RECOVERY_CONF below.
+    rm -f "$PGBACKREST_RESTORE_STANDBY_CONF" 2>/dev/null || true
   fi
 
   # Recovery already done on this volume, OR the conf.d write below would
@@ -1414,10 +1432,22 @@ EOF
     local escaped_target="${POSTGRES_RECOVERY_TARGET_TIME//\'/\'\'}"
     recovery_param="recovery_target_time = '${escaped_target}'"
   fi
+  # hot_standby = off keeps the replaying fork unreadable until it promotes.
+  # With the default (on), postgres starts accepting READ-ONLY connections
+  # the moment it reaches consistency — which is the BASE-BACKUP state —
+  # while redo keeps replaying toward the recovery target. A client
+  # connecting in that window reads pre-restore-point data (tables created
+  # after the base backup "do not exist") even though the restore is sound
+  # and completes moments later; on a genuinely unreachable target, every
+  # crash-loop cycle re-opens the same pre-target read window before its
+  # FATAL. With hot_standby off, clients get "the database system is
+  # starting up" until the promote — and this whole file is deleted by the
+  # post-promote cleanup above, so the setting never outlives recovery.
   cat > "$PGBACKREST_RECOVERY_CONF" <<EOF
 restore_command = '${escaped_restore}'
 ${recovery_param}
 recovery_target_action = 'promote'
+hot_standby = off
 EOF
   chown postgres:postgres "$PGBACKREST_RECOVERY_CONF"
   chmod 0640 "$PGBACKREST_RECOVERY_CONF"
@@ -1550,6 +1580,28 @@ EOF
     echo "pgbackrest: restore from source bucket failed; fix env vars (WAL_RECOVER_FROM_*, POSTGRES_RECOVERY_TARGET_TIME, POSTGRES_RECOVERY_TARGET_XID) and redeploy" >&2
     exit 1
   fi
+
+  # Keep the fork unreadable while it replays toward the target — same read
+  # race as the conf.d staging path (see configure_pgbackrest_recovery's
+  # hot_standby note): `pgbackrest restore` writes the recovery params into
+  # postgresql.auto.conf but leaves hot_standby at its default (on), so
+  # postgres would accept read-only connections at the base-backup state
+  # while redo is still replaying to the target. Staged as a one-line conf.d
+  # file AFTER the restore succeeds (writing into PGDATA any earlier makes
+  # pgbackrest see a non-empty data dir and abort) and BEFORE the restored
+  # marker below: a crash between the two lands on the externally-restored
+  # path next boot, where configure_pgbackrest_recovery stages hot_standby
+  # off itself. configure_pgbackrest_recovery removes this file once
+  # recovery is genuinely done, so readability returns exactly at promote
+  # (hot_standby is only consulted during recovery) and the setting never
+  # survives a post-promote boot.
+  ensure_pg_includes_confd
+  install -d -m 0750 -o postgres -g postgres "$PGBACKREST_CONFD_DIR"
+  cat > "$PGBACKREST_RESTORE_STANDBY_CONF" <<EOF
+hot_standby = off
+EOF
+  chown postgres:postgres "$PGBACKREST_RESTORE_STANDBY_CONF"
+  chmod 0640 "$PGBACKREST_RESTORE_STANDBY_CONF"
 
   touch "$PGBACKREST_RESTORED_MARKER"
   chown postgres:postgres "$PGBACKREST_RESTORED_MARKER" 2>/dev/null || true
