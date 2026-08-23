@@ -1361,6 +1361,13 @@ EOF
   # hang the database against the source bucket forever.
   if [ -f "$PGBACKREST_RESTORED_MARKER" ] || [ -f "$PITR_DONE_MARKER" ] \
     || [ "$upgrade_completed" = 1 ]; then
+    # A kill between the cleanup branch's done-marker touch and its rm pair
+    # leaves staging/recovery-conf leftovers that this early return would
+    # otherwise preserve forever. They're inert (no recovery.signal), but
+    # sweep them so the volume doesn't carry stale recovery config for life.
+    if [ -f "$PITR_DONE_MARKER" ]; then
+      rm -f "$PITR_STAGING_FILE" "$PGBACKREST_RECOVERY_CONF" 2>/dev/null || true
+    fi
     return 0
   fi
 
@@ -1375,6 +1382,10 @@ EOF
     # the next boot short-circuits on $PITR_DONE_MARKER and leftover
     # staging is harmless.
     touch "$PITR_DONE_MARKER"
+    # Persist the marker before removing what it supersedes: on power loss
+    # the journal may keep the rm without the create, resurrecting the
+    # re-arm window this branch exists to close.
+    sync "$PITR_DONE_MARKER" 2>/dev/null || sync
     rm -f "$PITR_STAGING_FILE"
     rm -f "$PGBACKREST_RECOVERY_CONF"
     echo "pgbackrest: previous PITR replay completed; marker written"
