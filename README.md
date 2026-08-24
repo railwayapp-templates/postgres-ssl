@@ -432,12 +432,22 @@ restore. `wrapper.sh` refuses to boot while a non-completed marker exists, and
 refuses any image whose major differs from the on-disk `PG_VERSION` — so no
 mismatched boot can touch the data.
 
-Both sides also hold a `flock` on the volume-root
-`.railway-major-upgrade.lock`: the job exclusively for its run, the runtime
-container shared for its lifetime. A job dispatched against a live database
-refuses instead of corrupting the cluster, and a database deployed while a
-job is mid-flight refuses to boot — in-image backstops for the
-orchestrator's own exclusion.
+Both sides also hold a `flock` on the volume-root `.railway-volume.lock`:
+the job exclusively for its run, the runtime container shared for its
+lifetime. A job dispatched against a live database refuses instead of
+corrupting the cluster, and a database deployed while a job is mid-flight
+refuses to boot — in-image backstops for the orchestrator's own exclusion.
+
+The lock lived at `.railway-major-upgrade.lock` until the rename: a name
+that reads as an event marker, on a file every boot creates, kept being
+cited during data-loss forensics as evidence that an automatic major
+upgrade had run. Post-rename builds still lock the legacy path — the
+runtime whenever the file exists, the job creating it — so mixed-build
+runtime/job pairings keep excluding each other; both files now also carry
+a self-describing note instead of being empty. The legacy file is never
+deleted (unlinking an flock rendezvous splits racers across inodes) and is
+never created by a post-rename boot, so on new volumes it only ever
+appears where an upgrade job actually ran.
 
 The job tolerates the platform's ungraceful container stop: it clears a stale
 `postmaster.pid` and, when `pg_control` says the cluster was not shut down
