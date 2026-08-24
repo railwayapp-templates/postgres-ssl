@@ -353,11 +353,16 @@ take_job_lock() {
     "Advisory flock rendezvous between the Postgres container and Railway maintenance jobs." \
     "Created on every boot; its presence is not a record of any upgrade or other event." \
     >>"$JOB_LOCK_FILE" 2>/dev/null || true
-  if ! { exec 10>>"$LEGACY_JOB_LOCK_FILE"; } 2>/dev/null; then
+  # fd 7, not 10+: bash reserves fds >= 10 to save/restore the shell's own
+  # fds around redirections (e.g. this brace group's 2>/dev/null), and that
+  # bookkeeping closes a user-opened fd 10 on the way out — flock then sees
+  # EBADF and every job run dies here. Single-digit fds are never touched
+  # by it.
+  if ! { exec 7>>"$LEGACY_JOB_LOCK_FILE"; } 2>/dev/null; then
     log "could not open $LEGACY_JOB_LOCK_FILE; continuing without the legacy upgrade lock"
     return 0
   fi
-  if ! flock -n 10; then
+  if ! flock -n 7; then
     die 2 "the volume is in use — another upgrade job, or a still-running database container, holds the upgrade lock"
   fi
 }

@@ -91,9 +91,14 @@ if command -v flock >/dev/null 2>&1 && [ -d "$EXPECTED_VOLUME_MOUNT_PATH" ] \
   # only: old volumes already carry the file (every old boot created it);
   # a volume that never booted an old build has no old-build peer to
   # exclude, and never creating it here is the point of the rename.
+  # fd 7, not 10+: bash reserves fds >= 10 to save/restore the shell's own
+  # fds around redirections (e.g. this brace group's 2>/dev/null), and that
+  # bookkeeping closes a user-opened fd 10 on the way out — flock then sees
+  # EBADF and every boot on a legacy-carrying volume refuses. Single-digit
+  # fds are never touched by it.
   if [ -f "$LEGACY_UPGRADE_LOCK_FILE" ]; then
-    if { exec 10>>"$LEGACY_UPGRADE_LOCK_FILE"; } 2>/dev/null; then
-      if ! flock -n -s 10; then
+    if { exec 7>>"$LEGACY_UPGRADE_LOCK_FILE"; } 2>/dev/null; then
+      if ! flock -n -s 7; then
         echo "A major version upgrade job is currently running against this volume."
         echo "The database must not start until it finishes; retry the deploy once the upgrade completes."
         exit 1
