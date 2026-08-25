@@ -29,6 +29,10 @@
 #              the workflow to decide roll-back vs roll-forward on resume.
 #   manifest — print the extensions available on the TARGET major as JSON.
 #              Feeds the dashboard preflight's extension check.
+#   reseed-marker — durably write the HA replica reseed marker without
+#              starting Postgres. RESEED_MARKER_FROM/TO carry the direction,
+#              which may be a downgrade during revert; the dual-binary image
+#              pair itself remains the published ascending pair.
 #   recover  — roll-back ONLY, never redoes the upgrade: return a volume
 #              whose job died BEFORE the commit point (no marker) to a
 #              bootable FROM-major state — reverse pg_upgrade's pg_control
@@ -228,10 +232,10 @@ if [ -z "$MODE" ]; then
   if [ "$#" -gt 0 ]; then
     for _arg in "$@"; do
       case "$_arg" in
-        check | upgrade | status | manifest | recover) MODE="$_arg" ;;
+        check | upgrade | status | manifest | recover | reseed-marker) MODE="$_arg" ;;
       esac
     done
-    [ -n "$MODE" ] || die 2 "no recognized mode among arguments: $* (expected one of: check, upgrade, status, manifest, recover)"
+    [ -n "$MODE" ] || die 2 "no recognized mode among arguments: $* (expected one of: check, upgrade, status, manifest, recover, reseed-marker)"
   fi
 fi
 MODE="${MODE:-upgrade}"
@@ -737,6 +741,52 @@ mode_manifest() {
   exit 0
 }
 
+mode_reseed_marker() {
+  check_mount
+  take_job_lock
+  refuse_unreadable_marker
+
+  local from="${RESEED_MARKER_FROM:-}" to="${RESEED_MARKER_TO:-}"
+  [[ "$from" =~ ^[0-9]+$ ]] || die 2 "RESEED_MARKER_FROM must be a Postgres major"
+  [[ "$to" =~ ^[0-9]+$ ]] || die 2 "RESEED_MARKER_TO must be a Postgres major"
+  [ "$from" != "$to" ] || die 2 "reseed marker source and target majors must differ"
+
+  local major phase marker_from marker_to
+  major="$(data_major)"
+  phase="$(read_marker_field phase)"
+  marker_from="$(read_marker_field from)"
+  marker_to="$(read_marker_field to)"
+
+  # A retry after the replica already reseeded must never arm a fresh wipe on
+  # target-major data. Empty/completed state is already safe. A matching
+  # reseed marker is still in flight and is re-fsynced below; every other
+  # in-flight phase belongs to another operation and must fail closed.
+  if [ "$major" = "$to" ]; then
+    if [ -z "$phase" ] || [ "$phase" = "completed" ]; then
+      result "$(jq -nc --arg from "$from" --arg to "$to" --arg major "$major" \
+        '{ok: true, mode: "reseed-marker", phase: "completed", from: $from, to: $to, dataMajor: $major, alreadyDone: true}')"
+      exit 0
+    fi
+  fi
+  if [ "$major" != "$from" ] \
+    && ! { [ "$phase" = "reseed" ] && [ "$marker_from" = "$from" ] && [ "$marker_to" = "$to" ]; }; then
+    die 2 "volume data major '${major:-missing}' is neither reseed source $from nor a target with its matching in-flight marker"
+  fi
+
+  if [ -n "$phase" ] && [ "$phase" != "completed" ] \
+    && { [ "$phase" != "reseed" ] || [ "$marker_from" != "$from" ] || [ "$marker_to" != "$to" ]; }; then
+    die 2 "marker phase '$phase' (${marker_from:-?} -> ${marker_to:-?}) belongs to another volume operation — refusing to overwrite it"
+  fi
+
+  # Re-write even an identical marker: write_marker fsyncs the temp file, the
+  # renamed file, and the volume root, so success is positive durability proof.
+  write_marker "$(jq -nc --arg from "$from" --arg to "$to" \
+    '{phase: "reseed", from: $from, to: $to}')"
+  result "$(jq -nc --arg from "$from" --arg to "$to" --arg major "$major" \
+    '{ok: true, mode: "reseed-marker", phase: "reseed", from: $from, to: $to, dataMajor: $major}')"
+  exit 0
+}
+
 mode_check() {
   check_mount
   take_job_lock
@@ -1172,5 +1222,6 @@ case "$MODE" in
   status) mode_status ;;
   manifest) mode_manifest ;;
   recover) mode_recover ;;
-  *) die 2 "unknown mode '$MODE' (expected check|upgrade|status|manifest|recover)" ;;
+  reseed-marker) mode_reseed_marker ;;
+  *) die 2 "unknown mode '$MODE' (expected check|upgrade|status|manifest|recover|reseed-marker)" ;;
 esac
