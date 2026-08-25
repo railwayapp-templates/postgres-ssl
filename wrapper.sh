@@ -531,6 +531,27 @@ PITR_DONE_MARKER="$PGDATA/.pitr_configured"
 # our conf.d/pgbackrest-recovery.conf path would duplicate them.
 PGBACKREST_RESTORED_MARKER="$PGDATA/.pgbackrest_restored"
 
+# Restartpoint tuning applied ONLY to a replay boot, via `-c` flags on the
+# postgres invocation itself — never written to postgresql.conf/auto.conf.
+# Without this, pg_wal can accumulate WAL segments fetched by restore_command
+# until the next restartpoint, which fires at whatever cadence
+# checkpoint_timeout/max_wal_size already on disk allow (vanilla defaults,
+# a customer's own prod tuning on an existing volume, or — on a volume
+# cloned from the source at the block level — the source's tuning). On a
+# volume provisioned at ~the source's current size, that buffer risks
+# ENOSPC before recovery ever reaches the PITR target. This is deliberately a
+# best-effort reduction, not a hard disk bound: recovery can only perform a
+# restartpoint at a checkpoint record written by the source, so PostgreSQL may
+# exceed max_wal_size by as much as one source checkpoint cycle. Operators must
+# still provision that headroom. `-c` wins over
+# auto.conf regardless of what's already on disk and applies to this one
+# process only, so there's nothing to revert: the next boot (post-promote,
+# once recovery.signal is gone) just uses the Dockerfile CMD's plain args.
+# Safe to be aggressive — this boot serves no live traffic, so the extra
+# checkpoint overhead only extends replay time, not query latency.
+PITR_RECOVERY_CHECKPOINT_TIMEOUT="${PITR_RECOVERY_CHECKPOINT_TIMEOUT:-30s}"
+PITR_RECOVERY_MAX_WAL_SIZE="${PITR_RECOVERY_MAX_WAL_SIZE:-512MB}"
+
 # Per-cluster archive sub-path: the effective repo1-path, persisted inside
 # PGDATA so the watcher, archive-push wrapper, and stanza-create subshell
 # all converge on the same value. Per-cluster pathing means a wipe-and-
@@ -2335,6 +2356,20 @@ fork_old_datadir_reclaim
 # preserves the e2e suite's existing behavior on docker stop / docker
 # restart.
 #
+# This boot is about to replay WAL from the source bucket toward a PITR
+# target — recovery.signal present (written either by
+# restore_from_pgbackrest_if_empty_volume's `pgbackrest restore` or by
+# configure_pgbackrest_recovery) plus WAL_RECOVER_FROM_BUCKET set covers both
+# paths. Request tighter checkpoint_timeout/max_wal_size thresholds for just
+# this process so restartpoints reclaim pg_wal at the earliest eligible source
+# checkpoint record instead of inheriting an arbitrarily loose local setting.
+# These are triggers, not hard limits; see the headroom caveat above and
+# PITR_RECOVERY_CHECKPOINT_TIMEOUT/PITR_RECOVERY_MAX_WAL_SIZE above.
+if [ -f "$PGDATA/recovery.signal" ] && [ -n "${WAL_RECOVER_FROM_BUCKET:-}" ]; then
+  echo "pgbackrest: requesting tighter restartpoints with checkpoint_timeout=${PITR_RECOVERY_CHECKPOINT_TIMEOUT} max_wal_size=${PITR_RECOVERY_MAX_WAL_SIZE} for this replay boot (best effort; retain one source checkpoint cycle of disk headroom)"
+  set -- "$@" -c "checkpoint_timeout=${PITR_RECOVERY_CHECKPOINT_TIMEOUT}" -c "max_wal_size=${PITR_RECOVERY_MAX_WAL_SIZE}"
+fi
+
 # The traps below deliberately do NOT forward signals or restructure the
 # foreground invocation (that is the pattern CI rejected). They only
 # record that a stop was requested: bash runs a trap after the foreground

@@ -1937,6 +1937,17 @@ t_empty_volume_restore_from_s3() {
     "$IMAGE" >/dev/null
   wait_for_pg "$rest_name" || { ko t_empty_volume_restore_from_s3 "restored pg did not start"; fail_dump t_empty_volume_restore_from_s3 "$rest_name"; return; }
 
+  # The recovery-only restartpoint knobs must reach the postgres process on
+  # the replay boot. They are best-effort triggers (restartpoints still require
+  # a source checkpoint record), but inheriting an arbitrarily loose local
+  # checkpoint policy would defeat the mitigation entirely.
+  if ! docker exec "$rest_name" sh -c \
+    "ps aux | grep '[p]ostgres.*checkpoint_timeout=30s.*max_wal_size=512MB'" >/dev/null; then
+    ko t_empty_volume_restore_from_s3 "replay boot did not receive recovery-only restartpoint args"
+    fail_dump t_empty_volume_restore_from_s3 "$rest_name"
+    return
+  fi
+
   # The .pgbackrest_restored marker must exist (set by
   # restore_from_pgbackrest_if_empty_volume after a successful restore).
   if ! docker exec "$rest_name" test -f /var/lib/postgresql/data/.pgbackrest_restored; then
@@ -1978,6 +1989,18 @@ t_empty_volume_restore_from_s3() {
   fi
   if [ "$rows_after" != "0" ]; then
     ko t_empty_volume_restore_from_s3 "id=2,3 (after target) should be absent; got $rows_after"
+    return
+  fi
+
+  # recovery.signal is consumed on promote. A subsequent boot must therefore
+  # use the ordinary postgres arguments; otherwise the aggressive recovery
+  # tuning silently leaks into production traffic.
+  docker restart "$rest_name" >/dev/null
+  wait_for_pg "$rest_name" || { ko t_empty_volume_restore_from_s3 "post-promote restart did not start"; fail_dump t_empty_volume_restore_from_s3 "$rest_name"; return; }
+  if docker exec "$rest_name" sh -c \
+    "ps aux | grep '[p]ostgres.*checkpoint_timeout=30s.*max_wal_size=512MB'" >/dev/null; then
+    ko t_empty_volume_restore_from_s3 "recovery-only restartpoint args leaked into post-promote boot"
+    fail_dump t_empty_volume_restore_from_s3 "$rest_name"
     return
   fi
 
