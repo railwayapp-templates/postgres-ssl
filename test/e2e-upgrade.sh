@@ -1957,6 +1957,59 @@ t_railway_env_without_mode_var_refused() {
   assert_eq "$(volume_data_major "$vol")" "$FROM_VERSION" "volume untouched — did not silently upgrade" || return 1
 }
 
+# A stopped HA replica has no container to exec into. The one-shot job mounts
+# that volume directly and must durably arm the reverse (TO -> FROM) reseed
+# before mono repins it to the old major.
+t_reseed_marker_on_stopped_reverse_replica() {
+  local vol="upg-e2e-reseed-reverse"
+  fresh_volume "$vol" || return 1
+  run_pg reseed-source "$vol" "$TO_IMAGE" || return 1
+  wait_for_pg reseed-source || return 1
+  stop_pg reseed-source
+
+  run_job "$vol" reseed-marker \
+    -e "RESEED_MARKER_FROM=$TO_VERSION" \
+    -e "RESEED_MARKER_TO=$FROM_VERSION"
+  assert_eq "$JOB_RC" "0" "marker job succeeds without a live database container" || { echo "$JOB_OUT" | tail -30; return 1; }
+  assert_eq "$(marker_field "$vol" phase)" "reseed" "reseed phase persisted" || return 1
+  assert_eq "$(marker_field "$vol" from)" "$TO_VERSION" "reverse source major persisted" || return 1
+  assert_eq "$(marker_field "$vol" to)" "$FROM_VERSION" "reverse target major persisted" || return 1
+
+  # Idempotent retry re-fsyncs the identical marker and still succeeds.
+  run_job "$vol" reseed-marker \
+    -e "RESEED_MARKER_FROM=$TO_VERSION" \
+    -e "RESEED_MARKER_TO=$FROM_VERSION"
+  assert_eq "$JOB_RC" "0" "identical marker retry succeeds" || return 1
+}
+
+t_reseed_marker_never_arms_target_major() {
+  local vol="upg-e2e-reseed-target"
+  seed_from_cluster "$vol" || return 1
+
+  run_job "$vol" reseed-marker \
+    -e "RESEED_MARKER_FROM=$TO_VERSION" \
+    -e "RESEED_MARKER_TO=$FROM_VERSION"
+  assert_eq "$JOB_RC" "0" "already-target volume is an idempotent success" || { echo "$JOB_OUT" | tail -30; return 1; }
+  assert_contains "$JOB_OUT" '"alreadyDone":true' "result proves no wipe was armed" || return 1
+  assert_eq "$(marker_field "$vol" phase)" "" "target-major volume remains unarmed" || return 1
+}
+
+t_reseed_marker_refuses_foreign_inflight_state() {
+  local vol="upg-e2e-reseed-foreign"
+  fresh_volume "$vol" || return 1
+  run_pg reseed-foreign-source "$vol" "$TO_IMAGE" || return 1
+  wait_for_pg reseed-foreign-source || return 1
+  stop_pg reseed-foreign-source
+  in_volume "$vol" "printf '%s' '{\"phase\":\"upgraded\",\"from\":\"16\",\"to\":\"17\"}' > $MARKER_PATH" || return 1
+
+  run_job "$vol" reseed-marker \
+    -e "RESEED_MARKER_FROM=$TO_VERSION" \
+    -e "RESEED_MARKER_TO=$FROM_VERSION"
+  assert_eq "$JOB_RC" "2" "foreign in-flight marker is refused" || { echo "$JOB_OUT" | tail -30; return 1; }
+  assert_contains "$JOB_OUT" "belongs to another volume operation" "refusal names the owner conflict" || return 1
+  assert_eq "$(marker_field "$vol" phase)" "upgraded" "foreign marker remains untouched" || return 1
+}
+
 # ----- runner -----------------------------------------------------------------
 ALL_TESTS=(
   t_vanilla_boot
@@ -2017,6 +2070,9 @@ ALL_TESTS=(
   t_bare_invocation_defaults_to_read_only_mode
   t_upgrade_job_mode_env_var_selects_mode
   t_railway_env_without_mode_var_refused
+  t_reseed_marker_on_stopped_reverse_replica
+  t_reseed_marker_never_arms_target_major
+  t_reseed_marker_refuses_foreign_inflight_state
 )
 
 TESTS=("${@:-}")
