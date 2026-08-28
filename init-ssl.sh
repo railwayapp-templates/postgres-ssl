@@ -115,3 +115,9 @@ ssl_ca_file = '$SSL_ROOT_CRT'
 shared_preload_libraries = 'pg_stat_statements'
 EOF
 fi
+# Flush the ssl append to disk. postgresql.conf is parsed at every boot but
+# written only here; nothing else ever fsyncs it. A block-level volume
+# snapshot taken before the page cache flushes the append captures the new
+# file size with zeroed data blocks, and a copy restored from that snapshot
+# fails to boot on the torn file.
+sync "$POSTGRES_CONF_FILE"

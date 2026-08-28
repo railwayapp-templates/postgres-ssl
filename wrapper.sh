@@ -340,6 +340,9 @@ ssl_cert_file = '$SSL_DIR/server.crt'
 ssl_key_file = '$SSL_DIR/server.key'
 ssl_ca_file = '$SSL_DIR/root.crt'
 EOF
+  # Flush the append: a block-level volume snapshot taken before writeback
+  # would capture the new size with zeroed data blocks (torn conf on restore).
+  sync "$POSTGRES_CONF_FILE"
 fi
 
 # Re-append the remote-access rule when pg_hba.conf has been reset to
@@ -376,6 +379,8 @@ if [ -f "$POSTGRES_CONF_FILE" ] && [ -f "$PG_HBA_FILE" ] \
 
 host all all all ${POSTGRES_HOST_AUTH_METHOD:-scram-sha-256}
 EOF
+  # Flush the append: same torn-tail-on-snapshot hazard as postgresql.conf.
+  sync "$PG_HBA_FILE"
 fi
 
 # Adds pg_stat_statements to shared_preload_libraries in a config file
@@ -669,6 +674,8 @@ ensure_pg_includes_confd() {
     return 0
   fi
   echo "include_dir = 'conf.d'" >> "$POSTGRES_CONF_FILE"
+  # Flush the append: same torn-tail-on-snapshot hazard as the ssl block.
+  sync "$POSTGRES_CONF_FILE"
   echo "pgbackrest: enabled include_dir 'conf.d' in postgresql.conf"
 }
 

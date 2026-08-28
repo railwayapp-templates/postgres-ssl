@@ -49,6 +49,15 @@ if ! grep -qE "^[[:space:]]*include_dir[[:space:]]*=[[:space:]]*['\"]?conf\.d['\
   echo "include_dir = 'conf.d'" >> "$PGDATA/postgresql.conf"
 fi
 
+# This is the last initdb-era writer of boot-parsed config, so flush the
+# whole volume filesystem here: initdb's sample, the entrypoint's pg_hba
+# append, init-ssl's ssl block, and the include_dir line above are all
+# buffered writes that nothing fsyncs. A block-level volume snapshot taken
+# before the page cache flushes them captures the new file sizes with zeroed
+# data blocks, and a copy restored from that snapshot fails to boot on the
+# torn file ("syntax error ... near token \"\"").
+sync -f "$PGDATA/PG_VERSION"
+
 mkdir -p "$PGDATA/conf.d"
 chmod 0750 "$PGDATA/conf.d"
 
