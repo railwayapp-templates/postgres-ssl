@@ -1772,6 +1772,74 @@ ENDSQL
   ) &
 }
 
+# Wait for postgres to be ready, then bring pg_stat_statements up to the
+# version this image's binaries ship, in every database that has it
+# installed. The platform owns this extension end to end — the image
+# preloads it via shared_preload_libraries and the dashboard's Stats tab
+# reads its view — but pg_upgrade preserves the extension's SQL-level
+# version, so an upgraded database stays on the OLD version's view/function
+# definitions forever (nothing else ever runs ALTER EXTENSION ... UPDATE).
+# Left alone, the fleet forks into per-major dialects of the same view and
+# the dashboard's single hardcoded query eventually breaks on upgraded
+# databases only. Reconciling at boot heals upgrades and already-lagging
+# volumes alike, one redeploy at a time.
+#
+# Deliberately scoped to pg_stat_statements: user-installed extensions are
+# the user's to update (an update can carry semantics/cost we shouldn't
+# decide for them); the dashboard preflight warns about those instead.
+# For pg_stat_statements the update only redefines views/functions — no
+# table data is touched — so running it idempotently at every boot is safe.
+#
+# Runs only when postgres is writable (skipped in recovery: a PITR restore
+# or standby heals on the boot after promotion instead). Errors are logged
+# and swallowed — a failed extension update must never take the database
+# down with it.
+fork_extension_reconcile() {
+  (
+    local i=0
+    while ! gosu postgres pg_isready -q 2>/dev/null; do
+      sleep 2
+      i=$((i+1))
+      [ $i -ge 60 ] && exit 0
+    done
+
+    if [ "$(gosu postgres psql -qAt -c 'SELECT pg_is_in_recovery()' 2>/dev/null)" != "f" ]; then
+      echo "extension-reconcile: postgres is in recovery; skipping (heals on the boot after promotion)"
+      exit 0
+    fi
+
+    local dbs
+    dbs=$(gosu postgres psql -qAt -c "SELECT datname FROM pg_database WHERE datallowconn AND NOT datistemplate" 2>/dev/null) || exit 0
+
+    while IFS= read -r db; do
+      [ -z "$db" ] && continue
+      gosu postgres psql -v ON_ERROR_STOP=0 -qAt -d "$db" 2>&1 << 'ENDSQL' | while IFS= read -r line; do [ -n "$line" ] && echo "extension-reconcile: [$db] $line"; done
+DO $body$
+DECLARE
+  installed text;
+  available text;
+BEGIN
+  SELECT e.extversion, ae.default_version INTO installed, available
+  FROM pg_catalog.pg_extension e
+  JOIN pg_catalog.pg_available_extensions ae ON ae.name = e.extname
+  WHERE e.extname = 'pg_stat_statements';
+  IF installed IS NOT NULL AND available IS NOT NULL AND installed <> available THEN
+    BEGIN
+      EXECUTE 'ALTER EXTENSION pg_stat_statements UPDATE';
+      RAISE NOTICE 'pg_stat_statements updated % -> %', installed, available;
+    EXCEPTION WHEN OTHERS THEN
+      -- No upgrade path from a very old version, or a concurrent DDL lock:
+      -- surface it in the logs and leave the extension as it was.
+      RAISE WARNING 'pg_stat_statements update % -> % failed: %', installed, available, SQLERRM;
+    END;
+  END IF;
+END
+$body$;
+ENDSQL
+    done <<< "$dbs"
+  ) &
+}
+
 compute_volume_thresholds
 # Inject the computed pg_wal drop threshold into the env that postgres (and
 # its archive_command wrapper) inherits, unless the operator pinned it. The
@@ -2342,6 +2410,7 @@ fork_old_datadir_reclaim() {
 bootstrap_pgbackrest_stanza
 fork_pgbackrest_backup_watcher
 fork_collation_refresh
+fork_extension_reconcile
 fork_post_upgrade_analyze
 fork_post_upgrade_config_restore
 fork_post_upgrade_reindex
