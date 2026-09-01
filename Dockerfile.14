@@ -1,5 +1,19 @@
 ARG POSTGRES_VERSION=14
 FROM postgres:${POSTGRES_VERSION}
+# Extension packages are pinned AT THE MINOR: the volume keeps each
+# extension's SQL catalog at install-time version while the image carries
+# the .so, and this tag is rebuilt daily - an unpinned package would let
+# pgdg move the binaries a whole minor (where catalog/.so compatibility
+# actually breaks) under every existing catalog overnight, with no gate
+# anywhere. PATCH releases and Debian packaging revisions float freely:
+# they are the bugfix/CVE stream and upstream keeps them
+# catalog-compatible (verified empirically 0.8.4->0.8.6). A MINOR bump is
+# the deliberate act: the scheduled bump workflow opens a one-line PR
+# moving this ARG, gated by the extension compat matrix (old catalogs
+# under the candidate .so). If pgdg ever prunes the whole minor from the
+# pool, the daily rebuild fails loudly - a human decides, never a nightly
+# accident.
+ARG PGVECTOR_PKG_VERSION=0.8.*
 
 # Install OpenSSL, sudo, pgvector, pgbackrest, and ca-certificates (needed
 # so pgbackrest can verify the TLS cert of the S3 endpoint — postgres base
@@ -16,7 +30,7 @@ ARG PKG_REFRESH=none
 RUN echo "refresh key: ${PKG_REFRESH}" \
     && apt-mark hold postgresql-14 postgresql-client-14 \
     && apt-get update && apt-get upgrade -y \
-    && apt-get install -y openssl sudo ca-certificates jq pgbackrest postgresql-14-pgvector \
+    && apt-get install -y openssl sudo ca-certificates jq pgbackrest "postgresql-14-pgvector=${PGVECTOR_PKG_VERSION}" \
     && apt-mark unhold postgresql-14 postgresql-client-14 \
     && rm -rf /var/lib/apt/lists/*
 
