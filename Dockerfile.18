@@ -1,5 +1,15 @@
 ARG POSTGRES_VERSION=18
 FROM postgres:${POSTGRES_VERSION}
+# Extension packages are PINNED: the volume keeps each extension's SQL
+# catalog at install-time version while the image carries the .so, and
+# this tag is rebuilt daily for CVE freshness - an unpinned package
+# would let pgdg move the binaries under every existing catalog on the
+# next rebuild, with no compatibility gate anywhere. Bumps are a
+# deliberate one-line change here. If the pin ever rotates out of the
+# pgdg pool the daily rebuild fails loudly - that is the point: a
+# human decides, never a nightly accident. (Fallback source if needed:
+# apt-archive.postgresql.org.)
+ARG PGVECTOR_PKG_VERSION=0.8.6-1.pgdg13+1
 
 # Install OpenSSL, sudo, pgvector, pgbackrest, and ca-certificates (needed
 # so pgbackrest can verify the TLS cert of the S3 endpoint — postgres base
@@ -16,7 +26,7 @@ ARG PKG_REFRESH=none
 RUN echo "refresh key: ${PKG_REFRESH}" \
     && apt-mark hold postgresql-18 postgresql-client-18 \
     && apt-get update && apt-get upgrade -y \
-    && apt-get install -y openssl sudo ca-certificates jq pgbackrest postgresql-18-pgvector \
+    && apt-get install -y openssl sudo ca-certificates jq pgbackrest postgresql-18-pgvector=${PGVECTOR_PKG_VERSION} \
     && apt-mark unhold postgresql-18 postgresql-client-18 \
     && rm -rf /var/lib/apt/lists/*
 
