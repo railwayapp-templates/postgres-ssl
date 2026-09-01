@@ -1,19 +1,19 @@
 ARG POSTGRES_VERSION=14
 FROM postgres:${POSTGRES_VERSION}
-# Extension packages are PINNED: the volume keeps each extension's SQL
-# catalog at install-time version while the image carries the .so, and
-# this tag is rebuilt daily for CVE freshness - an unpinned package
-# would let pgdg move the binaries under every existing catalog on the
-# next rebuild, with no compatibility gate anywhere. Bumps are a
-# deliberate one-line change here. If the pin ever rotates out of the
-# pgdg pool the daily rebuild fails loudly - that is the point: a
-# human decides, never a nightly accident. The pin freezes the UPSTREAM
-# version only; the Debian packaging revision (-N.pgdgXX+N) floats via
-# the glob, so pgdg re-packaging churn never breaks a rebuild. Bumps
-# arrive through the scheduled bump workflow: it opens a PR moving this
-# ARG, and that PR's CI must pass the extension compat matrix
-# (old catalogs under the candidate .so) before it can merge.
-ARG PGVECTOR_PKG_VERSION=0.8.6-*
+# Extension packages are pinned AT THE MINOR: the volume keeps each
+# extension's SQL catalog at install-time version while the image carries
+# the .so, and this tag is rebuilt daily - an unpinned package would let
+# pgdg move the binaries a whole minor (where catalog/.so compatibility
+# actually breaks) under every existing catalog overnight, with no gate
+# anywhere. PATCH releases and Debian packaging revisions float freely:
+# they are the bugfix/CVE stream and upstream keeps them
+# catalog-compatible (verified empirically 0.8.4->0.8.6). A MINOR bump is
+# the deliberate act: the scheduled bump workflow opens a one-line PR
+# moving this ARG, gated by the extension compat matrix (old catalogs
+# under the candidate .so). If pgdg ever prunes the whole minor from the
+# pool, the daily rebuild fails loudly - a human decides, never a nightly
+# accident.
+ARG PGVECTOR_PKG_VERSION=0.8.*
 
 # Install OpenSSL, sudo, pgvector, pgbackrest, and ca-certificates (needed
 # so pgbackrest can verify the TLS cert of the S3 endpoint — postgres base
