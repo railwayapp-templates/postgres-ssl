@@ -753,7 +753,7 @@ t_archiving_boot_survives_pghostaddr() {
     fi
     sleep 1
   done
-  [ "$marker" = "1" ] || { ko t_archiving_boot_survives_pghostaddr "postgres did not start"; fail_dump t_archiving_boot_survives_pghostaddr "$name"; return; }
+  [ "$ready" = "1" ] || { ko t_archiving_boot_survives_pghostaddr "postgres did not start"; fail_dump t_archiving_boot_survives_pghostaddr "$name"; return; }
 
   # A wider deadline than t_archiving_boot's 15s: stanza-create can hit a
   # transient lock-contention retry (30s backoff, unrelated to PGHOSTADDR —
