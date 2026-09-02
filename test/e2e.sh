@@ -305,6 +305,35 @@ wait_for_log_line() {
   return 1
 }
 
+# `docker logs` is the only place the container's stdout/stderr split
+# survives outside a log pipeline: it writes the container's stdout to its
+# own stdout and the container's stderr to its own stderr. The two helpers
+# below let a test assert WHICH stream a line arrived on — the property a
+# pipeline turns into that line's severity. Both avoid `docker logs | grep`:
+# under `pipefail` a `grep -q` that exits on its first match SIGPIPEs the
+# producer and the pipeline reports 141, so a real match reads as a miss.
+logs_on_stream() {
+  local container="$1" stream="$2"
+  local prefix="/tmp/pgssl-logstream-${container}"
+  docker logs "$container" >"${prefix}.out" 2>"${prefix}.err"
+  if [ "$stream" = "stdout" ]; then cat "${prefix}.out"; else cat "${prefix}.err"; fi
+  rm -f "${prefix}.out" "${prefix}.err"
+}
+
+# Stream-scoped wait_for_log_line — same log-driver drain race, so poll
+# rather than checking once.
+wait_for_log_line_on_stream() {
+  local container="$1" pattern="$2" stream="$3" timeout="${4:-30}"
+  local deadline=$(($(date +%s) + timeout))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if grep -qF -- "$pattern" <<<"$(logs_on_stream "$container" "$stream")"; then
+      return 0
+    fi
+    sleep 0.5
+  done
+  return 1
+}
+
 cleanup_test_resources() {
   [ "${E2E_KEEP_CONTAINERS:-0}" = "1" ] && return 0
   docker rm -f $(docker ps -aq --filter "label=postgres-ssl-e2e=1") 2>/dev/null >/dev/null || true
@@ -724,7 +753,7 @@ t_archiving_boot_survives_pghostaddr() {
     fi
     sleep 1
   done
-  [ "$ready" = "1" ] || { ko t_archiving_boot_survives_pghostaddr "postgres did not start"; fail_dump t_archiving_boot_survives_pghostaddr "$name"; return; }
+  [ "$marker" = "1" ] || { ko t_archiving_boot_survives_pghostaddr "postgres did not start"; fail_dump t_archiving_boot_survives_pghostaddr "$name"; return; }
 
   # A wider deadline than t_archiving_boot's 15s: stanza-create can hit a
   # transient lock-contention retry (30s backoff, unrelated to PGHOSTADDR —
@@ -4777,10 +4806,83 @@ t_invalid_bucket_sentinel_cleared_on_disable() {
   docker volume rm "$vol" >/dev/null
 }
 
+t_log_to_stdout_moves_server_stream() {
+  # Which stream the server logs on is a user-visible contract, not an
+  # internal detail: a log pipeline reads a line's severity from its stream
+  # (stdout = info, stderr = error), so LOG_TO_STDOUT is the difference
+  # between a Postgres service that files every checkpoint and connection as
+  # an error and one that does not. Both directions are pinned here, so the
+  # branch can't be read as unreferenced and dropped again (issue #135).
+  local name=t-logstream-${PG_VERSION}
+  local vol=${name}-vol
+  # Marker chosen so it can only come from the REAL postmaster: initdb runs
+  # a temporary server whose output docker-entrypoint.sh puts on stdout, and
+  # it starts that one with `-c listen_addresses=''` (see the entrypoint's
+  # docker_temp_server_start), so "listening on IPv4 address" is never in
+  # its log. Asserting on a line the temp server also emits — "database
+  # system is ready to accept connections" — would see it on stdout on a
+  # first boot no matter what the switch does, and pass for the wrong reason.
+  local marker='listening on IPv4 address'
+  # Asserts on wrapper.sh behavior — never trust a pre-existing tag.
+  if ! rebuild_image; then
+    ko "${FUNCNAME[0]}" "could not rebuild $IMAGE"
+    return
+  fi
+  new_volume "$vol"
+  docker rm -f "$name" "${name}-b" >/dev/null 2>&1 || true
+
+  # Unset: upstream behavior — the server log stays on stderr.
+  docker run -d --name "$name" --label postgres-ssl-e2e=1 --network "$NET" \
+    -e POSTGRES_PASSWORD=test \
+    -v "$vol:/var/lib/postgresql/data" \
+    "$IMAGE" >/dev/null
+  wait_for_pg "$name" || { ko t_log_to_stdout_moves_server_stream "postgres did not start with LOG_TO_STDOUT unset"; fail_dump t_log_to_stdout_moves_server_stream "$name"; return; }
+  wait_for_log_line_on_stream "$name" "$marker" stderr 30 \
+    || { ko t_log_to_stdout_moves_server_stream "server log did not reach stderr with LOG_TO_STDOUT unset"; fail_dump t_log_to_stdout_moves_server_stream "$name"; return; }
+
+  local on_stdout
+  on_stdout=$(logs_on_stream "$name" stdout)
+  # The entrypoint's own initdb progress is on stdout either way, so this
+  # anchor proves the stdout capture is real before asserting an absence.
+  if ! grep -qF -- "init process complete" <<<"$on_stdout"; then
+    ko t_log_to_stdout_moves_server_stream "stdout capture is missing the entrypoint's initdb output — the stream split is not being observed"
+    fail_dump t_log_to_stdout_moves_server_stream "$name"
+    return
+  fi
+  if grep -qF -- "$marker" <<<"$on_stdout"; then
+    ko t_log_to_stdout_moves_server_stream "server log reached stdout with LOG_TO_STDOUT unset"
+    fail_dump t_log_to_stdout_moves_server_stream "$name"
+    return
+  fi
+
+  # LOG_TO_STDOUT=true on the same (now initialized) volume: the server log
+  # follows the switch onto stdout and leaves stderr for real failures.
+  docker rm -f "$name" >/dev/null
+  docker run -d --name "${name}-b" --label postgres-ssl-e2e=1 --network "$NET" \
+    -e POSTGRES_PASSWORD=test \
+    -e LOG_TO_STDOUT=true \
+    -v "$vol:/var/lib/postgresql/data" \
+    "$IMAGE" >/dev/null
+  wait_for_pg "${name}-b" || { ko t_log_to_stdout_moves_server_stream "postgres did not start with LOG_TO_STDOUT=true"; fail_dump t_log_to_stdout_moves_server_stream "${name}-b"; return; }
+  wait_for_log_line_on_stream "${name}-b" "$marker" stdout 30 \
+    || { ko t_log_to_stdout_moves_server_stream "server log did not follow LOG_TO_STDOUT=true onto stdout"; fail_dump t_log_to_stdout_moves_server_stream "${name}-b"; return; }
+  if grep -qF -- "$marker" <<<"$(logs_on_stream "${name}-b" stderr)"; then
+    ko t_log_to_stdout_moves_server_stream "server log still reached stderr under LOG_TO_STDOUT=true"
+    fail_dump t_log_to_stdout_moves_server_stream "${name}-b"
+    return
+  fi
+
+  ok t_log_to_stdout_moves_server_stream
+  note "server log on stderr by default, on stdout under LOG_TO_STDOUT=true"
+  docker rm -f "${name}-b" >/dev/null
+  docker volume rm "$vol" >/dev/null
+}
+
 # ----- runner ----------------------------------------------------------------
 
 ALL_TESTS=(
   t_vanilla_boot
+  t_log_to_stdout_moves_server_stream
   t_runtime_lock_blocks_overlapping_boot
   t_unasked_clean_exit_is_nonzero
   t_requested_stop_still_exits_zero
