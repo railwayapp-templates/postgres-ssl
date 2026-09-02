@@ -32,6 +32,24 @@ configuring the `SSL_CERT_DAYS` environment variable as needed.
 When a redeploy or restart is done the certificates expiry is checked, if it has
 expired or will expire in 30 days a new certificate is automatically generated.
 
+### Server log stream
+
+Postgres writes every log level it has — `LOG` through `PANIC` — to stderr,
+and the stream a line arrives on is what Railway reads its severity from:
+stdout is ingested as info, stderr as error. Left alone, a database that
+reports each checkpoint, connection and authentication on stderr fills a
+severity-filtered log view — including one spanning every service in the
+project — with lines that are not errors.
+
+Set `LOG_TO_STDOUT=true` (or `1`) to send the Postgres server log to stdout
+instead. Real server errors move with it, since Postgres emits all of its
+levels on the one stream, so this trades per-line severity for a log view
+where an error is an error. Unset — or any other value — keeps the upstream
+behavior.
+
+The image's own diagnostics are unaffected either way: certificate,
+volume-lock and pgBackRest warnings from `wrapper.sh` stay on stderr.
+
 ### Available image tags
 
 Images are automatically built weekly and tagged with multiple version levels

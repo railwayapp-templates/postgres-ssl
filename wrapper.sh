@@ -2467,6 +2467,32 @@ fi
 STOP_REQUESTED=0
 trap 'STOP_REQUESTED=1' TERM INT
 
+# LOG_TO_STDOUT=true moves the SERVER's log stream from stderr to stdout.
+# Postgres writes every level it has — LOG through PANIC — to a single
+# stream, and the stream a line arrives on is what a log pipeline reads its
+# severity from: stdout is ingested as info, stderr as error. A database
+# that reports each checkpoint, connection and authentication on stderr
+# therefore fills a severity-filtered log view with lines that are not
+# errors, which is what this switch exists to fix (issue #10). It trades
+# per-line severity for a quiet error view; unset keeps upstream behavior.
+#
+# Neither this repo nor the platform ever sets the variable — the caller
+# sets it as a service variable, so "no references here" is the contract
+# working, not dead code (#72 read it the other way and dropped the branch;
+# issue #135 is the user whose Postgres logs it took away). Both streams
+# are pinned by t_log_to_stdout_moves_server_stream in test/e2e.sh.
+#
+# The redirect is deliberately narrow: it lands past every `>&2` diagnostic
+# above and past the forked watchers (which keep the fds they were forked
+# with), so certificate, volume-lock and pgBackRest warnings from this
+# wrapper still arrive as errors.
+case "${LOG_TO_STDOUT:-}" in
+  [Tt][Rr][Uu][Ee] | 1)
+    echo "wrapper: LOG_TO_STDOUT=${LOG_TO_STDOUT} — sending the Postgres server log to stdout"
+    exec 2>&1
+    ;;
+esac
+
 ENTRYPOINT_EXIT=0
 /usr/local/bin/docker-entrypoint.sh "$@" || ENTRYPOINT_EXIT=$?
 
