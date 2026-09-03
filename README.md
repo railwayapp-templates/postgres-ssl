@@ -93,14 +93,27 @@ in the future is a wrapper change rather than a cross-repo rewrite.
 Invariant: `repo1` is always "this service's own destination bucket" —
 the only place this service writes WAL. `repo2`, when present, is a
 read-only recovery source. No two services ever share a destination
-bucket. Two modes:
+bucket. Which role(s) the image takes is decided purely by which env
+contract is present:
 
-- `WAL_ARCHIVE_*` only → standalone archiving service. `repo1` = own bucket.
-- `WAL_ARCHIVE_*` + `WAL_RECOVER_FROM_*` → PITR-restored fork. `repo1` =
-  fork's own fresh bucket (writes from boot), `repo2` = source's bucket
-  (read-only during recovery; ignored after promote, the fork's new
-  timeline doesn't exist there). The fork archives to its own bucket
-  from day one — no separate "re-enable PITR after restore" step.
+- `WAL_ARCHIVE_*` only → archiving service. `repo1` = own bucket.
+- `WAL_RECOVER_FROM_*` (+ `POSTGRES_RECOVERY_TARGET_TIME`) only → restored
+  service. The source bucket is mounted read-only for the empty-volume
+  `pgbackrest restore` and for `archive-get` during replay; once Postgres
+  promotes, the service runs as plain non-archiving Postgres. **This is
+  what Railway's managed PITR restore provisions**: the new service gets
+  the source's variables with `WAL_ARCHIVE_*` stripped and
+  `WAL_RECOVER_FROM_*` mirrored in, so it does not archive WAL until you
+  enable Point-in-Time Recovery on it (which gives it its own bucket) —
+  see [Point-in-Time Recovery](https://docs.railway.com/volumes/point-in-time-recovery).
+- `WAL_ARCHIVE_*` + `WAL_RECOVER_FROM_*` together → restore with archiving
+  from the start. `repo1` = this service's own destination bucket (the
+  promoted timeline is archived there from its first segment), `repo2` =
+  source's bucket (read-only during recovery; ignored after promote — the
+  new timeline doesn't exist there). The image supports this for
+  self-managed setups; the managed restore flow does not set both, so a
+  managed restore always needs the separate enable step above to resume
+  archiving.
 
 `archive_command` points at `/usr/local/bin/pgbackrest-archive-push-wrapper.sh`
 rather than calling `pgbackrest archive-push` directly. The wrapper tries the
