@@ -15,7 +15,8 @@ FROM postgres:${POSTGRES_VERSION}
 # accident.
 ARG PGVECTOR_PKG_VERSION=0.8.*
 
-# Install OpenSSL, sudo, pgvector, pgbackrest, and ca-certificates (needed
+# Install OpenSSL, sudo, pgvector, pgbackrest, tini (PID 1, see ENTRYPOINT
+# below), and ca-certificates (needed
 # so pgbackrest can verify the TLS cert of the S3 endpoint — postgres base
 # image disables apt Recommends, so ca-certificates isn't pulled implicitly)
 # CI passes its content key here (see the build workflow's content gate):
@@ -30,7 +31,7 @@ ARG PKG_REFRESH=none
 RUN echo "refresh key: ${PKG_REFRESH}" \
     && apt-mark hold postgresql-18 postgresql-client-18 \
     && apt-get update && apt-get upgrade -y \
-    && apt-get install -y openssl sudo ca-certificates jq pgbackrest "postgresql-18-pgvector=${PGVECTOR_PKG_VERSION}" \
+    && apt-get install -y openssl sudo ca-certificates jq pgbackrest tini "postgresql-18-pgvector=${PGVECTOR_PKG_VERSION}" \
     && apt-mark unhold postgresql-18 postgresql-client-18 \
     && rm -rf /var/lib/apt/lists/*
 
@@ -46,5 +47,17 @@ COPY --chmod=755 pgbackrest-archive-push-wrapper.sh /usr/local/bin/pgbackrest-ar
 COPY --chmod=755 pgbackrest-backup-watcher.sh /usr/local/bin/pgbackrest-backup-watcher.sh
 COPY --chmod=755 wrapper.sh /usr/local/bin/wrapper.sh
 
-ENTRYPOINT ["wrapper.sh"]
+# tini is PID 1. The runtime stops a container by signaling PID 1 only; a
+# shell there with no handler drops the signal, and the stop ends in SIGKILL
+# once the grace period runs out — every restart becomes a hard kill and the
+# next boot a WAL crash recovery. wrapper.sh cannot simply exec postgres
+# either: it forks background helpers (backup watcher, post-upgrade tasks)
+# that exec would re-parent onto the postmaster, which PANICs on their
+# SIGCHLD. tini -g delivers the stop signal to wrapper.sh's process group
+# (the wrapper and the postgres it runs in the foreground), reaps the
+# helpers when they exit, and exits with the wrapper's status. SIGINT is
+# postgres's fast-shutdown signal; the base image already declares it, and
+# it is restated here because the whole arrangement depends on it.
+STOPSIGNAL SIGINT
+ENTRYPOINT ["/usr/bin/tini", "-g", "--", "/usr/local/bin/wrapper.sh"]
 CMD ["postgres", "-p", "5432", "-c", "listen_addresses=*"]

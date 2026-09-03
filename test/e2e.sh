@@ -538,9 +538,12 @@ t_requested_stop_still_exits_zero() {
     || { ko t_requested_stop_still_exits_zero "initdb did not complete"; fail_dump t_requested_stop_still_exits_zero "$name"; return; }
   wait_for_pg "$name" || { ko t_requested_stop_still_exits_zero "postgres did not start"; fail_dump t_requested_stop_still_exits_zero "$name"; return; }
 
-  # Simulate the runtime's stop: TERM to the wrapper (PID 1), then a clean
-  # postgres shutdown. The wrapper's trap only records the request; the
-  # shutdown itself is postgres's own.
+  # Simulate the runtime's stop: TERM to PID 1 (tini, which forwards it to
+  # the wrapper's process group), then a clean postgres shutdown. The
+  # wrapper's trap only records the request; the shutdown itself is
+  # postgres's own — pg_ctl below is a no-op if the forwarded TERM already
+  # finished it. The real stop path (SIGINT, fast shutdown, timing) is
+  # pinned by t_stop_is_clean_and_restart_keeps_watcher.
   docker exec "$name" kill -TERM 1
   docker exec -u postgres "$name" bash -c 'pg_ctl stop -D "$PGDATA" -m fast -w'
 
@@ -567,6 +570,138 @@ t_requested_stop_still_exits_zero() {
   fi
 
   ok t_requested_stop_still_exits_zero
+  docker rm -f "$name" >/dev/null
+  docker volume rm "$vol" >/dev/null
+}
+
+t_stop_is_clean_and_restart_keeps_watcher() {
+  # The runtime stops a container by signaling PID 1 only. With a shell as
+  # PID 1 and no handler that signal was dropped, so every stop ran out the
+  # grace period, ended in SIGKILL, and the next boot did WAL crash recovery.
+  # tini is PID 1 now and hands SIGINT to the wrapper's process group, so a
+  # stop must be a fast shutdown: well inside the grace period, exit 0, the
+  # shutdown logged. The background helpers must stay out of the postmaster's
+  # process tree (no SIGCHLD PANIC / exit 103 — the reason `exec` was never
+  # an option here) and come back on start/restart, and ALTER SYSTEM must
+  # survive `docker restart` (the failure mode of the bash-forwarding shape).
+  local name=t-clean-stop-${PG_VERSION}
+  local vol=${name}-vol
+  local t=t_stop_is_clean_and_restart_keeps_watcher
+  # Asserts on wrapper.sh + Dockerfile behavior — never trust a pre-existing tag.
+  if ! rebuild_image; then
+    ko "$t" "could not rebuild $IMAGE"
+    return
+  fi
+  reset_bucket
+  new_volume "$vol"
+  docker rm -f "$name" >/dev/null 2>&1 || true
+  # Archiving on so the watcher is forked: the helper whose re-parenting
+  # sank the exec approach, and the one that must survive the stop signal.
+  run_archiving_pg "$name" "$vol" -e PGDATA=/var/lib/postgresql/data/pgdata
+  wait_for_log_line "$name" "init process complete" 120 \
+    || { ko "$t" "initdb did not complete"; fail_dump "$t" "$name"; return; }
+  wait_for_pg "$name" || { ko "$t" "postgres did not start"; fail_dump "$t" "$name"; return; }
+
+  local pid1
+  pid1=$(docker exec "$name" cat /proc/1/comm 2>/dev/null)
+  assert_eq "$pid1" "tini" "PID 1 inside the container" || { ko "$t" ""; fail_dump "$t" "$name"; return; }
+  if ! docker exec "$name" pgrep -f pgbackrest-backup-watcher.sh >/dev/null; then
+    ko "$t" "backup watcher not running before the stop"; fail_dump "$t" "$name"; return
+  fi
+  # Let archiving settle before stopping: a fast shutdown waits for the
+  # archiver's in-flight archive_command, and right after boot that command
+  # can be mid-retry while stanza-create is still running — seconds that are
+  # postgres's own, not the signal path's. Stanza present + one segment
+  # pushed = steady state, which is what the stop timing below measures.
+  local deadline=$(($(date +%s) + 60)) settled=0
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if grep -qF "stanza-create completed" <<<"$(docker logs "$name" 2>&1)"; then settled=1; break; fi
+    sleep 1
+  done
+  [ "$settled" = "1" ] || { ko "$t" "stanza-create did not complete"; fail_dump "$t" "$name"; return; }
+  # A write that needs a checkpoint on shutdown, so "shut down" below is a
+  # real fast shutdown and not an idle no-op; the WAL switch archives it now
+  # rather than at shutdown.
+  docker exec "$name" psql -U postgres -c "CREATE TABLE stop_probe(id int); INSERT INTO stop_probe SELECT generate_series(1, 1000); SELECT pg_switch_wal();" >/dev/null
+  deadline=$(($(date +%s) + 60)); settled=0
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if grep -qF "pushed WAL file" <<<"$(docker logs "$name" 2>&1)"; then settled=1; break; fi
+    sleep 1
+  done
+  [ "$settled" = "1" ] || { ko "$t" "first WAL segment was never archived"; fail_dump "$t" "$name"; return; }
+
+  # The platform's stop: STOPSIGNAL (SIGINT) to PID 1, 15 s grace, then
+  # SIGKILL. A dropped signal shows up as ~15 s and exit 137; a delivered
+  # one as a sub-second fast shutdown at steady state (measured ~0.5 s).
+  # The bound below leaves room for a shutdown checkpoint or one archive
+  # push on a loaded host while staying well clear of the grace period.
+  local started stopped dur exit_code
+  started=$(date +%s)
+  docker stop -t 15 "$name" >/dev/null
+  stopped=$(date +%s)
+  dur=$((stopped - started))
+  exit_code=$(docker inspect -f '{{.State.ExitCode}}' "$name")
+  assert_eq "$exit_code" "0" "container exit code after docker stop" || { ko "$t" ""; fail_dump "$t" "$name"; return; }
+  if [ "$dur" -ge 12 ]; then
+    ko "$t" "docker stop took ${dur}s — a delivered SIGINT finishes in about a second; this ran out the grace period"
+    fail_dump "$t" "$name"; return
+  fi
+  # Capture the log once and grep the variable: `docker logs | grep -q` is
+  # the pipefail/SIGPIPE trap logs_on_stream describes, and here the match
+  # is the LAST line of a long log, so a 141 would read as "not shut down".
+  local logs="" deadline=$(($(date +%s) + 10))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    logs=$(docker logs "$name" 2>&1)
+    grep -qF "database system is shut down" <<<"$logs" && break
+    sleep 0.5
+  done
+  grep -qF "database system is shut down" <<<"$logs" \
+    || { ko "$t" "postgres did not log a clean shutdown"; fail_dump "$t" "$name"; return; }
+  grep -qF "received fast shutdown request" <<<"$logs" \
+    || { ko "$t" "postgres did not receive the fast-shutdown signal (SIGINT never reached it)"; fail_dump "$t" "$name"; return; }
+  if grep -qE "exit_code=103|PANIC" <<<"$logs"; then
+    ko "$t" "postmaster panicked during the stop (a helper re-parented onto it?)"; fail_dump "$t" "$name"; return
+  fi
+  if grep -qF "no stop was requested" <<<"$logs"; then
+    ko "$t" "requested stop was misclassified as unasked"; fail_dump "$t" "$name"; return
+  fi
+  note "docker stop -t 15: ${dur}s, exit ${exit_code}"
+
+  # Back up: no crash recovery (the shutdown was clean), watcher forked again.
+  docker start "$name" >/dev/null
+  wait_for_pg "$name" || { ko "$t" "postgres did not come back after docker start"; fail_dump "$t" "$name"; return; }
+  logs=$(docker logs "$name" 2>&1)
+  if grep -qF "database system was interrupted" <<<"$logs"; then
+    ko "$t" "the restarted postgres ran crash recovery — the stop was not clean"; fail_dump "$t" "$name"; return
+  fi
+  local deadline=$(($(date +%s) + 30)) watcher_back=0
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if docker exec "$name" pgrep -f pgbackrest-backup-watcher.sh >/dev/null 2>&1; then watcher_back=1; break; fi
+    sleep 1
+  done
+  [ "$watcher_back" = "1" ] || { ko "$t" "backup watcher did not come back after docker start"; fail_dump "$t" "$name"; return; }
+
+  # docker restart = the shape that lost auto.conf under the bash-forwarding
+  # attempt: an ALTER SYSTEM must survive it, and the watcher must be alive
+  # afterwards.
+  docker exec "$name" psql -U postgres -c "ALTER SYSTEM SET work_mem = '48MB';" >/dev/null
+  docker restart -t 15 "$name" >/dev/null
+  wait_for_pg "$name" || { ko "$t" "postgres did not come back after docker restart"; fail_dump "$t" "$name"; return; }
+  local work_mem rows
+  work_mem=$(docker exec "$name" psql -U postgres -At -c "SHOW work_mem")
+  assert_eq "$work_mem" "48MB" "work_mem from auto.conf after docker restart" || { ko "$t" ""; fail_dump "$t" "$name"; return; }
+  rows=$(docker exec "$name" psql -U postgres -At -c "SELECT count(*) FROM stop_probe")
+  assert_eq "$rows" "1000" "rows written before the stop" || { ko "$t" ""; fail_dump "$t" "$name"; return; }
+  deadline=$(($(date +%s) + 30)); watcher_back=0
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if docker exec "$name" pgrep -f pgbackrest-backup-watcher.sh >/dev/null 2>&1; then watcher_back=1; break; fi
+    sleep 1
+  done
+  [ "$watcher_back" = "1" ] || { ko "$t" "backup watcher did not come back after docker restart"; fail_dump "$t" "$name"; return; }
+  pid1=$(docker exec "$name" cat /proc/1/comm 2>/dev/null)
+  assert_eq "$pid1" "tini" "PID 1 after docker restart" || { ko "$t" ""; fail_dump "$t" "$name"; return; }
+
+  ok "$t"
   docker rm -f "$name" >/dev/null
   docker volume rm "$vol" >/dev/null
 }
@@ -4886,6 +5021,7 @@ ALL_TESTS=(
   t_runtime_lock_blocks_overlapping_boot
   t_unasked_clean_exit_is_nonzero
   t_requested_stop_still_exits_zero
+  t_stop_is_clean_and_restart_keeps_watcher
   t_collation_refresh_no_permission_error
   t_invalid_bucket_skips_archive
   t_archiving_boot

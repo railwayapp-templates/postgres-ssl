@@ -39,10 +39,11 @@ fi
 # races refuse instead of corrupting: a job dispatched against a live
 # database fails its exclusive lock, and a database deployed while a job is
 # mid-flight fails here. The fd is opened by THIS shell, which stays alive
-# as PID 1 (docker-entrypoint.sh below is a child, not an exec), so the
-# lock is held exactly as long as the container regardless of what postgres
-# does with its inherited copy of the fd — closing a duplicate descriptor
-# does not release a flock while the original stays open.
+# for the container's whole lifetime (tini is PID 1 and this shell is its
+# only child; docker-entrypoint.sh below is a child of this shell, not an
+# exec), so the lock is held exactly as long as the container regardless of
+# what postgres does with its inherited copy of the fd — closing a duplicate
+# descriptor does not release a flock while the original stays open.
 #
 # Legacy PGDATA-at-the-volume-root layouts skip the lock on first init:
 # creating the lock file inside an empty PGDATA would make docker-entrypoint
@@ -115,8 +116,9 @@ fi
 
 # -----------------------------------------------------------------------------
 # Runtime lock: at most one postgres container touches this volume at a time.
-# Held EXCLUSIVELY (fd 9) for the container's lifetime, same shell-as-PID-1
-# mechanics as the upgrade lock above — the kernel releases it only when the
+# Held EXCLUSIVELY (fd 9) for the container's lifetime, same shell-lives-as-
+# long-as-the-container mechanics as the upgrade lock above — the kernel
+# releases it only when the
 # last process holding the open description exits, so "lock free" really
 # means every process of the previous container is gone, however that
 # container ended (graceful stop, SIGKILL, OOM).
@@ -1290,6 +1292,7 @@ bootstrap_pgbackrest_stanza() {
   [ -z "${WAL_ARCHIVE_BUCKET:-}" ] && return 0
 
   (
+    trap '' INT TERM  # background helper — see "Process tree and the stop signal" before the foreground call
     # No `local` here: subshells are their own scope so it's redundant, and
     # the construct misleads if the body is ever lifted out of a function.
     deadline=$(( $(date +%s) + 600 ))
@@ -1710,9 +1713,16 @@ EOF
 # stale file. With the watcher's own main loop holding a fixed PID, only
 # the transient iteration subshell churns (always short-lived,
 # never lands in postmaster.pid's range at container-start time).
+#
+# setsid: the watcher runs in its own session and process group, so the stop
+# signal tini delivers to this shell's group (see "Process tree and the stop
+# signal" before the foreground call) never reaches it or its pgbackrest
+# children. A backgrounded child is not a group leader, so setsid(2) applies
+# in-process — no extra fork, the watcher keeps the single long-lived PID
+# the paragraph above depends on, and it stays THIS shell's child.
 fork_pgbackrest_backup_watcher() {
   [ -z "${WAL_ARCHIVE_BUCKET:-}" ] && return 0
-  gosu postgres /usr/local/bin/pgbackrest-backup-watcher.sh &
+  setsid gosu postgres /usr/local/bin/pgbackrest-backup-watcher.sh &
 }
 
 # Wait for postgres to be ready then refresh collation versions on all databases.
@@ -1729,6 +1739,7 @@ fork_collation_refresh() {
     return 0
   fi
   (
+    trap '' INT TERM  # background helper — see "Process tree and the stop signal" before the foreground call
     local i=0
     while ! gosu postgres pg_isready -q 2>/dev/null; do
       sleep 2
@@ -1796,6 +1807,7 @@ ENDSQL
 # down with it.
 fork_extension_reconcile() {
   (
+    trap '' INT TERM  # background helper — see "Process tree and the stop signal" before the foreground call
     local i=0
     while ! gosu postgres pg_isready -q 2>/dev/null; do
       sleep 2
@@ -1965,6 +1977,7 @@ fork_post_upgrade_analyze() {
   [ -f "$UPGRADE_MARKER_FILE" ] || return 0
   [ "$(jq -r '.needsAnalyze // false' "$UPGRADE_MARKER_FILE" 2>/dev/null)" = "true" ] || return 0
   (
+    trap '' INT TERM  # background helper — see "Process tree and the stop signal" before the foreground call
     for _ in $(seq 1 120); do
       if pg_isready -q -h /var/run/postgresql -p 5432 2>/dev/null; then
         echo "post-upgrade: rebuilding planner statistics in stages"
@@ -2051,6 +2064,7 @@ fork_post_upgrade_config_restore() {
     return 0
   fi
   (
+    trap '' INT TERM  # background helper — see "Process tree and the stop signal" before the foreground call
     for _ in $(seq 1 120); do
       if pg_isready -q -h /var/run/postgresql -p 5432 2>/dev/null; then
         echo "post-upgrade: re-applying ALTER SYSTEM settings from $(basename "$stash")"
@@ -2171,6 +2185,7 @@ fork_post_upgrade_reindex() {
     rx_baseline_unknown=1
   fi
   (
+    trap '' INT TERM  # background helper — see "Process tree and the stop signal" before the foreground call
     # Same connection shape as fork_post_upgrade_analyze: the cluster's
     # actual superuser over the local socket — a custom-POSTGRES_USER
     # cluster has no 'postgres' role at all.
@@ -2343,6 +2358,7 @@ fork_old_datadir_reclaim() {
   [ "$(jq -r '.phase // empty' "$UPGRADE_MARKER_FILE" 2>/dev/null || true)" = "completed" ] || return 0
   compgen -G "${PGDATA}.old-*" >/dev/null 2>&1 || return 0
   (
+    trap '' INT TERM  # background helper — see "Process tree and the stop signal" before the foreground call
     retention="${UPGRADE_OLD_DIR_RETENTION_SECONDS:-86400}"
     marker_stamped=0
     [ -n "$(jq -r '.oldDataDirRemovedAt // empty' "$UPGRADE_MARKER_FILE" 2>/dev/null || true)" ] && marker_stamped=1
@@ -2416,21 +2432,30 @@ fork_post_upgrade_config_restore
 fork_post_upgrade_reindex
 fork_old_datadir_reclaim
 
-# H1 (audit): we considered `exec docker-entrypoint.sh` and a
-# trap+wait+forward-SIGTERM pattern to make `docker stop` flush
-# postgres's graceful shutdown sequence and clear postmaster.pid.
-# Neither survived CI: exec re-parents the watcher/bootstrap subshells
-# onto postmaster (postmaster panics on SIGCHLD with exit 103); the
-# trap+wait pattern disturbed docker-entrypoint's initdb-time temp
-# postmaster lifecycle and broke `docker restart` (auto.conf changes
-# didn't survive). The real production failure mode the audit named —
-# stale postmaster.pid colliding with a recently-respawned watcher PID —
-# is already mitigated by PR #86 reverting the wrapper.sh supervisor:
-# the watcher's long-lived PID no longer churns, so the in-container
-# kill(stale_pid, 0) liveness check no longer hits one of its
-# subprocesses. Falling back to the simple foreground invocation
-# preserves the e2e suite's existing behavior on docker stop / docker
-# restart.
+# Process tree and the stop signal. tini is PID 1 (see the Dockerfile) and
+# runs this script as its only child; docker-entrypoint.sh below runs in the
+# FOREGROUND as a child of this shell and execs postgres, so postgres shares
+# this shell's process group. The runtime stops the container by sending
+# SIGINT (STOPSIGNAL) to PID 1 alone; tini -g forwards it to that process
+# group — postgres takes a fast shutdown, this shell latches STOP_REQUESTED
+# (trap below) and, once the foreground child returns, exits 0; tini exits
+# with that status. The background helpers forked above must NOT be in that
+# group: the watcher is started under setsid (own session, own group) and
+# each `( ... ) &` subshell ignores INT/TERM as its first statement, so the
+# group signal neither stops a helper mid-task nor makes one exit early.
+# They stay children of this shell — never of the postmaster — and tini
+# reaps whatever is still running when the container ends.
+#
+# History, so the two simpler shapes are not retried: `exec
+# docker-entrypoint.sh` made postgres PID 1 and re-parented the helpers
+# onto it — the postmaster PANICs on an unexpected SIGCHLD (exit 103); a
+# bash trap+wait+forward loop around a backgrounded entrypoint disturbed
+# docker-entrypoint's initdb-time temp postmaster and lost ALTER SYSTEM
+# settings across `docker restart`. Both failed in CI (#87); neither is a
+# one-liner away from working, which is why the init lives outside this
+# script. The stale-postmaster.pid vs watcher-PID collision that audit
+# also named is closed separately by the watcher holding one long-lived
+# PID (#86), and setsid above preserves that property.
 #
 # This boot is about to replay WAL from the source bucket toward a PITR
 # target — recovery.signal present (written either by
@@ -2447,21 +2472,22 @@ if [ -f "$PGDATA/recovery.signal" ] && [ -n "${WAL_RECOVER_FROM_BUCKET:-}" ]; th
 fi
 
 # The traps below deliberately do NOT forward signals or restructure the
-# foreground invocation (that is the pattern CI rejected). They only
-# record that a stop was requested: bash runs a trap after the foreground
-# child returns, so by the time the exit-code shaping below executes the
-# flag reflects whether the runtime asked us to stop. That distinction is
-# what lets a postgres that dies CLEANLY BUT UNASKED — e.g. it shut itself
-# down because something unlinked its postmaster.pid — exit this container
-# nonzero so an ON_FAILURE restart policy can bring the database back,
-# instead of the container reporting exit 0 and staying down forever.
+# foreground invocation (that is the pattern CI rejected; delivering the
+# signal to postgres is tini's job, see above). They only record that a
+# stop was requested: bash runs a trap after the foreground child returns,
+# so by the time the exit-code shaping below executes the flag reflects
+# whether the runtime asked us to stop. That distinction is what lets a
+# postgres that dies CLEANLY BUT UNASKED — e.g. it shut itself down because
+# something unlinked its postmaster.pid — exit this container nonzero so an
+# ON_FAILURE restart policy can bring the database back, instead of the
+# container reporting exit 0 and staying down forever.
 #
 # The flag is a one-shot latch: a TERM/INT that never culminates in a stop
-# (an operator poking PID 1, a platform stop that gets cancelled) still
-# reclassifies a LATER unasked clean exit as requested, exit 0, no restart.
-# Accepted: bash defers trap execution until the foreground child returns,
-# so signal-delivery time cannot be recorded and a recency check is not
-# implementable in this design — and on Railway a TERM broadcast is always
+# (an operator signaling this shell, a platform stop that gets cancelled)
+# still reclassifies a LATER unasked clean exit as requested, exit 0, no
+# restart. Accepted: bash defers trap execution until the foreground child
+# returns, so signal-delivery time cannot be recorded and a recency check is
+# not implementable in this design — and on Railway a stop signal is always
 # followed by container removal, so a latched flag never coexists with a
 # live postgres for long.
 STOP_REQUESTED=0
