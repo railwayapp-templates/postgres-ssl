@@ -1978,6 +1978,9 @@ fork_post_upgrade_analyze() {
   [ "$(jq -r '.needsAnalyze // false' "$UPGRADE_MARKER_FILE" 2>/dev/null)" = "true" ] || return 0
   (
     trap '' INT TERM  # background helper — see "Process tree and the stop signal" before the foreground call
+    # fork_post_upgrade_reindex waits on this: the sentinel means the staged
+    # analyze is no longer running, whichever way it ended.
+    trap 'touch "$POST_UPGRADE_ANALYZE_DONE" 2>/dev/null' EXIT
     for _ in $(seq 1 120); do
       if pg_isready -q -h /var/run/postgresql -p 5432 2>/dev/null; then
         echo "post-upgrade: rebuilding planner statistics in stages"
@@ -2258,6 +2261,31 @@ fork_post_upgrade_reindex() {
     while ! pg_isready -q -h /var/run/postgresql -p 5432 2>/dev/null; do
       sleep 5; i=$((i+1)); [ "$i" -ge 120 ] && exit 0
     done
+    # The staged analyze forks on the same boot and works the same tables:
+    # ANALYZE takes ShareUpdateExclusiveLock on a table while REINDEX INDEX
+    # CONCURRENTLY needs that same lock and then waits out every transaction
+    # that saw the old index — with both in flight Postgres reports a
+    # deadlock, aborts the ANALYZE stage and the statistics rebuild is
+    # pushed to the next boot. Let the analyze finish first (either way —
+    # the sentinel marks completion, the flag marks success). The ceiling
+    # only bounds a wedged ANALYZE; past it the rebuild goes ahead so a
+    # stalled statistics pass can never hold up a collation repair forever.
+    if [ "$(jq -r '.needsAnalyze // false' "$UPGRADE_MARKER_FILE" 2>/dev/null)" = "true" ]; then
+      rx_wait_secs=${POST_UPGRADE_REINDEX_WAIT_SECONDS:-14400}
+      rx_wait_deadline=$(( $(date +%s) + rx_wait_secs ))
+      echo "post-upgrade: reindex waits for the staged statistics rebuild to finish"
+      while [ ! -e "$POST_UPGRADE_ANALYZE_DONE" ] \
+        && [ "$(jq -r '.needsAnalyze // false' "$UPGRADE_MARKER_FILE" 2>/dev/null)" = "true" ]; do
+        if [ "$(date +%s)" -ge "$rx_wait_deadline" ]; then
+          echo "post-upgrade: staged statistics rebuild still running after ${rx_wait_secs}s; reindex proceeds"
+          break
+        fi
+        sleep 5
+      done
+      if [ -e "$POST_UPGRADE_ANALYZE_DONE" ] || [ "$(jq -r '.needsAnalyze // false' "$UPGRADE_MARKER_FILE" 2>/dev/null)" != "true" ]; then
+        echo "post-upgrade: staged statistics rebuild finished; reindex check starts"
+      fi
+    fi
     pg_major=$(cat "$PGDATA/PG_VERSION" 2>/dev/null || echo "0")
     if [ "$pg_major" -lt 15 ] 2>/dev/null; then
       # Defensive only: the upgrade job's supported range (14-18) can never
@@ -2427,6 +2455,11 @@ bootstrap_pgbackrest_stanza
 fork_pgbackrest_backup_watcher
 fork_collation_refresh
 fork_extension_reconcile
+# Completion sentinel shared by the two post-upgrade forks below; lives in
+# the container's /tmp, not on the volume, and is cleared here because a
+# restarted container keeps its /tmp and hands this script the same PID.
+POST_UPGRADE_ANALYZE_DONE="/tmp/.post-upgrade-analyze-done.$$"
+rm -f "$POST_UPGRADE_ANALYZE_DONE" 2>/dev/null
 fork_post_upgrade_analyze
 fork_post_upgrade_config_restore
 fork_post_upgrade_reindex

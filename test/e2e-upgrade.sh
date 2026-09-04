@@ -642,16 +642,47 @@ t_analyze_staged() {
   wait_for_pg analyze-pg || { fail_dump analyze analyze-pg; return 1; }
   local deadline=$(($(date +%s) + 120))
   while [ "$(date +%s)" -lt "$deadline" ]; do
-    if [ "$(marker_field "$vol" needsAnalyze)" = "false" ]; then
-      stop_pg analyze-pg
-      return 0
-    fi
+    [ "$(marker_field "$vol" needsAnalyze)" = "false" ] && break
     sleep 5
   done
-  fail_dump analyze analyze-pg
+  if [ "$(marker_field "$vol" needsAnalyze)" != "false" ]; then
+    fail_dump analyze analyze-pg
+    stop_pg analyze-pg
+    echo "  needsAnalyze never flipped to false"
+    return 1
+  fi
+  # The collation reindex forks on the same boot and rebuilds indexes on the
+  # very tables the staged ANALYZE is sampling; run together they deadlock
+  # (ShareUpdateExclusiveLock vs REINDEX CONCURRENTLY's wait on the ANALYZE
+  # transaction) and the statistics pass is pushed to the next boot. The
+  # reindex must therefore start only after the analyze has finished: its
+  # first index touch — or its zero-work verdict — has to follow the
+  # "statistics rebuild complete" line, and the flag must still self-clear.
+  deadline=$(($(date +%s) + 180))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    [ "$(marker_field "$vol" needsReindex)" = "false" ] && break
+    sleep 5
+  done
+  local logs analyze_done reindex_start
+  logs=$(docker logs analyze-pg 2>&1)
+  assert_eq "$(marker_field "$vol" needsReindex)" "false" "reindex flag self-cleared on the same boot" || { fail_dump analyze analyze-pg; stop_pg analyze-pg; return 1; }
+  assert_contains "$logs" "reindex waits for the staged statistics rebuild" "reindex fork saw the pending analyze and waited" || { stop_pg analyze-pg; return 1; }
+  analyze_done=$(echo "$logs" | grep -n "post-upgrade: statistics rebuild complete" | head -1 | cut -d: -f1)
+  reindex_start=$(echo "$logs" | grep -nE "post-upgrade: (reindexing |reindexed [0-9]+ collation-dependent|no collation-dependent indexes to rebuild|collation library unchanged)" | head -1 | cut -d: -f1)
+  if [ -z "$analyze_done" ] || [ -z "$reindex_start" ] || [ "$analyze_done" -ge "$reindex_start" ]; then
+    echo "  expected the statistics rebuild to complete (line $analyze_done) before the reindex touched an index (line $reindex_start)"
+    echo "$logs" | grep -nE "post-upgrade: (statistics|reindex|no collation|collation library)" | sed 's/^/    /'
+    stop_pg analyze-pg
+    return 1
+  fi
+  if echo "$logs" | grep -q "deadlock detected"; then
+    echo "  the staged analyze and the reindex still deadlocked"
+    echo "$logs" | grep -n "deadlock" | sed 's/^/    /'
+    stop_pg analyze-pg
+    return 1
+  fi
   stop_pg analyze-pg
-  echo "  needsAnalyze never flipped to false"
-  return 1
+  return 0
 }
 
 # No marker, TO image on FROM data: the wrapper refuses with an explicit
