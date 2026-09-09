@@ -859,13 +859,24 @@ mode_check() {
 #     ready. wrapper.sh also treats a completed upgrade marker as proof of
 #     promoted recovery (defense in depth); this carry keeps the sentinels
 #     themselves truthful.
+#
+#   .railway_credentials — the postgres-ha image's credential pin: the role
+#     passwords the cluster was bootstrapped with, kept inside $PGDATA so
+#     clones and backups inherit them. pg_upgrade preserves the roles and
+#     their password hashes but knows nothing about this file, so without the
+#     carry the upgraded cluster boots with no pin and adopts whatever the
+#     variables say. On a cluster whose variables were edited after creation
+#     that adoption points Patroni at passwords the roles do not have, and the
+#     replicas reseeded after the upgrade cannot authenticate to the leader.
+#     Carried with its mode (0600) and owner. A standalone volume has no such
+#     file and is left exactly as before.
 carry_cluster_config() {
   local src="$1" dst="$2" f
   for f in pg_hba.conf pg_ident.conf; do
     [ -f "$src/$f" ] || continue
     cp -p "$src/$f" "$dst/$f" || die 3 "failed to carry $f into the new data dir"
   done
-  for f in .pitr_configured .pitr_staging .pgbackrest_restored; do
+  for f in .pitr_configured .pitr_staging .pgbackrest_restored .railway_credentials; do
     [ -f "$src/$f" ] || continue
     cp -p "$src/$f" "$dst/$f" || die 3 "failed to carry $f into the new data dir"
   done

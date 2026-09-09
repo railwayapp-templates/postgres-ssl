@@ -835,6 +835,46 @@ t_remote_auth_survives_upgrade() {
 # the SOURCE bucket and the database hangs at "the database system is
 # starting up" forever. The job must carry the sentinels across; the wrapper
 # must also treat the completed marker itself as proof (defense in depth).
+# The postgres-ha image pins the role passwords the cluster was created with
+# in $PGDATA/.railway_credentials (mode 0600, owner postgres) so a variable
+# edit cannot desynchronize Patroni from the roles. pg_upgrade preserves the
+# roles but not that file: the job must carry it, byte for byte and with its
+# mode, or the upgraded cluster adopts the (possibly edited) variables as its
+# pin and the reseeded replicas cannot authenticate to the leader. A volume
+# without the file (every standalone volume) must come out without one.
+t_credential_pin_survives_upgrade() {
+  local vol="upg-e2e-credpin"
+  local pin='{"superuser_pass":"su-original","repl_pass":"repl-original","app_pass":"app-original"}'
+  seed_from_cluster "$vol" || return 1
+  in_volume "$vol" "printf '%s' '$pin' > $PGDATA_IN_VOLUME/.railway_credentials \
+    && chown postgres:postgres $PGDATA_IN_VOLUME/.railway_credentials \
+    && chmod 0600 $PGDATA_IN_VOLUME/.railway_credentials" || return 1
+
+  run_job "$vol" upgrade
+  assert_eq "$JOB_RC" 0 "upgrade exit code" || { echo "$JOB_OUT" | tail -20; return 1; }
+
+  local carried
+  carried="$(in_volume "$vol" "cat $PGDATA_IN_VOLUME/.railway_credentials" 2>&1)"
+  assert_eq "$carried" "$pin" "credential pin carried byte for byte into the upgraded data dir" || return 1
+  local mode
+  mode="$(in_volume "$vol" "stat -c '%a %U' $PGDATA_IN_VOLUME/.railway_credentials" 2>&1)"
+  assert_eq "$mode" "600 postgres" "credential pin keeps mode 0600 and owner postgres" || return 1
+
+  # The upgraded cluster still boots and serves on the TO major with the pin
+  # in place (the standalone image does not read it; it must not trip on it).
+  run_pg credpin-after "$vol" "$TO_IMAGE" || return 1
+  wait_for_pg credpin-after || { fail_dump credpin-after credpin-after; return 1; }
+  stop_pg credpin-after
+
+  # A volume that never had a pin (every standalone volume) comes out without one.
+  local plain="upg-e2e-nopin"
+  seed_from_cluster "$plain" || return 1
+  run_job "$plain" upgrade
+  assert_eq "$JOB_RC" 0 "upgrade exit code (no pin)" || { echo "$JOB_OUT" | tail -20; return 1; }
+  in_volume "$plain" "test ! -e $PGDATA_IN_VOLUME/.railway_credentials" \
+    || { echo "  a credential pin appeared on a volume that never had one"; return 1; }
+}
+
 t_pitr_fork_survives_upgrade() {
   local vol="upg-e2e-pitrfork"
   local recover_env=(
@@ -2069,6 +2109,7 @@ ALL_TESTS=(
   t_resume_after_crash_between_swaps
   t_remote_auth_survives_upgrade
   t_pitr_fork_survives_upgrade
+  t_credential_pin_survives_upgrade
   t_second_upgrade_reaches_next_major
   t_chained_upgrade_reclaims_by_own_age
   t_custom_initdb_args_checksums_flag_wins
