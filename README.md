@@ -71,6 +71,52 @@ docker run ghcr.io/railwayapp-templates/postgres-ssl:17
 docker run ghcr.io/railwayapp-templates/postgres-ssl:17.6
 ```
 
+### Base distro
+
+Every `Dockerfile.<major>` (and `Dockerfile.upgrade`) builds `FROM
+postgres:<version>-${DEBIAN_RELEASE}` with `DEBIAN_RELEASE` pinned
+explicitly — currently `trixie` (Debian 13, glibc 2.41) for every major.
+
+The unsuffixed upstream tag (`postgres:16`) is a floating alias for whichever
+Debian release docker-library currently prefers. It moved from bookworm
+(glibc 2.36) to trixie (glibc 2.41) with no change in this repository, and the
+daily rebuild republished the same `:16` tag on the new glibc. That is not a
+cosmetic change: **a glibc bump changes libc collation order, which silently
+invalidates every btree index on collatable text columns of a volume
+initialized under the old glibc** — rows become unfindable through the index,
+unique constraints stop holding, and foreign-key checks fail on rows that are
+demonstrably there. PostgreSQL warns about the collation version mismatch on
+every connection until the recorded version is refreshed; the wrapper now
+reindexes before it refreshes (see [Collation drift at boot](#collation-drift-at-boot)),
+but the distro must never move as a side effect of a nightly rebuild.
+
+`trixie` was chosen because every published tag was already on it when the pin
+landed (the published image config carries `PG_VERSION=<minor>-1.pgdg13+N` —
+`pgdg13` is trixie, `pgdg12` bookworm — which is also how to check what a
+published tag runs on without pulling it). Moving a major back to bookworm
+would flip glibc a second time under every volume that has since been
+reindexed on trixie.
+
+To move a major to another release deliberately:
+
+1. Change `ARG DEBIAN_RELEASE=` in `Dockerfile.<major>` (and `Dockerfile.upgrade`
+   if the upgrade job's target majors move — pg_upgrade stamps the new cluster's
+   collation versions with the job image's glibc, so it must match the runtime
+   image that will serve the upgraded cluster). One PR, reviewed as a
+   glibc/ICU change, not a packaging tweak.
+2. Confirm `postgres:<minor>-<release>` exists upstream for every per-minor tag
+   the build workflow still rebuilds (it rebuilds every published minor, not
+   just the newest; `curl -s https://registry-1.docker.io/v2/library/postgres/tags/list`
+   with an anonymous pull token lists them).
+3. Expect the next boot of every volume on that major to detect the collation
+   version change and rebuild its collation-dependent indexes concurrently
+   before refreshing the version stamps. Plan the rollout around that load;
+   large text-heavy databases reindex for a while.
+
+The build workflow's content gate reads `DEBIAN_RELEASE` from the Dockerfile
+and probes `postgres:<minor>-<release>`, so a rebuild is triggered by changes
+to the *pinned* base, never by upstream moving the alias.
+
 ### Point-in-time recovery (opt-in)
 
 The image ships with [pgBackRest](https://pgbackrest.org/) installed but

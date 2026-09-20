@@ -10,7 +10,13 @@
 # status / manifest modes, documented in the script header. It runs against
 # the database service's own volume while the service is stopped.
 ARG TO_VERSION=17
-FROM postgres:${TO_VERSION}
+# Same explicit distro pin as the runtime images (see Dockerfile.<major>):
+# pg_upgrade initdb's the target cluster and stamps its collation versions
+# with THIS image's glibc, so the job must run on the same Debian release
+# as the runtime image that will serve the upgraded cluster — otherwise the
+# first runtime boot sees a spurious (or, worse, masked) collation change.
+ARG DEBIAN_RELEASE=trixie
+FROM postgres:${TO_VERSION}-${DEBIAN_RELEASE}
 
 ARG FROM_VERSION=16
 ARG TO_VERSION
