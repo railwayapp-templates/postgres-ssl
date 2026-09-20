@@ -664,10 +664,51 @@ Scope and caveats for both post-upgrade self-heals (this reindex and the
   postgres-ha cluster members boot a different image without these forks,
   so on HA volumes the flags never self-clear and the dashboard-driven flow
   resolves them.
-- The self-heal covers upgrades only. A plain image rebuild that ships a
-  newer glibc/ICU **without** a major upgrade leaves no marker, and on such
-  boots `wrapper.sh`'s collation-version refresh still only silences the
-  version-mismatch warnings — it does not rebuild indexes.
+- The marker-driven self-heal covers upgrades. A plain image rebuild that
+  ships a newer glibc/ICU **without** a major upgrade leaves no marker; that
+  case is handled by the boot-time check below, which shares the same
+  detect → rebuild → refresh machinery.
+
+#### Collation drift at boot
+
+On every boot (PG13+), once the database is out of recovery, `wrapper.sh`
+compares every database's recorded collation versions with what the image's
+libraries actually provide: the database default's `datcollversion` (PG15+)
+and every named libc/ICU collation's `collversion` (PG13+). Current stamps
+everywhere — the common case — cost a few catalog reads and no writes
+(`collation-refresh: collation versions current in every database; nothing to do`).
+
+A mismatch means the collation library changed under the volume: a same-tag
+image rebuild on a newer Debian, a glibc/ICU security update, or a
+bookworm-era backup restored onto a trixie image. The wrapper then:
+
+- logs the mismatch per database (recorded vs. provided version),
+- rebuilds every index that depends on a changed collation — the database
+  default, any stale named collation, and (when any stamp of a provider
+  proves that library changed) every predefined collation of that provider —
+  with `REINDEX INDEX CONCURRENTLY`, one log line per index, falling back to
+  a plain `REINDEX` only for exclusion-constraint indexes,
+- refreshes that database's version stamps (`ALTER COLLATION … REFRESH
+  VERSION`, `ALTER DATABASE … REFRESH COLLATION VERSION`) **only after every
+  rebuild in it succeeded**.
+
+If any rebuild fails, that database's stamps are left stale on purpose:
+PostgreSQL keeps warning on every connection, the wrapper logs a WARNING
+naming the count, and the next boot retries. The stale stamps are the
+pending-work flag, so the process is idempotent across restarts and needs no
+marker on the volume. C/POSIX collations are never versioned and never
+rebuilt.
+
+History: before this check existed, the boot-time refresh ran `ALTER DATABASE
+… REFRESH COLLATION VERSION` **without** reindexing, so a same-tag rebuild
+that moved the base from bookworm (glibc 2.36) to trixie (glibc 2.41)
+silenced the warning and left the indexes invalid (incident of 2026-08-29).
+A volume that went through that refresh still has its named libc collation
+rows stamped with the old glibc — the old code never refreshed those — and
+the provider inference above treats that as proof the library changed, so
+such a volume is rebuilt on its first boot with the current wrapper. A
+volume whose named stamps were *also* refreshed by hand leaves no evidence
+and needs a one-off `REINDEX DATABASE`.
 
 ### Archive re-anchoring
 
