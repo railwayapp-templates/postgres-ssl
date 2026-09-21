@@ -738,6 +738,186 @@ t_collation_refresh_no_permission_error() {
   docker volume rm "$vol" >/dev/null
 }
 
+
+# psql helpers for the collation-drift tests below: run SQL in a container as
+# the postgres superuser, either for its scalar result or as a must-succeed
+# statement (failure prints psql's own error).
+cd_psql_in() { docker exec "$1" psql -U postgres -At -c "$2" 2>/dev/null; }
+cd_psql_must() {
+  local out
+  if ! out=$(docker exec "$1" psql -U postgres -v ON_ERROR_STOP=1 -c "$2" 2>&1); then
+    echo "  psql failed: $2"
+    echo "$out" | sed 's/^/    /'
+    return 1
+  fi
+}
+
+t_collation_drift_reindexes_before_refresh() {
+  # The same-major rebuild class of collation drift (incident of 2026-08-29:
+  # :16 moved from bookworm glibc 2.36 to trixie glibc 2.41 under a live
+  # volume, and the wrapper refreshed the collation version WITHOUT
+  # reindexing — rows became unfindable through their indexes). No marker is
+  # involved; the stale stamps are the only evidence. A faked datcollversion
+  # plus a faked named-collation version forces the shape deterministically:
+  # the fork must log the mismatch, rebuild the dependent indexes
+  # (CONCURRENTLY; non-concurrently for the exclusion index), and only then
+  # refresh the stamps. Second act: only a PREDEFINED libc collation row is
+  # stale while the default stamp reads current — the shape the pre-fix
+  # blind refresh left behind on every affected volume — and the default-
+  # collation index must still be rebuilt (provider inference). Third act:
+  # a clean restart does zero work.
+  local t=t_collation_drift_reindexes_before_refresh
+  local name=t-colldrift-${PG_VERSION}
+  local vol=${name}-vol
+  if ! rebuild_image; then ko "$t" "could not rebuild $IMAGE"; return; fi
+  new_volume "$vol"
+  docker rm -f "$name" >/dev/null 2>&1 || true
+  docker run -d --name "$name" --label postgres-ssl-e2e=1 --network "$NET" \
+    -e POSTGRES_PASSWORD=test \
+    -v "$vol:/var/lib/postgresql/data" \
+    "$IMAGE" >/dev/null
+  wait_for_pg "$name" || { ko "$t" "postgres did not start"; fail_dump "$t" "$name"; return; }
+  # Fresh volume, same library as the image: the boot-time check must find
+  # nothing to do and must not touch a single index.
+  wait_for_log_line "$name" "collation-refresh: collation versions current in every database; nothing to do" 60 \
+    || { ko "$t" "first boot did not report current collation versions"; fail_dump "$t" "$name"; return; }
+
+  cd_psql_must "$name" "CREATE TABLE ct(a text); INSERT INTO ct SELECT g::text FROM generate_series(1,500) g; CREATE INDEX ct_a_idx ON ct(a)" || { ko "$t" "seed failed"; return; }
+  # Exclusion-constraint index on a collatable column: REINDEX CONCURRENTLY
+  # refuses these, so the fork must take the plain REINDEX path for it.
+  cd_psql_must "$name" "CREATE EXTENSION btree_gist; CREATE TABLE ex(r text, EXCLUDE USING gist (r WITH =)); INSERT INTO ex VALUES ('ea'), ('eb')" || { ko "$t" "seed failed"; return; }
+  # A user-created libc collation with quote-needing names, and an index on
+  # a uuid column — never collatable, must never be touched.
+  cd_psql_must "$name" "CREATE SCHEMA \"Weird Schema\"; CREATE COLLATION \"Weird Schema\".\"my coll\" (provider = libc, locale = 'en_US.utf8'); CREATE TABLE \"Weird Schema\".\"w t\"(a text COLLATE \"Weird Schema\".\"my coll\", u uuid); INSERT INTO \"Weird Schema\".\"w t\" VALUES ('x1', gen_random_uuid()), ('x2', gen_random_uuid()); CREATE INDEX \"w idx\" ON \"Weird Schema\".\"w t\"(a); CREATE INDEX w_u_idx ON \"Weird Schema\".\"w t\"(u)" || { ko "$t" "seed failed"; return; }
+
+  # Act 1: fake the recorded default-collation version AND the named
+  # collation's version, restart.
+  cd_psql_must "$name" "SET allow_system_table_mods = on; UPDATE pg_database SET datcollversion = '0.fake' WHERE datname = current_database()" || { ko "$t" "could not fake datcollversion"; return; }
+  cd_psql_must "$name" "SET allow_system_table_mods = on; UPDATE pg_collation SET collversion = '0.fake' WHERE collname = 'my coll'" || { ko "$t" "could not fake collversion"; return; }
+  docker restart "$name" >/dev/null
+  wait_for_pg "$name" || { ko "$t" "postgres did not restart"; fail_dump "$t" "$name"; return; }
+  wait_for_log_line "$name" "collation-refresh: rebuilt " 180 \
+    || { ko "$t" "the collation-drift rebuild did not complete after the forced mismatch"; fail_dump "$t" "$name"; return; }
+  local logs
+  logs=$(docker logs "$name" 2>&1)
+  assert_contains "$logs" "collation-refresh: postgres: collation version mismatch — default collation recorded 0.fake" "mismatch logged with recorded vs. provided version" || { ko "$t" "mismatch not logged"; fail_dump "$t" "$name"; return; }
+  assert_contains "$logs" "collation-refresh: reindexing postgres.public.ct_a_idx (collation version changed)" "default-collation index rebuilt concurrently" || { ko "$t" "ct_a_idx not rebuilt"; fail_dump "$t" "$name"; return; }
+  assert_contains "$logs" "non-concurrently (exclusion constraint" "exclusion index took the non-concurrent path" || { ko "$t" "exclusion index path"; fail_dump "$t" "$name"; return; }
+  assert_contains "$logs" 'collation-refresh: reindexing postgres."Weird Schema"."w idx" (collation version changed)' "quote-needing index rebuilt" || { ko "$t" "w idx not rebuilt"; fail_dump "$t" "$name"; return; }
+  if echo "$logs" | grep -q "w_u_idx"; then
+    ko "$t" "uuid index was rebuilt although uuid is not collatable"
+    fail_dump "$t" "$name"; return
+  fi
+  # Order of operations is the whole point: every "reindexing" line must
+  # precede the line that announces refreshed stamps.
+  local last_reindex first_refresh
+  last_reindex=$(echo "$logs" | grep -n "collation-refresh: reindexing " | tail -1 | cut -d: -f1)
+  first_refresh=$(echo "$logs" | grep -n "collation-refresh: rebuilt .*collation version stamps refreshed" | head -1 | cut -d: -f1)
+  if [ -z "$last_reindex" ] || [ -z "$first_refresh" ] || [ "$last_reindex" -ge "$first_refresh" ]; then
+    ko "$t" "stamps were refreshed (line ${first_refresh:-?}) before the last rebuild (line ${last_reindex:-?})"
+    fail_dump "$t" "$name"; return
+  fi
+  assert_eq "$(cd_psql_in "$name" 'SELECT (datcollversion IS NOT DISTINCT FROM pg_database_collation_actual_version(oid))::int FROM pg_database WHERE datname = current_database()')" "1" "default version stamp refreshed after the rebuild" || { ko "$t" "default stamp not refreshed"; fail_dump "$t" "$name"; return; }
+  assert_eq "$(cd_psql_in "$name" "SELECT (collversion IS NOT DISTINCT FROM pg_collation_actual_version(oid))::int FROM pg_collation WHERE collname = 'my coll'")" "1" "named collation stamp refreshed" || { ko "$t" "named stamp not refreshed"; fail_dump "$t" "$name"; return; }
+  assert_eq "$(cd_psql_in "$name" "SELECT count(*) FROM pg_index WHERE NOT indisvalid")" "0" "no invalid indexes left behind" || { ko "$t" "invalid index left"; fail_dump "$t" "$name"; return; }
+  assert_eq "$(cd_psql_in "$name" "SELECT count(*) FROM ct WHERE a = '250'")" "1" "rebuilt index answers queries" || { ko "$t" "index lookup"; fail_dump "$t" "$name"; return; }
+
+  # Act 2: the shape the pre-fix wrapper left on every affected volume —
+  # the default stamp already refreshed (reads current), but the predefined
+  # libc rows the blind refresh never touched still carry the old glibc.
+  # The default-collation index must be rebuilt from that evidence alone.
+  cd_psql_must "$name" "SET allow_system_table_mods = on; UPDATE pg_collation SET collversion = '0.fake' WHERE collname = 'en_US.utf8' AND collprovider = 'c'" || { ko "$t" "could not fake predefined collversion"; return; }
+  assert_eq "$(cd_psql_in "$name" "SELECT count(*) FROM pg_collation WHERE collversion = '0.fake'")" "1" "predefined en_US.utf8 row exists to fake" || { ko "$t" "no en_US.utf8 row"; fail_dump "$t" "$name"; return; }
+  docker restart "$name" >/dev/null
+  wait_for_pg "$name" || { ko "$t" "postgres did not restart (act 2)"; fail_dump "$t" "$name"; return; }
+  local before_count
+  before_count=$(echo "$logs" | grep -c "collation-refresh: rebuilt ")
+  local deadline=$(($(date +%s) + 180))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    [ "$(docker logs "$name" 2>&1 | grep -c "collation-refresh: rebuilt ")" -gt "$before_count" ] && break
+    sleep 2
+  done
+  logs=$(docker logs "$name" 2>&1)
+  [ "$(echo "$logs" | grep -c "collation-refresh: rebuilt ")" -gt "$before_count" ] \
+    || { ko "$t" "act 2: rebuild did not complete with only a predefined libc row stale"; fail_dump "$t" "$name"; return; }
+  assert_contains "$logs" "collation-refresh: postgres: collation version mismatch — 1 named collation(s) recorded under a different library version" "act 2: named-only mismatch logged" || { ko "$t" "act 2 mismatch log"; fail_dump "$t" "$name"; return; }
+  [ "$(echo "$logs" | grep -c "collation-refresh: reindexing postgres.public.ct_a_idx ")" -eq 2 ] \
+    || { ko "$t" "act 2: default-collation index not rebuilt from a stale predefined libc row (provider inference)"; fail_dump "$t" "$name"; return; }
+  assert_eq "$(cd_psql_in "$name" "SELECT count(*) FROM pg_collation WHERE collversion IS NOT NULL AND collversion IS DISTINCT FROM pg_collation_actual_version(oid)")" "0" "act 2: every named stamp refreshed" || { ko "$t" "act 2 stamps"; fail_dump "$t" "$name"; return; }
+
+  # Act 3: clean restart, zero work.
+  docker restart "$name" >/dev/null
+  wait_for_pg "$name" || { ko "$t" "postgres did not restart (act 3)"; fail_dump "$t" "$name"; return; }
+  deadline=$(($(date +%s) + 60))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    [ "$(docker logs "$name" 2>&1 | grep -c "collation versions current in every database; nothing to do")" -ge 2 ] && break
+    sleep 2
+  done
+  logs=$(docker logs "$name" 2>&1)
+  [ "$(echo "$logs" | grep -c "collation versions current in every database; nothing to do")" -ge 2 ] \
+    || { ko "$t" "act 3: clean restart did not report current versions"; fail_dump "$t" "$name"; return; }
+  [ "$(echo "$logs" | grep -c "collation-refresh: rebuilt ")" -eq 2 ] \
+    || { ko "$t" "act 3: a clean restart rebuilt indexes again"; fail_dump "$t" "$name"; return; }
+
+  ok "$t"
+  note "mismatch -> REINDEX (concurrent; plain for the exclusion index) -> refresh; stale predefined libc row alone triggers the default-collation rebuild; clean restart is a no-op"
+  docker rm -f "$name" >/dev/null
+  docker volume rm "$vol" >/dev/null
+}
+
+t_collation_drift_failed_reindex_keeps_stamps_stale() {
+  # If a rebuild fails the stamps must stay stale — refreshing them would
+  # silence PostgreSQL's warning over an index that is still invalid, which
+  # is the exact failure mode of the pre-fix wrapper. An expression index
+  # whose function raises under a database-level GUC makes REINDEX fail
+  # deterministically; clearing the GUC and restarting must then heal.
+  local t=t_collation_drift_failed_reindex_keeps_stamps_stale
+  local name=t-colldrift-fail-${PG_VERSION}
+  local vol=${name}-vol
+  if ! rebuild_image; then ko "$t" "could not rebuild $IMAGE"; return; fi
+  new_volume "$vol"
+  docker rm -f "$name" >/dev/null 2>&1 || true
+  docker run -d --name "$name" --label postgres-ssl-e2e=1 --network "$NET" \
+    -e POSTGRES_PASSWORD=test \
+    -v "$vol:/var/lib/postgresql/data" \
+    "$IMAGE" >/dev/null
+  wait_for_pg "$name" || { ko "$t" "postgres did not start"; fail_dump "$t" "$name"; return; }
+  wait_for_log_line "$name" "collation-refresh: collation versions current in every database; nothing to do" 60 \
+    || { ko "$t" "first boot did not report current collation versions"; fail_dump "$t" "$name"; return; }
+
+  cd_psql_must "$name" "CREATE FUNCTION boom(t text) RETURNS text IMMUTABLE LANGUAGE plpgsql AS \$f\$ BEGIN IF current_setting('e2e.boom', true) = 'on' THEN RAISE EXCEPTION 'boom'; END IF; RETURN t; END \$f\$" || { ko "$t" "seed failed"; return; }
+  cd_psql_must "$name" "CREATE TABLE bt(a text); INSERT INTO bt SELECT g::text FROM generate_series(1,100) g; CREATE INDEX bt_boom_idx ON bt (boom(a)); CREATE INDEX bt_a_idx ON bt (a)" || { ko "$t" "seed failed"; return; }
+  cd_psql_must "$name" "ALTER DATABASE postgres SET e2e.boom = 'on'" || { ko "$t" "could not arm the failing index"; return; }
+  cd_psql_must "$name" "SET allow_system_table_mods = on; UPDATE pg_database SET datcollversion = '0.fake' WHERE datname = current_database()" || { ko "$t" "could not fake datcollversion"; return; }
+  docker restart "$name" >/dev/null
+  wait_for_pg "$name" || { ko "$t" "postgres did not restart"; fail_dump "$t" "$name"; return; }
+  wait_for_log_line "$name" "collation-refresh: WARNING: 1 database(s) still have collation-dependent indexes that could not be rebuilt" 180 \
+    || { ko "$t" "failed rebuild was not reported loudly"; fail_dump "$t" "$name"; return; }
+  local logs
+  logs=$(docker logs "$name" 2>&1)
+  assert_contains "$logs" "postgres.public.bt_boom_idx: reindex failed; will retry on next boot" "failing index named in the log" || { ko "$t" "failure line"; fail_dump "$t" "$name"; return; }
+  assert_contains "$logs" "collation-refresh: reindexing postgres.public.bt_a_idx (collation version changed)" "the healthy index in the same database was still rebuilt" || { ko "$t" "bt_a_idx"; fail_dump "$t" "$name"; return; }
+  if echo "$logs" | grep -q "collation version stamps refreshed"; then
+    ko "$t" "stamps were reported refreshed despite a failed rebuild"
+    fail_dump "$t" "$name"; return
+  fi
+  assert_eq "$(cd_psql_in "$name" "SELECT datcollversion FROM pg_database WHERE datname = current_database()")" "0.fake" "default stamp left stale after the failed rebuild" || { ko "$t" "stamp was refreshed"; fail_dump "$t" "$name"; return; }
+  # The leftover of the failed CONCURRENTLY attempt must not accumulate:
+  # the next boot drops *_ccnew before retrying.
+  cd_psql_must "$name" "ALTER DATABASE postgres RESET e2e.boom" || { ko "$t" "could not disarm"; return; }
+  docker restart "$name" >/dev/null
+  wait_for_pg "$name" || { ko "$t" "postgres did not restart (heal)"; fail_dump "$t" "$name"; return; }
+  wait_for_log_line "$name" "collation-refresh: rebuilt " 180 \
+    || { ko "$t" "retry on the next boot did not heal"; fail_dump "$t" "$name"; return; }
+  assert_eq "$(cd_psql_in "$name" 'SELECT (datcollversion IS NOT DISTINCT FROM pg_database_collation_actual_version(oid))::int FROM pg_database WHERE datname = current_database()')" "1" "default stamp refreshed once every rebuild succeeded" || { ko "$t" "stamp not refreshed after heal"; fail_dump "$t" "$name"; return; }
+  assert_eq "$(cd_psql_in "$name" "SELECT count(*) FROM pg_index WHERE NOT indisvalid")" "0" "no invalid *_ccnew leftovers" || { ko "$t" "invalid leftovers"; fail_dump "$t" "$name"; return; }
+
+  ok "$t"
+  note "failed rebuild -> stamps stay stale + WARNING; disarmed retry on next boot heals and refreshes"
+  docker rm -f "$name" >/dev/null
+  docker volume rm "$vol" >/dev/null
+}
+
 t_invalid_bucket_skips_archive() {
   # Sets WAL_ARCHIVE_BUCKET to junk shapes the upstream resolver might leak
   # (unresolved Railway template ref + bucket-id UUID). The image guard must
@@ -5023,6 +5203,8 @@ ALL_TESTS=(
   t_requested_stop_still_exits_zero
   t_stop_is_clean_and_restart_keeps_watcher
   t_collation_refresh_no_permission_error
+  t_collation_drift_reindexes_before_refresh
+  t_collation_drift_failed_reindex_keeps_stamps_stale
   t_invalid_bucket_skips_archive
   t_archiving_boot
   t_archiving_boot_survives_pghostaddr

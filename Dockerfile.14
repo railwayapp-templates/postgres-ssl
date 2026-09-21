@@ -1,5 +1,25 @@
 ARG POSTGRES_VERSION=14
-FROM postgres:${POSTGRES_VERSION}
+# Base distro pinned EXPLICITLY. The unsuffixed upstream tag
+# (postgres:14) is a floating alias for whichever Debian release
+# docker-library currently prefers; it moved from bookworm (glibc 2.36) to
+# trixie (glibc 2.41) without any change in this repo, and the daily rebuild
+# republished the same :14 tag on the new glibc. A glibc bump changes libc
+# collation order, which silently invalidates every btree index on collatable
+# text columns of a volume initialized under the old glibc (rows become
+# unfindable through the index). The wrapper now reindexes before it
+# refreshes collation versions, but the distro must never move as a side
+# effect of a nightly rebuild. Every published postgres-ssl tag was on
+# trixie when this pin landed (image config: PG_VERSION=*.pgdg13+*), so
+# trixie is the value that changes nothing; moving it is a deliberate act:
+#   1. change this ARG in one PR (all majors, or one major on purpose),
+#   2. accept that the next boot of every volume on that major reindexes its
+#      collation-dependent indexes (see README "Base distro"),
+#   3. confirm the upstream tag exists for every minor the build workflow
+#      still rebuilds (it rebuilds every published per-minor tag).
+# The build workflow's content gate reads this ARG so it tracks the pinned
+# base, not the floating alias.
+ARG DEBIAN_RELEASE=trixie
+FROM postgres:${POSTGRES_VERSION}-${DEBIAN_RELEASE}
 # Extension packages are pinned AT THE MINOR: the volume keeps each
 # extension's SQL catalog at install-time version while the image carries
 # the .so, and this tag is rebuilt daily - an unpinned package would let

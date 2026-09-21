@@ -144,9 +144,15 @@ jobs:
           set -o pipefail
           IMG="ghcr.io/${{ github.repository }}"
           TAG="${{ matrix.minor }}"
-          BASE="postgres:${{ matrix.minor }}"
-
+          # The base the Dockerfile really builds on: the distro-suffixed
+          # upstream tag. Probing the unsuffixed alias here would key the
+          # gate on a base the image no longer uses (and would follow the
+          # alias the day upstream moves it again).
           GATE_OK=true
+          DISTRO=$(sed -nE 's/^ARG DEBIAN_RELEASE=([a-z0-9]+)$/\1/p' "Dockerfile.${{ matrix.major }}") || GATE_OK=false
+          [ -n "$DISTRO" ] || GATE_OK=false
+          BASE="postgres:${{ matrix.minor }}-${DISTRO}"
+
           CODE_KEY=$(git ls-tree HEAD | grep -E "\.sh$|Dockerfile\.${{ matrix.major }}$" | sha256sum | cut -c1-16) || GATE_OK=false
           BASE_DIGEST=$(docker buildx imagetools inspect "$BASE" --format '{{json .Manifest.Digest}}' | tr -d '"') || GATE_OK=false
           docker pull -q "$BASE" >/dev/null || GATE_OK=false
@@ -265,9 +271,12 @@ jobs:
           set -o pipefail
           IMG="ghcr.io/${{ github.repository }}/upgrade"
           TAG="${{ matrix.from }}-${{ matrix.to }}"
-          BASE="postgres:${{ matrix.to }}"
-
+          # Distro-suffixed base, read from the Dockerfile (see build-postgres).
           GATE_OK=true
+          DISTRO=$(sed -nE 's/^ARG DEBIAN_RELEASE=([a-z0-9]+)$/\1/p' Dockerfile.upgrade) || GATE_OK=false
+          [ -n "$DISTRO" ] || GATE_OK=false
+          BASE="postgres:${{ matrix.to }}-${DISTRO}"
+
           CODE_KEY=$(git ls-tree HEAD | grep -E "\.sh$|Dockerfile\.upgrade$" | sha256sum | cut -c1-16) || GATE_OK=false
           BASE_DIGEST=$(docker buildx imagetools inspect "$BASE" --format '{{json .Manifest.Digest}}' | tr -d '"') || GATE_OK=false
           docker pull -q "$BASE" >/dev/null || GATE_OK=false
