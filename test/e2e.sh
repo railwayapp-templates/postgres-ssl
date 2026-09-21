@@ -242,17 +242,31 @@ run_archiving_pg() {
     "${ARCHIVING_PG_IMAGE:-$IMAGE}" >/dev/null
 }
 
-# Wait for postgres to accept connections. 120 s default — restored
-# clusters need pgbackrest's archive-get to fetch + apply each WAL segment
-# during recovery, which adds tens of seconds under suite-load (multiple
-# concurrent docker-execs, MinIO contending for I/O). 60 s was the original
-# vanilla-boot ceiling and was tight even there; the bump is harmless for
-# fast paths (returns as soon as pg_isready succeeds) and load-bearing for
-# restore + recovery paths.
+# Wait for the FINAL postgres to accept connections — never the temporary
+# postmaster docker-entrypoint starts during initdb. That temp server is
+# launched with listen_addresses='' (Unix socket only), so a socket-based
+# pg_isready happily matches it and then the next psql lands in the
+# shutdown gap ("No such file or directory" / "shutting down"). TCP to
+# 127.0.0.1 only answers for the real server the CMD starts with
+# listen_addresses=*. Same discriminator as bootstrap_pgbackrest_stanza
+# in wrapper.sh and wait_for_pg in e2e-upgrade.sh.
+#
+# PGHOSTADDR/PGHOST are cleared for the probe: libpq lets PGHOSTADDR
+# override even an explicit -h, so a container started with a bogus
+# PGHOSTADDR (t_archiving_boot_survives_pghostaddr shape) would otherwise
+# make this helper always fail. Clearing them only affects the exec'd
+# probe process, not the container's env.
+#
+# 120 s default — restored clusters need pgbackrest's archive-get to
+# fetch + apply each WAL segment during recovery, which adds tens of
+# seconds under suite-load. 60 s was the original vanilla-boot ceiling
+# and was tight even there; the bump is harmless for fast paths and
+# load-bearing for restore + recovery paths.
 wait_for_pg() {
   local container="$1" deadline=$(($(date +%s) + 120))
   while [ "$(date +%s)" -lt "$deadline" ]; do
-    if docker exec "$container" pg_isready -U postgres -q 2>/dev/null; then
+    if docker exec -e PGHOSTADDR= -e PGHOST= "$container" \
+         pg_isready -q -h 127.0.0.1 -p 5432 -U postgres 2>/dev/null; then
       return 0
     fi
     # Bail early if the container has exited — no point polling a dead
@@ -531,9 +545,9 @@ t_requested_stop_still_exits_zero() {
     -e PGDATA=/var/lib/postgresql/data/pgdata \
     -v "$vol:/var/lib/postgresql/data" \
     "$IMAGE" >/dev/null
-  # First boot on a fresh volume: pg_isready answers the initdb TEMP
-  # postmaster too, so wait for the entrypoint to hand off to the final
-  # server before signaling anything.
+  # wait_for_pg already discriminates the final server via TCP, but this
+  # test signals TERM immediately after ready — keep the init-complete
+  # log gate so we never race a still-finishing entrypoint handoff.
   wait_for_log_line "$name" "init process complete" 120 \
     || { ko t_requested_stop_still_exits_zero "initdb did not complete"; fail_dump t_requested_stop_still_exits_zero "$name"; return; }
   wait_for_pg "$name" || { ko t_requested_stop_still_exits_zero "postgres did not start"; fail_dump t_requested_stop_still_exits_zero "$name"; return; }
@@ -1046,29 +1060,11 @@ t_archiving_boot_survives_pghostaddr() {
   docker rm -f "$name" >/dev/null 2>&1 || true
   run_archiving_pg "$name" "$vol" -e "PGHOSTADDR=10.255.255.1"
   docker container update --label-add postgres-ssl-e2e=1 "$name" >/dev/null 2>&1 || true
-  # wait_for_pg's own readiness probe (docker exec ... pg_isready, no -h)
-  # would ALWAYS fail here regardless of wrapper.sh's own fix, and NOT
-  # because of an -h precedence subtlety: verified empirically that
-  # PGHOSTADDR overrides even an explicit socket-path -h (pg_isready -h
-  # /var/run/postgresql still tries the bogus TCP address and fails) — it
-  # unconditionally forces a TCP connection to that address, full stop.
-  # This is a test-infrastructure limitation, not the product's: `docker
-  # exec` always sees the CONTAINER's declared env (what `docker run -e`
-  # set), never whatever wrapper.sh's already-running process later unset
-  # in its own memory — an unset inside one process can't retroactively
-  # change what a brand-new exec'd process sees, and there is no `-h` value
-  # that out-ranks PGHOSTADDR once it's present in that process's own
-  # environment. So the check itself must clear it for the exec, same as
-  # wrapper.sh clears it for what it forks.
-  local deadline=$(($(date +%s) + 120)) ready=0
-  while [ "$(date +%s)" -lt "$deadline" ]; do
-    if docker exec -e PGHOSTADDR= "$name" pg_isready -U postgres -q 2>/dev/null; then
-      ready=1
-      break
-    fi
-    sleep 1
-  done
-  [ "$ready" = "1" ] || { ko t_archiving_boot_survives_pghostaddr "postgres did not start"; fail_dump t_archiving_boot_survives_pghostaddr "$name"; return; }
+  # wait_for_pg clears PGHOSTADDR for its own probe (libpq lets it override
+  # any -h), so a container started with a bogus address still answers.
+  # The product assertion below is that stanza-create itself survives —
+  # wrapper.sh unsets PGHOSTADDR before forking those subshells.
+  wait_for_pg "$name" || { ko t_archiving_boot_survives_pghostaddr "postgres did not start"; fail_dump t_archiving_boot_survives_pghostaddr "$name"; return; }
 
   # A wider deadline than t_archiving_boot's 15s: stanza-create can hit a
   # transient lock-contention retry (30s backoff, unrelated to PGHOSTADDR —
@@ -3609,10 +3605,10 @@ t_reanchor_backfills_missing_anchor() {
     fail_dump "${FUNCNAME[0]}" "$name"
     return
   fi
-  # Poll rather than single-shot: wait_for_pg's socket probe also answers for
-  # docker-entrypoint's TEMPORARY initdb-time server, so under suite load this
-  # read can land before 99-pgbackrest-init.sh has written the marker. The
-  # marker is guaranteed by END of init; give it a bounded window.
+  # Poll rather than single-shot: the marker is written by the init script
+  # before the final server binds TCP (so wait_for_pg returning should be
+  # enough), but docker's volume mount visibility has been observed to lag
+  # a beat under suite load. Bounded window, fail loud if still missing.
   local path_before="" _deadline=$(($(date +%s) + 30))
   while [ "$(date +%s)" -lt "$_deadline" ]; do
     path_before=$(docker exec "$name" cat /var/lib/postgresql/data/.pgbackrest_repo_path 2>/dev/null)
