@@ -3664,6 +3664,303 @@ t_reanchor_backfills_missing_anchor() {
   docker volume rm "$vol" >/dev/null
 }
 
+# ----- unusable repo-path marker / WAL_ARCHIVE_PATH --------------------------
+
+# Run a shell snippet as root against a stopped volume with the suite's own
+# image (PGDATA is the volume root for these tests).
+in_stopped_volume_self() {
+  local vol="$1" snippet="$2"
+  docker run --rm --label postgres-ssl-e2e=1 \
+    -v "$vol:/var/lib/postgresql/data" --entrypoint /bin/sh "$IMAGE" -c "$snippet"
+}
+
+# Poll until the repo-path marker exists and echo it (empty on timeout).
+read_repo_marker_when_present() {
+  local container="$1" deadline=$(($(date +%s) + 30)) path=""
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    path=$(docker exec "$container" cat /var/lib/postgresql/data/.pgbackrest_repo_path 2>/dev/null)
+    [ -n "$path" ] && break
+    sleep 1
+  done
+  printf '%s' "$path"
+}
+
+# Force a WAL switch and wait (default 60s) for at least one archived segment
+# under <path>/archive. Returns 0 once one lands.
+wait_for_wal_under_path() {
+  local container="$1" path="$2" timeout="${3:-60}"
+  docker exec "$container" psql -U postgres -c \
+    "CREATE TABLE IF NOT EXISTS repo_path_probe(id int); INSERT INTO repo_path_probe VALUES (1); SELECT pg_switch_wal();" >/dev/null 2>&1
+  local deadline=$(($(date +%s) + timeout)) n
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    n=$(mc "mc find local/${BUCKET}${path}/archive --name '*.zst' 2>/dev/null | wc -l" | tail -1 | tr -d ' ')
+    [ "${n:-0}" -ge 1 ] && return 0
+    sleep 2
+  done
+  return 1
+}
+
+# The fleet shape: PITR was enabled while WAL_ARCHIVE_PATH held a value an MSYS
+# shell mangled (`/pgbackrest-staging` → `C:/Program Files/Git/pgbackrest-staging`),
+# so the marker was derived as `C:/Program Files/.../cluster-<sysid>`. pgBackRest
+# rejects that during option parsing (`[032] ... must begin with /`), so nothing
+# was ever archived. The operator then corrected the variable, but the marker
+# outranks it — every boot kept the unusable path. On this image the boot must
+# re-derive `${WAL_ARCHIVE_PATH}/cluster-<sysid>` from the CORRECTED variable,
+# rewrite marker + anchor + conf, and stanza-create / archive-push / the
+# watcher's full must all succeed there.
+t_unusable_repo_marker_rederived_from_archive_path() {
+  local name=t-bad-marker-${PG_VERSION}
+  local vol=${name}-vol
+  if ! rebuild_image; then
+    ko "${FUNCNAME[0]}" "could not rebuild $IMAGE"
+    return
+  fi
+  reset_bucket
+  new_volume "$vol"
+  docker rm -f "${name}-a" "${name}-b" >/dev/null 2>&1 || true
+
+  run_archiving_pg "${name}-a" "$vol"
+  if ! wait_for_pg "${name}-a"; then
+    ko "${FUNCNAME[0]}" "no first startup"
+    fail_dump "${FUNCNAME[0]}" "${name}-a"
+    return
+  fi
+  if [ -z "$(read_repo_marker_when_present "${name}-a")" ]; then
+    ko "${FUNCNAME[0]}" "no repo-path marker after first boot"
+    fail_dump "${FUNCNAME[0]}" "${name}-a"
+    return
+  fi
+  local sysid
+  sysid=$(cluster_sysid "${name}-a")
+  stop_pg_clean "${name}-a"
+
+  local bad_path="C:/Program Files/Git/pgbackrest-staging/cluster-${sysid}"
+  local want_path="/pgbackrest-staging/cluster-${sysid}"
+  if ! in_stopped_volume_self "$vol" "
+    printf '%s\n' '${bad_path}' > /var/lib/postgresql/data/.pgbackrest_repo_path &&
+    chown postgres:postgres /var/lib/postgresql/data/.pgbackrest_repo_path &&
+    chmod 0640 /var/lib/postgresql/data/.pgbackrest_repo_path
+  "; then
+    ko "${FUNCNAME[0]}" "could not plant the unusable marker"
+    return
+  fi
+
+  # The corrected variable; later -e wins over run_archiving_pg's default.
+  run_archiving_pg_fast_watcher "${name}-b" "$vol" -e "WAL_ARCHIVE_PATH=/pgbackrest-staging"
+  if ! wait_for_pg "${name}-b"; then
+    ko "${FUNCNAME[0]}" "no startup with an unusable marker (the boot must never fail on it)"
+    fail_dump "${FUNCNAME[0]}" "${name}-b"
+    return
+  fi
+  if ! wait_for_log_line "${name}-b" "repo path re-derived to ${want_path}" 30; then
+    ko "${FUNCNAME[0]}" "boot did not re-derive the unusable marker onto ${want_path}"
+    fail_dump "${FUNCNAME[0]}" "${name}-b"
+    return
+  fi
+
+  local marker_after anchor_after conf_path
+  marker_after=$(docker exec "${name}-b" cat /var/lib/postgresql/data/.pgbackrest_repo_path 2>/dev/null)
+  if [ "$marker_after" != "$want_path" ]; then
+    ko "${FUNCNAME[0]}" "marker should be '${want_path}', got '${marker_after}'"
+    fail_dump "${FUNCNAME[0]}" "${name}-b"
+    return
+  fi
+  anchor_after=$(docker exec "${name}-b" cat /var/lib/postgresql/data/.pgbackrest_repo_anchor 2>/dev/null | tr '\n' ' ')
+  case "$anchor_after" in
+    *"sysid=${sysid}"*"pg_version=${PG_VERSION}"*) ;;
+    *)
+      ko "${FUNCNAME[0]}" "anchor should name sysid=${sysid} pg_version=${PG_VERSION}, got '${anchor_after}'"
+      fail_dump "${FUNCNAME[0]}" "${name}-b"
+      return ;;
+  esac
+  if ! wait_for_log_line "${name}-b" "stanza-create completed" 60; then
+    ko "${FUNCNAME[0]}" "stanza-create did not complete at the re-derived path"
+    fail_dump "${FUNCNAME[0]}" "${name}-b"
+    return
+  fi
+  conf_path=$(docker exec "${name}-b" grep -E '^repo1-path=' /etc/pgbackrest/pgbackrest.conf 2>/dev/null | cut -d= -f2-)
+  if [ "$conf_path" != "$want_path" ]; then
+    ko "${FUNCNAME[0]}" "pgbackrest.conf repo1-path should be '${want_path}', got '${conf_path}'"
+    fail_dump "${FUNCNAME[0]}" "${name}-b"
+    return
+  fi
+  if docker logs "${name}-b" 2>&1 | grep -qF "must begin with /"; then
+    ko "${FUNCNAME[0]}" "pgBackRest still rejected a repo1-path after the re-derive"
+    fail_dump "${FUNCNAME[0]}" "${name}-b"
+    return
+  fi
+  if ! wait_for_wal_under_path "${name}-b" "$want_path" 60; then
+    ko "${FUNCNAME[0]}" "archive-push landed no WAL under ${want_path}"
+    fail_dump "${FUNCNAME[0]}" "${name}-b"
+    return
+  fi
+  # The watcher's state was replaced by the flip, so it takes a fresh full at
+  # the re-derived path rather than trusting the first boot's timestamps.
+  if ! wait_for_watcher_backup "${name}-b" full 120; then
+    ko "${FUNCNAME[0]}" "watcher took no full at the re-derived path"
+    fail_dump "${FUNCNAME[0]}" "${name}-b"
+    return
+  fi
+  local fulls
+  fulls=$(count_backups_at_path "${name}-b" full "$want_path")
+  if [ "${fulls:-0}" -lt 1 ]; then
+    ko "${FUNCNAME[0]}" "expected a full backup under ${want_path}, got ${fulls:-0}"
+    fail_dump "${FUNCNAME[0]}" "${name}-b"
+    return
+  fi
+
+  ok "${FUNCNAME[0]}"
+  note "unusable marker '${bad_path}' re-derived to ${want_path}; stanza, WAL and a full landed there"
+  docker rm -f "${name}-b" >/dev/null
+  docker volume rm "$vol" >/dev/null
+}
+
+# WAL_ARCHIVE_PATH itself unusable on a fresh volume: the image must not derive
+# (and persist) a marker pgBackRest will reject. It logs loudly and archives
+# under the image default /pgbackrest — safe because the rejected value can
+# never have produced an object — and the database starts either way.
+t_unusable_wal_archive_path_falls_back_to_default() {
+  local name=t-bad-archive-path-${PG_VERSION}
+  local vol=${name}-vol
+  if ! rebuild_image; then
+    ko "${FUNCNAME[0]}" "could not rebuild $IMAGE"
+    return
+  fi
+  reset_bucket
+  new_volume "$vol"
+  docker rm -f "$name" >/dev/null 2>&1 || true
+
+  run_archiving_pg "$name" "$vol" -e "WAL_ARCHIVE_PATH=C:/Program Files/Git/pgbackrest-staging"
+  if ! wait_for_pg "$name"; then
+    ko "${FUNCNAME[0]}" "no startup with an unusable WAL_ARCHIVE_PATH (the boot must never fail on it)"
+    fail_dump "${FUNCNAME[0]}" "$name"
+    return
+  fi
+  if ! wait_for_log_line "$name" "is not an absolute path" 30; then
+    ko "${FUNCNAME[0]}" "no loud log for the unusable WAL_ARCHIVE_PATH"
+    fail_dump "${FUNCNAME[0]}" "$name"
+    return
+  fi
+
+  local marker sysid want_path
+  marker=$(read_repo_marker_when_present "$name")
+  sysid=$(cluster_sysid "$name")
+  want_path="/pgbackrest/cluster-${sysid}"
+  if [ "$marker" != "$want_path" ]; then
+    ko "${FUNCNAME[0]}" "marker should fall back to '${want_path}', got '${marker}'"
+    fail_dump "${FUNCNAME[0]}" "$name"
+    return
+  fi
+  if ! wait_for_log_line "$name" "stanza-create completed" 60; then
+    ko "${FUNCNAME[0]}" "stanza-create did not complete under the default path"
+    fail_dump "${FUNCNAME[0]}" "$name"
+    return
+  fi
+  if docker logs "$name" 2>&1 | grep -qF "must begin with /"; then
+    ko "${FUNCNAME[0]}" "pgBackRest was handed an unusable repo1-path"
+    fail_dump "${FUNCNAME[0]}" "$name"
+    return
+  fi
+  if ! wait_for_wal_under_path "$name" "$want_path" 60; then
+    ko "${FUNCNAME[0]}" "archive-push landed no WAL under ${want_path}"
+    fail_dump "${FUNCNAME[0]}" "$name"
+    return
+  fi
+
+  ok "${FUNCNAME[0]}"
+  note "unusable WAL_ARCHIVE_PATH fell back to ${want_path}; stanza and WAL landed there"
+  docker rm -f "$name" >/dev/null
+  docker volume rm "$vol" >/dev/null
+}
+
+# The other side of the re-derive: a USABLE marker still wins verbatim over
+# WAL_ARCHIVE_PATH, even when derivation would now produce a different path.
+# Planted as a WAL_REGRESSION-shaped path (cluster-<sysid>-<epoch>) because that
+# is exactly the marker a watcher migration leaves behind and must keep.
+t_usable_repo_marker_still_wins() {
+  local name=t-good-marker-${PG_VERSION}
+  local vol=${name}-vol
+  if ! rebuild_image; then
+    ko "${FUNCNAME[0]}" "could not rebuild $IMAGE"
+    return
+  fi
+  reset_bucket
+  new_volume "$vol"
+  docker rm -f "${name}-a" "${name}-b" >/dev/null 2>&1 || true
+
+  run_archiving_pg "${name}-a" "$vol"
+  if ! wait_for_pg "${name}-a"; then
+    ko "${FUNCNAME[0]}" "no first startup"
+    fail_dump "${FUNCNAME[0]}" "${name}-a"
+    return
+  fi
+  if [ -z "$(read_repo_marker_when_present "${name}-a")" ]; then
+    ko "${FUNCNAME[0]}" "no repo-path marker after first boot"
+    fail_dump "${FUNCNAME[0]}" "${name}-a"
+    return
+  fi
+  local sysid
+  sysid=$(cluster_sysid "${name}-a")
+  stop_pg_clean "${name}-a"
+
+  local kept_path="/pgbackrest/cluster-${sysid}-1700000000"
+  if ! in_stopped_volume_self "$vol" "
+    printf '%s\n' '${kept_path}' > /var/lib/postgresql/data/.pgbackrest_repo_path &&
+    chown postgres:postgres /var/lib/postgresql/data/.pgbackrest_repo_path &&
+    chmod 0640 /var/lib/postgresql/data/.pgbackrest_repo_path
+  "; then
+    ko "${FUNCNAME[0]}" "could not plant the marker"
+    return
+  fi
+
+  run_archiving_pg "${name}-b" "$vol" -e "WAL_ARCHIVE_PATH=/elsewhere"
+  if ! wait_for_pg "${name}-b"; then
+    ko "${FUNCNAME[0]}" "no second startup"
+    fail_dump "${FUNCNAME[0]}" "${name}-b"
+    return
+  fi
+  if ! wait_for_log_line "${name}-b" "using repo1-path=${kept_path}" 60; then
+    ko "${FUNCNAME[0]}" "stanza bootstrap did not use the planted marker ${kept_path}"
+    fail_dump "${FUNCNAME[0]}" "${name}-b"
+    return
+  fi
+  if docker logs "${name}-b" 2>&1 | grep -qE "can never use|re-derived"; then
+    ko "${FUNCNAME[0]}" "a usable marker was treated as unusable"
+    fail_dump "${FUNCNAME[0]}" "${name}-b"
+    return
+  fi
+  local marker_after
+  marker_after=$(docker exec "${name}-b" cat /var/lib/postgresql/data/.pgbackrest_repo_path 2>/dev/null)
+  if [ "$marker_after" != "$kept_path" ]; then
+    ko "${FUNCNAME[0]}" "usable marker was rewritten: '${kept_path}' → '${marker_after}'"
+    fail_dump "${FUNCNAME[0]}" "${name}-b"
+    return
+  fi
+  if ! wait_for_log_line "${name}-b" "stanza-create completed" 60; then
+    ko "${FUNCNAME[0]}" "stanza-create did not complete at the marker's path"
+    fail_dump "${FUNCNAME[0]}" "${name}-b"
+    return
+  fi
+  if ! wait_for_wal_under_path "${name}-b" "$kept_path" 60; then
+    ko "${FUNCNAME[0]}" "archive-push landed no WAL under ${kept_path}"
+    fail_dump "${FUNCNAME[0]}" "${name}-b"
+    return
+  fi
+  local elsewhere
+  elsewhere=$(bucket_objects_under /elsewhere)
+  if [ "${elsewhere:-0}" != "0" ]; then
+    ko "${FUNCNAME[0]}" "${elsewhere} object(s) landed under WAL_ARCHIVE_PATH=/elsewhere; the marker must win"
+    fail_dump "${FUNCNAME[0]}" "${name}-b"
+    return
+  fi
+
+  ok "${FUNCNAME[0]}"
+  note "usable marker ${kept_path} kept over WAL_ARCHIVE_PATH=/elsewhere"
+  docker rm -f "${name}-b" >/dev/null
+  docker volume rm "$vol" >/dev/null
+}
+
 # The migration machinery's state fields were wal_regression_* before the
 # boot-time re-anchor started sharing them. A volume that redeploys onto the
 # renaming image carries the old names, and the in-flight case is the one that
@@ -5232,6 +5529,9 @@ ALL_TESTS=(
   t_upgrade_archive_reanchors_to_new_cluster_path
   t_reanchor_stale_marker_after_upgrade
   t_reanchor_backfills_missing_anchor
+  t_unusable_repo_marker_rederived_from_archive_path
+  t_unusable_wal_archive_path_falls_back_to_default
+  t_usable_repo_marker_still_wins
   t_legacy_wal_regression_state_fields_migrate
   t_restore_change_target_after_promote_noop
   t_restore_then_wipe_volume_redoes_restore

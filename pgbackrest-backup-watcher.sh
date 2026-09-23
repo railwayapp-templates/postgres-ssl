@@ -1447,9 +1447,33 @@ watcher_iteration() {
 # The marker may not exist yet on the very first watcher iteration (we're
 # forked from wrapper.sh before exec'ing docker-entrypoint), so the loop
 # below re-reads it on every iteration as a cheap fallback.
+#
+# A marker pgBackRest can never accept (not beginning with `/`, empty,
+# multi-line — same check as wrapper.sh's pgbackrest_repo_path_is_usable) is
+# not adopted: exporting it would make every backup, info probe and
+# stanza-create in this iteration fail option parsing. wrapper.sh re-derives
+# such a marker at boot; until it has, keep whatever path is already in the
+# environment (or none, which leaves pgbackrest.conf's repo1-path in charge).
+repo_path_is_usable() {
+  case "$1" in
+    /*) ;;
+    *) return 1 ;;
+  esac
+  case "$1" in
+    *$'\n'*|*$'\r'*) return 1 ;;
+  esac
+  return 0
+}
+
 sync_repo_path_from_marker() {
   if [ -f "$PGDATA/.pgbackrest_repo_path" ]; then
-    PGBACKREST_REPO1_PATH=$(cat "$PGDATA/.pgbackrest_repo_path")
+    local marker_path
+    marker_path=$(cat "$PGDATA/.pgbackrest_repo_path" 2>/dev/null || true)
+    if ! repo_path_is_usable "$marker_path"; then
+      log "repo-path marker holds \"${marker_path}\", which pgBackRest can never use; not adopting it (repo1-path=${PGBACKREST_REPO1_PATH:-unset}); the next boot re-derives it"
+      return 0
+    fi
+    PGBACKREST_REPO1_PATH="$marker_path"
     export PGBACKREST_REPO1_PATH
   fi
 }
