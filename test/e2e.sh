@@ -4908,6 +4908,171 @@ t_chain_restore_r1_to_r2() {
   docker volume rm "$src_vol" "$r1_vol" "$r2_vol" >/dev/null
 }
 
+# Every object key under a repo path, sorted — the "nothing at the old path was
+# deleted" measurement (a before/after subset check, since archive-push may
+# still add WAL there before the migration moves it away).
+bucket_object_keys_under() {
+  mc "mc find local/${BUCKET}${1} 2>/dev/null" | sort
+}
+
+# Half-created stanza self-heal. pgBackRest's stanza-create writes archive.info
+# first and backup.info second (src/command/stanza/create.c); interrupted in
+# between, it leaves archive.info with no backup.info and every later
+# stanza-create fails with "[055]: archive.info exists but backup.info is
+# missing on repo1". archive-push keeps working but no backup can ever be
+# taken. This forges that repo state on a stopped service (plus the symmetric
+# "backup.info exists but archive.info is missing"), reboots it on the same
+# volume, and asserts the watcher:
+#   - logs the ERROR line itself, not just the "command begin" preamble;
+#   - waits out the confirm window before acting (persistence gate);
+#   - moves archiving to <old path>-<epoch> and lands a full there;
+#   - leaves every object at the old path in place.
+# The bootstrap stanza-create loop in wrapper.sh follows the marker, so it
+# converges at the new path instead of retrying the old one forever.
+#
+# $1 = which info file the forged repo is missing: "backup.info" or
+# "archive.info".
+run_half_created_stanza_case() {
+  local missing="$1" test_name="$2"
+  local name="t-half-stanza-${missing%%.*}-${PG_VERSION}"
+  local vol=${name}-vol
+  local confirm=15
+  reset_bucket
+  new_volume "$vol"
+  docker rm -f "$name" >/dev/null 2>&1 || true
+
+  run_archiving_pg_fast_watcher "$name" "$vol"
+  wait_for_pg "$name" || { ko "$test_name" "no startup"; fail_dump "$test_name" "$name"; return; }
+  wait_for_log_line "$name" "stanza-create completed" 30 \
+    || { ko "$test_name" "bootstrap stanza-create did not complete"; fail_dump "$test_name" "$name"; return; }
+  docker exec "$name" psql -U postgres -c "CREATE TABLE t(id int); SELECT pg_switch_wal();" >/dev/null
+  wait_for_watcher_backup "$name" full 90 \
+    || { ko "$test_name" "no initial full"; fail_dump "$test_name" "$name"; return; }
+
+  local orig_path
+  orig_path=$(docker exec "$name" cat /var/lib/postgresql/data/.pgbackrest_repo_path)
+  stop_pg_clean "$name"
+
+  # Forge the half-created stanza. backup.info missing: drop the whole
+  # backup/main prefix — the exact production shape (archive.info + WAL, no
+  # backup.info, no backups). archive.info missing: drop only the two info
+  # files, keeping WAL and the backup set.
+  if [ "$missing" = "backup.info" ]; then
+    mc "mc rm -r --force local/${BUCKET}${orig_path}/backup/main" >/dev/null 2>&1
+  else
+    mc "mc rm --force local/${BUCKET}${orig_path}/archive/main/archive.info local/${BUCKET}${orig_path}/archive/main/archive.info.copy" >/dev/null 2>&1
+  fi
+  local remaining_info
+  remaining_info=$(mc "mc find local/${BUCKET}${orig_path} --name '${missing}*' 2>/dev/null" | wc -l | tr -d ' ')
+  if [ "$remaining_info" != "0" ]; then
+    ko "$test_name" "could not forge the half-created stanza (${remaining_info} ${missing}* objects left)"
+    return
+  fi
+  # Fresh watcher state, as on the affected services (no full ever recorded).
+  docker run --rm -v "$vol:/v" alpine rm -f /v/.pgbackrest_backup_state >/dev/null 2>&1
+
+  local keys_before
+  keys_before=$(bucket_object_keys_under "$orig_path")
+
+  run_archiving_pg_fast_watcher "$name" "$vol" \
+    -e "WAL_BACKUP_HALF_STANZA_CONFIRM_SECONDS=${confirm}"
+  wait_for_pg "$name" || { ko "$test_name" "no restart"; fail_dump "$test_name" "$name"; return; }
+
+  # Observability: the stanza-create failure line carries the ERROR text.
+  local want_error
+  if [ "$missing" = "backup.info" ]; then
+    want_error="archive.info exists but backup.info is missing on repo1"
+  else
+    want_error="backup.info exists but archive.info is missing on repo1"
+  fi
+  wait_for_log_line "$name" "pgbackrest-watcher: stanza-create: exited rc=55;.*${want_error}" 60 \
+    || { ko "$test_name" "watcher's stanza-create log line lacks the ERROR text"; fail_dump "$test_name" "$name"; return; }
+  wait_for_log_line "$name" "half-created stanza: ${missing}-missing at ${orig_path}; re-checking" 30 \
+    || { ko "$test_name" "first sighting not recorded"; fail_dump "$test_name" "$name"; return; }
+
+  local deadline=$(($(date +%s) + 120)) migrated=0
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if docker logs "$name" 2>&1 | grep -q "half-created-stanza: migrating archive path"; then
+      migrated=1; break
+    fi
+    docker exec "$name" psql -U postgres -c "SELECT pg_switch_wal();" >/dev/null 2>&1
+    sleep 2
+  done
+  if [ "$migrated" != 1 ]; then
+    ko "$test_name" "watcher did not migrate off the half-created stanza"
+    fail_dump "$test_name" "$name"
+    return
+  fi
+
+  # Persistence gate: acted only once the sighting was at least $confirm old.
+  local age
+  age=$(docker logs "$name" 2>&1 | grep -o "persisted for [0-9]*s" | head -1 | grep -o "[0-9]*")
+  if [ -z "$age" ] || [ "$age" -lt "$confirm" ]; then
+    ko "$test_name" "migration fired before the confirm window (age='${age}', window=${confirm}s)"
+    fail_dump "$test_name" "$name"
+    return
+  fi
+
+  local new_path
+  new_path=$(docker exec "$name" cat /var/lib/postgresql/data/.pgbackrest_repo_path)
+  case "$new_path" in
+    "${orig_path}-"[0-9]*) ;;
+    *)
+      ko "$test_name" "marker did not move to an epoch-suffixed path; orig=${orig_path}, new=${new_path}"
+      fail_dump "$test_name" "$name"
+      return ;;
+  esac
+
+  local full_deadline=$(($(date +%s) + 120)) full_hit=0
+  while [ "$(date +%s)" -lt "$full_deadline" ]; do
+    if docker logs "$name" 2>&1 | grep -q "pgbackrest-watcher: backup --type=full completed"; then
+      full_hit=1; break
+    fi
+    docker exec "$name" psql -U postgres -c "SELECT pg_switch_wal();" >/dev/null 2>&1
+    sleep 3
+  done
+  if [ "$full_hit" != 1 ]; then
+    ko "$test_name" "no full at the fresh path after the migration"
+    fail_dump "$test_name" "$name"
+    return
+  fi
+  local new_fulls
+  new_fulls=$(count_backups_at_path "$name" full "$new_path")
+  if [ "${new_fulls:-0}" -lt 1 ]; then
+    ko "$test_name" "pgbackrest info at ${new_path} shows no full (got '${new_fulls}')"
+    fail_dump "$test_name" "$name"
+    return
+  fi
+
+  # Non-destructive: every object that was at the old path is still there.
+  local keys_after missing_keys
+  keys_after=$(bucket_object_keys_under "$orig_path")
+  missing_keys=$(comm -23 <(printf '%s\n' "$keys_before") <(printf '%s\n' "$keys_after") | grep -c . || true)
+  if [ "$missing_keys" != "0" ]; then
+    ko "$test_name" "${missing_keys} object(s) disappeared from the old path ${orig_path}"
+    fail_dump "$test_name" "$name"
+    return
+  fi
+
+  # The boot-time stanza-create loop follows the marker and succeeds at the
+  # new path (it retries every 30s).
+  wait_for_log_line "$name" "pgbackrest: stanza-create completed" 45 \
+    || { ko "$test_name" "bootstrap stanza-create loop never converged after the migration"; fail_dump "$test_name" "$name"; return; }
+
+  ok "$test_name"
+  note "${missing} missing at ${orig_path} → migrated after ${age}s to ${new_path}; full landed there; old path untouched"
+  docker rm -f "$name" >/dev/null
+  docker volume rm "$vol" >/dev/null
+}
+
+t_watcher_heals_half_created_stanza() {
+  run_half_created_stanza_case backup.info t_watcher_heals_half_created_stanza
+}
+
+t_watcher_heals_stanza_missing_archive_info() {
+  run_half_created_stanza_case archive.info t_watcher_heals_stanza_missing_archive_info
+}
+
 # M2. Catalog-verify self-heal. local state can carry last_full_at while S3
 # has lost the full (catalog wiped, redeploy that dropped the bucket, restore
 # from before the full). NEEDS_INITIAL_BACKUP only fires on empty state, so
@@ -5246,6 +5411,8 @@ ALL_TESTS=(
   t_chain_restore_r1_to_r2
   # audit follow-ups (M1/L4/L7 — see plan ok-fix-all-of-cheerful-wolf.md)
   t_catalog_verify_deadlock_selfheals
+  t_watcher_heals_half_created_stanza
+  t_watcher_heals_stanza_missing_archive_info
   t_gap_marker_suppresses_catalog_verify_full
   t_stanza_create_timeout_sentinel_absent_on_success
   t_invalid_bucket_sentinel_cleared_on_disable
