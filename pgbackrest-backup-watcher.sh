@@ -127,6 +127,40 @@ FULL_RETRY_BACKOFF_SECONDS="${WAL_BACKUP_FULL_RETRY_BACKOFF_SECONDS:-600}"
 # trips and drops segments.
 WAL_LAG_GAP_THRESHOLD_SEGMENTS="${WAL_LAG_GAP_THRESHOLD_SEGMENTS:-32}"
 
+# Backup stall watchdog — see run_backup_supervised. A running backup is
+# killed only when its progress (bytes copied, from `pgbackrest info`) has not
+# advanced for the stall window; a backup that keeps copying is never touched,
+# however long it runs.
+#
+# WAL_BACKUP_STALL_SECONDS (default 1800 = 30 min; 0 disables the watchdog):
+# the floor of the window. It has to cover the phases where pgBackRest reports
+# no byte progress at all: pg_backup_start (start-fast=y, so one immediate
+# checkpoint), removing a non-resumable earlier attempt from the bucket,
+# building and saving the manifest, and the tail after the last progress write
+# (pg_backup_stop plus the archive-timeout wait for the closing WAL). On a
+# healthy service those take seconds to a few minutes; 30 min is an order of
+# magnitude above that while still turning an indefinite hang into a retry
+# within the hour.
+#
+# WAL_BACKUP_STALL_MIN_BYTES_PER_SECOND (default 4194304 = 4 MiB/s): scales
+# the window with the backup's size. pgBackRest refreshes the progress it
+# reports only when percent-complete moves by more than 10 points
+# (src/command/backup/backup.c, backupJobCallback: `if (percentComplete -
+# *currentPercentComplete > 10)` → cmdLockWriteP), so the reported bytes
+# advance in ~11 % steps. A multi-TB backup legitimately spends a long time
+# between steps, so the window is max(floor, 11 % of size / this rate): only
+# a backup copying slower than 4 MiB/s sustained could be cut, and at that
+# rate a 1 TiB backup would take three days.
+#
+# WAL_BACKUP_STALL_POLL_SECONDS (default 60): how often the running backup's
+# progress is probed. WAL_BACKUP_STALL_KILL_GRACE_SECONDS (default 60): time
+# between SIGTERM (pgBackRest stops its workers and releases its lock) and
+# SIGKILL of anything still alive.
+BACKUP_STALL_SECONDS="${WAL_BACKUP_STALL_SECONDS:-1800}"
+BACKUP_STALL_MIN_BYTES_PER_SECOND="${WAL_BACKUP_STALL_MIN_BYTES_PER_SECOND:-4194304}"
+BACKUP_STALL_POLL_SECONDS="${WAL_BACKUP_STALL_POLL_SECONDS:-60}"
+BACKUP_STALL_KILL_GRACE_SECONDS="${WAL_BACKUP_STALL_KILL_GRACE_SECONDS:-60}"
+
 # A malformed numeric knob must never degrade silently: bash arithmetic
 # evaluates non-numeric strings to 0, and 0 here means "periodic fulls
 # disabled" — a typo like 168h would silently stop the weekly full and
@@ -153,6 +187,13 @@ sanitize_uint WAL_BACKUP_DIFF_INTERVAL_HOURS DIFF_INTERVAL_HOURS 24
 sanitize_uint WAL_BACKUP_CATALOG_VERIFY_INTERVAL_SECONDS CATALOG_VERIFY_INTERVAL_SECONDS 3600
 sanitize_uint WAL_BACKUP_FULL_RETRY_BACKOFF_SECONDS FULL_RETRY_BACKOFF_SECONDS 600
 sanitize_uint WAL_LAG_GAP_THRESHOLD_SEGMENTS WAL_LAG_GAP_THRESHOLD_SEGMENTS 32
+sanitize_uint WAL_BACKUP_STALL_SECONDS BACKUP_STALL_SECONDS 1800
+sanitize_uint WAL_BACKUP_STALL_MIN_BYTES_PER_SECOND BACKUP_STALL_MIN_BYTES_PER_SECOND 4194304
+sanitize_uint WAL_BACKUP_STALL_POLL_SECONDS BACKUP_STALL_POLL_SECONDS 60
+sanitize_uint WAL_BACKUP_STALL_KILL_GRACE_SECONDS BACKUP_STALL_KILL_GRACE_SECONDS 60
+# A 0 rate would divide by zero and a 0 poll would spin; both fall back.
+[ "$BACKUP_STALL_MIN_BYTES_PER_SECOND" -eq 0 ] && BACKUP_STALL_MIN_BYTES_PER_SECOND=4194304
+[ "$BACKUP_STALL_POLL_SECONDS" -eq 0 ] && BACKUP_STALL_POLL_SECONDS=60
 
 # Resolved cadence in seconds. WAL_BACKUP_FULL_INTERVAL_SECONDS overrides
 # the hours setting — bash arithmetic precludes fractional hours, so the
@@ -329,6 +370,132 @@ is_standby() {
   [ "$r" = "t" ]
 }
 
+# ---- Backup stall watchdog ---------------------------------------------------
+#
+# `pgbackrest backup` has no bound of its own: a backup wedged on a hung bucket
+# connection (or anything else that stops it copying) blocks this loop forever
+# — no further backups, no iteration lines, while archive-push keeps working,
+# so the only visible symptom is a catalog whose newest backup keeps ageing.
+# The backup therefore runs as a child that this loop supervises by PROGRESS,
+# never by wall clock: a multi-TB full legitimately runs for many hours.
+#
+# Progress source: `pgbackrest info --output=json` reports a running backup's
+# progress under the stanza's status.lock.backup — `held` (a valid backup lock
+# exists on this host), `size` (total bytes of the backup) and `size-cplt`
+# (bytes copied so far), the latter two only once the copy phase has started
+# (pgBackRest >= 2.38; src/command/info/info.c, stanzaStatusBackupLockAdd:
+# STATUS_KEY_LOCK_HELD_VAR "held", STATUS_KEY_LOCK_SIZE_VAR "size",
+# STATUS_KEY_LOCK_SIZE_COMPLETE_VAR "size-cplt" — unchanged in 2.59.0). The
+# lock is read from this host's lock-path, which is where the child runs.
+
+# Effective stall window for a backup of $1 bytes (0 = size not reported yet):
+# max(WAL_BACKUP_STALL_SECONDS, 11 % of size / WAL_BACKUP_STALL_MIN_BYTES_PER_SECOND).
+backup_stall_window_seconds() {
+  local size="${1:-0}" scaled
+  case "$size" in ''|*[!0-9]*) size=0 ;; esac
+  scaled=$(( size * 11 / 100 / BACKUP_STALL_MIN_BYTES_PER_SECOND ))
+  if [ "$scaled" -gt "$BACKUP_STALL_SECONDS" ]; then
+    echo "$scaled"
+  else
+    echo "$BACKUP_STALL_SECONDS"
+  fi
+}
+
+# Pure verdict: succeeds when a backup whose progress last changed at $2
+# (epoch), with $3 total bytes, counts as stalled at $1 (epoch).
+backup_is_stalled() {
+  local now="$1" last_progress_at="$2" size="${3:-0}" window
+  window=$(backup_stall_window_seconds "$size")
+  [ $((now - last_progress_at)) -ge "$window" ]
+}
+
+# Probes the running backup's progress. On success sets BACKUP_PROGRESS_TOKEN
+# (changes whenever progress does: "idle" before the lock is taken, then
+# "<size-cplt>/<size>", "-" for a field not reported yet) and
+# BACKUP_PROGRESS_SIZE (total bytes, 0 when unknown). Returns 1 when the probe
+# is inconclusive (info errored or unparseable) — the caller keeps its last
+# observation, so a failed probe never counts as progress.
+probe_backup_progress() {
+  local info_out parsed
+  info_out=$(timeout 60 pgbackrest --stanza=main --repo=1 info --output=json 2>/dev/null) || return 1
+  [ -z "$info_out" ] && return 1
+  parsed=$(printf '%s' "$info_out" | jq -r '
+    [.[]? | select(.name == "main")][0].status.lock.backup as $l
+    | if ($l | type) != "object" then empty
+      elif ($l.held // false) then "\($l["size-cplt"] // "-")/\($l.size // "-") \($l.size // 0)"
+      else "idle 0" end' 2>/dev/null) || return 1
+  [ -z "$parsed" ] && return 1
+  BACKUP_PROGRESS_TOKEN="${parsed% *}"
+  BACKUP_PROGRESS_SIZE="${parsed##* }"
+  return 0
+}
+
+# Prints every descendant PID of $1, depth-first.
+descendant_pids() {
+  local child
+  for child in $(pgrep -P "$1" 2>/dev/null); do
+    echo "$child"
+    descendant_pids "$child"
+  done
+}
+
+# SIGTERM the backup (pgBackRest stops its local workers and releases the
+# stanza lock itself), wait up to WAL_BACKUP_STALL_KILL_GRACE_SECONDS, then
+# SIGKILL whatever of the process tree is still alive. The descendants are
+# snapshotted first: once the parent dies they are reparented and can no
+# longer be found through it. The partial backup left in the repo is
+# pgBackRest's to handle — the next full resumes it, the next diff/incr
+# discards it.
+kill_backup_tree() {
+  local pid="$1" tree waited=0 p
+  tree=$(descendant_pids "$pid")
+  kill -TERM "$pid" 2>/dev/null || true
+  while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt "$BACKUP_STALL_KILL_GRACE_SECONDS" ]; do
+    sleep 1
+    waited=$((waited + 1))
+  done
+  for p in "$pid" $tree; do
+    kill -KILL "$p" 2>/dev/null || true
+  done
+}
+
+# Runs `pgbackrest backup --type=$1` under the stall watchdog and returns its
+# exit code — always non-zero when the watchdog killed it. A backup whose
+# progress keeps moving runs to completion exactly as an unsupervised call
+# would; WAL_BACKUP_STALL_SECONDS=0 turns supervision off.
+run_backup_supervised() {
+  local type="$1" pid now last_progress_at next_probe last_token="" size=0 rc
+  # --repo=1 / --no-expire-auto: see run_backup.
+  pgbackrest --stanza=main --repo=1 backup --type="$type" --no-expire-auto &
+  pid=$!
+  if [ "$BACKUP_STALL_SECONDS" -eq 0 ]; then
+    wait "$pid"
+    return $?
+  fi
+  last_progress_at=$(date +%s)
+  next_probe=$((last_progress_at + BACKUP_STALL_POLL_SECONDS))
+  while kill -0 "$pid" 2>/dev/null; do
+    sleep 1
+    now=$(date +%s)
+    [ "$now" -lt "$next_probe" ] && continue
+    next_probe=$((now + BACKUP_STALL_POLL_SECONDS))
+    if probe_backup_progress && [ "$BACKUP_PROGRESS_TOKEN" != "$last_token" ]; then
+      last_token="$BACKUP_PROGRESS_TOKEN"
+      size="$BACKUP_PROGRESS_SIZE"
+      last_progress_at="$now"
+    fi
+    if kill -0 "$pid" 2>/dev/null && backup_is_stalled "$now" "$last_progress_at" "$size"; then
+      log "backup stalled: no progress for $((now - last_progress_at))s; killed (type=$type, window=$(backup_stall_window_seconds "$size")s, last_progress=${last_token:-none})"
+      kill_backup_tree "$pid"
+      wait "$pid" 2>/dev/null
+      rc=$?
+      [ "$rc" -eq 0 ] && rc=1
+      return "$rc"
+    fi
+  done
+  wait "$pid"
+}
+
 run_backup() {
   local type="$1"
   log "running pgbackrest backup --type=$type"
@@ -348,7 +515,7 @@ run_backup() {
   # backup itself kept succeeding. Expire now runs as its own explicit,
   # non-gating step below, only after the backup is confirmed to have
   # actually succeeded.
-  pgbackrest --stanza=main --repo=1 backup --type="$type" --no-expire-auto
+  run_backup_supervised "$type"
   local exit_code=$?
 
   # Exit 55 = FileMissingError: backup.info absent — stanza was never
@@ -357,14 +524,16 @@ run_backup() {
   if [ "$exit_code" -eq 55 ]; then
     log "stanza not initialized (exit 55), running stanza-create then retrying backup..."
     pgbackrest --stanza=main stanza-create || true
-    pgbackrest --stanza=main --repo=1 backup --type="$type" --no-expire-auto
+    run_backup_supervised "$type"
     exit_code=$?
   fi
 
   if [ "$exit_code" -ne 0 ]; then
     # Record the failure time only for fulls so decide_action can space
     # repeated initial/periodic full *retries* (FULL_RETRY_BACKOFF_SECONDS)
-    # without hammering S3 every poll. Diffs aren't gated.
+    # without hammering S3 every poll. Diffs aren't gated. A backup the stall
+    # watchdog killed is an ordinary failure here: same marker, same backoff,
+    # and the loop carries on.
     [ "$type" = "full" ] && write_state_field last_full_failure_at "$(date +%s)"
     log "backup --type=$type failed (will retry on next poll)"
     return 1
@@ -1433,6 +1602,10 @@ watcher_iteration() {
 
   run_backup "$DECIDED_ACTION" || true
 }
+
+# Sourced (test/unit/backup-stall.sh loads the functions above): stop here,
+# before the daemon starts.
+if [ "${BASH_SOURCE[0]}" != "$0" ]; then return 0; fi
 
 # wrapper.sh forks us unconditionally; bail silently if archiving isn't on.
 # A fork has both WAL_ARCHIVE_* (own bucket / repo1) and WAL_RECOVER_FROM_*
