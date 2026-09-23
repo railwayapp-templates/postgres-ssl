@@ -118,6 +118,15 @@ CATALOG_VERIFY_INTERVAL_SECONDS="${WAL_BACKUP_CATALOG_VERIFY_INTERVAL_SECONDS:-3
 # failure marker, so it fires immediately — only failing retries are throttled.
 FULL_RETRY_BACKOFF_SECONDS="${WAL_BACKUP_FULL_RETRY_BACKOFF_SECONDS:-600}"
 
+# Minimum age (seconds) of a half-created-stanza sighting before the watcher
+# acts on it — see half_created_stanza_step. The first sighting only records
+# its epoch; a later iteration that still sees the half-created stanza at least
+# this long after the first one moves archiving to a fresh path. Defaults to the
+# normal poll interval, so the two sightings are always at least one normal
+# poll apart, even while the watcher runs its tighter pre-first-full cadence.
+# The default is filled in after POLL_INTERVAL_SECONDS is sanitized below.
+HALF_STANZA_CONFIRM_SECONDS="${WAL_BACKUP_HALF_STANZA_CONFIRM_SECONDS:-}"
+
 # LSN-lag detection — see file header. Detection runs every iteration (no
 # probe throttle): `pgbackrest info` is local-to-S3 round-trip, ~50-200ms,
 # cheap enough to call every minute. 32 segments ≈ 512 MiB — far enough above
@@ -153,6 +162,8 @@ sanitize_uint WAL_BACKUP_DIFF_INTERVAL_HOURS DIFF_INTERVAL_HOURS 24
 sanitize_uint WAL_BACKUP_CATALOG_VERIFY_INTERVAL_SECONDS CATALOG_VERIFY_INTERVAL_SECONDS 3600
 sanitize_uint WAL_BACKUP_FULL_RETRY_BACKOFF_SECONDS FULL_RETRY_BACKOFF_SECONDS 600
 sanitize_uint WAL_LAG_GAP_THRESHOLD_SEGMENTS WAL_LAG_GAP_THRESHOLD_SEGMENTS 32
+: "${HALF_STANZA_CONFIRM_SECONDS:=$POLL_INTERVAL_SECONDS}"
+sanitize_uint WAL_BACKUP_HALF_STANZA_CONFIRM_SECONDS HALF_STANZA_CONFIRM_SECONDS "$POLL_INTERVAL_SECONDS"
 
 # Resolved cadence in seconds. WAL_BACKUP_FULL_INTERVAL_SECONDS overrides
 # the hours setting — bash arithmetic precludes fractional hours, so the
@@ -228,6 +239,14 @@ log() { echo "pgbackrest-watcher: $*"; }
 #                                       confirmation — the probe blackout itself
 #                                       is evidence the async worker may be wedged
 #                                       on a hung S3 connection.
+#   half_stanza_first_seen_at=<epoch> — epoch stanza-create first reported a
+#                                       half-created stanza on repo1 (one of
+#                                       archive.info / backup.info present, the
+#                                       other missing) in the current run of
+#                                       such sightings. Empty = none. Cleared
+#                                       by any successful stanza-create and
+#                                       after the fresh-path migration it
+#                                       gates. See half_created_stanza_step.
 #   probe_fail_archived_at_start=<int> — ARCHIVED_COUNT snapshot taken when the
 #                                       consecutive-failure run began. If count
 #                                       has grown since then, postgres is still
@@ -457,13 +476,125 @@ log_catalog_probe_error() {
 # iteration decouples stanza repair from the catalog-verify interval so a broken
 # stanza is fixed on the next poll (~60s) rather than waiting up to
 # CATALOG_VERIFY_INTERVAL_SECONDS (default 1h). Logs only on failure.
+#
+# A failure is also checked for a half-created stanza (half_created_stanza_kind),
+# the one stanza-create failure that retrying never fixes.
 stanza_create_step() {
   local out rc
   out=$(timeout 60 pgbackrest --stanza=main stanza-create 2>&1)
   rc=$?
-  if [ "$rc" -ne 0 ]; then
-    log "stanza-create: exited rc=${rc}; $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-300)"
+  if [ "$rc" -eq 0 ]; then
+    # A whole stanza ends any half-created sighting in progress: the earlier
+    # sighting was a stanza-create caught between its two writes.
+    if [ -n "$(read_state half_stanza_first_seen_at)" ]; then
+      write_state_field half_stanza_first_seen_at ""
+      log "half-created stanza: stanza-create now succeeds at ${PGBACKREST_REPO1_PATH:-unset}; the earlier sighting was transient"
+    fi
+    return 0
   fi
+  log "stanza-create: exited rc=${rc}; $(stanza_create_error_excerpt "$out")"
+
+  local kind
+  if kind=$(half_created_stanza_kind "$out"); then
+    half_created_stanza_step "$kind"
+  fi
+}
+
+# The part of a failed pgBackRest command's output worth logging. With
+# log-level-console=info the output opens with a long "command begin" line
+# listing every option, so the first 300 characters of the flattened output
+# never reached the ERROR. Log the ERROR/WARN lines and the HINT continuation
+# lines instead; fall back to the flattened tail when the output carries none
+# (a timeout kill, a crash before logging).
+stanza_create_error_excerpt() {
+  local out="$1" excerpt
+  excerpt=$(printf '%s\n' "$out" | grep -E 'ERROR:|WARN:|HINT:' | sed 's/^[[:space:]]*//' | tr '\n' ' ')
+  if [ -z "$excerpt" ]; then
+    excerpt=$(printf '%s' "$out" | tr '\n' ' ' | tail -c 300)
+  fi
+  printf '%s' "$excerpt" | cut -c1-600
+}
+
+# Classifies stanza-create output as a half-created stanza on repo1. Echoes the
+# kind and returns 0 on a match; returns 1 otherwise.
+#
+# pgBackRest's stanza-create (src/command/stanza/create.c) writes archive.info
+# (+ .copy) FIRST and backup.info (+ .copy) SECOND. A stanza-create interrupted
+# between the two — e.g. a container restarted seconds into its first boot —
+# leaves archive.info with no backup.info, and from then on every stanza-create
+# refuses to touch the repo:
+#
+#   ERROR: [055]: archive.info exists but backup.info is missing on repo1
+#          HINT: this may be a symptom of repository corruption!
+#
+# archive-push keeps working (it only needs archive.info), but every backup
+# fails loading backup.info, so the service archives WAL with no base backup to
+# replay it onto — zero restorable points, indefinitely. run_backup's rc=55 →
+# stanza-create → retry cannot help: that stanza-create is the one refusing.
+#
+# The symmetric "backup.info exists but archive.info is missing" is the same
+# dead end from the other side: archive-push needs archive.info, so WAL stops
+# reaching the repo and every backup's archive check fails with it. It cannot
+# come out of an interrupted stanza-create (archive.info is written first), so
+# something removed archive.info; whatever backups remain at that path stay
+# there untouched, and a fresh path is the only place new ones can be taken.
+#
+# Only repo1 counts: it is the service's own bucket and the only repo this
+# watcher writes. On a fork the same message "on repo2" names the source's
+# bucket, which moving repo1 would not fix.
+half_created_stanza_kind() {
+  case "$1" in
+    *"archive.info exists but backup.info is missing on repo1"*)
+      echo "backup.info-missing"; return 0 ;;
+    *"backup.info exists but archive.info is missing on repo1"*)
+      echo "archive.info-missing"; return 0 ;;
+  esac
+  return 1
+}
+
+# Heals a half-created stanza on repo1 by moving archiving to a fresh path —
+# the same non-destructive migration the WAL_REGRESSION self-heal uses
+# (cluster-<sysid> → cluster-<sysid>-<epoch>). Nothing at the old path is
+# written or deleted: it keeps whatever it holds (WAL with no base backup, in
+# the interrupted-stanza-create case), and mono's restore picker keeps listing
+# it with every other cluster-* prefix. After the migration the next
+# stanza-create builds a whole stanza at the new path and NEEDS_INITIAL_BACKUP
+# takes the first full there.
+#
+# Persistence gate: a stanza-create running elsewhere writes the two files a
+# few milliseconds apart, so one sighting can be a stanza caught mid-creation.
+# The first sighting only records its epoch in the state file; the migration
+# fires on a later iteration that still sees the half-created stanza at least
+# HALF_STANZA_CONFIRM_SECONDS (default: one normal poll) after it. A successful
+# stanza-create in between clears the sighting (stanza_create_step). The epoch
+# is in the state file, so a watcher restart does not reset the clock.
+half_created_stanza_step() {
+  local kind="$1" now first_seen
+  now=$(date +%s)
+  first_seen=$(read_state half_stanza_first_seen_at)
+  case "$first_seen" in
+    ''|*[!0-9]*)
+      write_state_field half_stanza_first_seen_at "$now"
+      log "half-created stanza: ${kind} at ${PGBACKREST_REPO1_PATH:-unset}; re-checking on a later poll (>= ${HALF_STANZA_CONFIRM_SECONDS}s) before moving archiving to a fresh path"
+      return 0
+      ;;
+  esac
+
+  local age=$((now - first_seen))
+  if [ "$age" -lt "$HALF_STANZA_CONFIRM_SECONDS" ]; then
+    return 0
+  fi
+
+  log "half-created stanza: ${kind} at ${PGBACKREST_REPO1_PATH:-unset} persisted for ${age}s (confirm window ${HALF_STANZA_CONFIRM_SECONDS}s); stanza-create cannot repair it — moving archiving to a fresh path, old path left untouched"
+  if ! migrate_to_new_archive_path "half-created-stanza"; then
+    log "half-created stanza: migration did not complete; will retry"
+    return 0
+  fi
+  write_state_field half_stanza_first_seen_at ""
+  # The fulls that failed against the half-created stanza say nothing about the
+  # fresh path; without this the first full there would wait out
+  # FULL_RETRY_BACKOFF_SECONDS instead of running on this iteration.
+  write_state_field last_full_failure_at ""
 }
 
 # LAST_OBSERVED_LAG_SEGMENTS / LAST_LAG_REPO_MAX surface the most recent
@@ -896,15 +1027,19 @@ finalize_pending_archive_path_migration_if_needed() {
 # (marker first) would strand the watcher at the new empty path with stale
 # last_full_at, skipping NEEDS_INITIAL_BACKUP and waiting up to a full
 # catalog-verify cycle to heal.
+#
+# $1 names the trigger in the log lines and the iteration diagnostic (default
+# "wal-regression"; the half-created-stanza heal passes its own).
 migrate_to_new_archive_path() {
-  GAP_STATE_DIAG="wal-regression"
+  local reason="${1:-wal-regression}"
+  GAP_STATE_DIAG="$reason"
 
   # PGBACKREST_REPO1_PATH is normally set by wrapper.sh's exec env and
   # refreshed every iteration by sync_repo_path_from_marker, but a missing
   # marker + missing env would trip `set -u` below. Bail with a clear log
   # rather than aborting the watcher iteration mid-flow.
   if [ -z "${PGBACKREST_REPO1_PATH:-}" ]; then
-    log "wal-regression: PGBACKREST_REPO1_PATH unset (marker missing, no env override); cannot migrate"
+    log "${reason}: PGBACKREST_REPO1_PATH unset (marker missing, no env override); cannot migrate"
     return 1
   fi
 
@@ -935,12 +1070,12 @@ migrate_to_new_archive_path() {
   # pending migration first so stale .ok files cannot mask missing uploads at
   # the new path.
   if [ "$PGBACKREST_REPO1_PATH" = "$new_path" ]; then
-    log "wal-regression: finalizing pending archive-path migration at ${new_path}"
+    log "${reason}: finalizing pending archive-path migration at ${new_path}"
     finalize_archive_path_migration "$new_path"
     return $?
   fi
 
-  log "wal-regression: migrating archive path (${PGBACKREST_REPO1_PATH} → ${new_path}); old backups preserved at former path"
+  log "${reason}: migrating archive path (${PGBACKREST_REPO1_PATH} → ${new_path}); old backups preserved at former path"
 
   # Reset backup-tracking + recovery state BEFORE flipping the marker. If
   # this function is interrupted partway through, the next iteration sees
@@ -962,7 +1097,7 @@ migrate_to_new_archive_path() {
   write_state_field_required force_attempts 0 || return 1
 
   if ! apply_active_path "$new_path"; then
-    log "wal-regression: failed to apply new archive path (${new_path}); will retry"
+    log "${reason}: failed to apply new archive path (${new_path}); will retry"
     return 1
   fi
 
@@ -970,7 +1105,7 @@ migrate_to_new_archive_path() {
     return 1
   fi
 
-  log "wal-regression: state reset; next iteration will initialize stanza and take full backup at ${new_path}"
+  log "${reason}: state reset; next iteration will initialize stanza and take full backup at ${new_path}"
 }
 
 # Recovery state machine. Replaces the old "wait for grace then take a full"

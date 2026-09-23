@@ -1330,6 +1330,13 @@ bootstrap_pgbackrest_stanza() {
     echo "pgbackrest: using repo1-path=${repo_path}"
 
     while true; do
+      # Follow the marker on every attempt: the backup watcher can move
+      # archiving to a fresh path while this loop is still retrying (its
+      # half-created-stanza heal — a stanza-create at the old path fails the
+      # same way forever), and the new path is where the stanza belongs.
+      if marker_path=$(cat "$PGBACKREST_REPO_PATH_MARKER" 2>/dev/null) && [ -n "$marker_path" ]; then
+        export PGBACKREST_REPO1_PATH="$marker_path"
+      fi
       if gosu postgres pgbackrest --stanza=main stanza-create; then
         echo "pgbackrest: stanza-create completed"
         # Clear the timeout sentinel — a successful stanza-create either
