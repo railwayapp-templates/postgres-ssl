@@ -126,9 +126,25 @@ PGWAL_THRESHOLD_BYTES=$(( PGWAL_THRESHOLD_MB * 1024 * 1024 ))
 # would collide on stanza identity. With it, archive-push targets
 # ${WAL_ARCHIVE_PATH}/cluster-<sysid> and post-wipe clusters get their own
 # sub-prefix instead of trying to overwrite the predecessor's repo.
+#
+# A marker pgBackRest can never accept (not beginning with `/`, empty,
+# multi-line — same check as wrapper.sh's pgbackrest_repo_path_is_usable) is
+# not exported: it would fail this push at option parsing. wrapper.sh
+# re-derives such a marker at boot, and rewrites pgbackrest.conf's repo1-path
+# with it, so falling back to the conf is falling back to the repaired path.
 if [ -f "$PGDATA/.pgbackrest_repo_path" ]; then
-  PGBACKREST_REPO1_PATH=$(cat "$PGDATA/.pgbackrest_repo_path")
-  export PGBACKREST_REPO1_PATH
+  MARKER_REPO_PATH=$(cat "$PGDATA/.pgbackrest_repo_path" 2>/dev/null || true)
+  case "$MARKER_REPO_PATH" in
+    *$'\n'*|*$'\r'*) MARKER_REPO_PATH_USABLE=0 ;;
+    /*) MARKER_REPO_PATH_USABLE=1 ;;
+    *) MARKER_REPO_PATH_USABLE=0 ;;
+  esac
+  if [ "$MARKER_REPO_PATH_USABLE" = "1" ]; then
+    PGBACKREST_REPO1_PATH="$MARKER_REPO_PATH"
+    export PGBACKREST_REPO1_PATH
+  else
+    echo "pgbackrest-wrapper: repo-path marker holds \"${MARKER_REPO_PATH}\", which pgBackRest can never use; not exporting it (pgbackrest.conf's repo1-path applies)" >&2
+  fi
 fi
 
 # pgBackRest 2.58 rejects --repo on archive-push (it pushes to whatever
