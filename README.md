@@ -209,6 +209,7 @@ Operator-facing env contract:
 | `WAL_BACKUP_DIFF_INTERVAL_HOURS` | image-owned differential base-backup cadence (default `24`; `0` disables) |
 | `WAL_BACKUP_RETENTION_FULL` | full backups kept by `pgbackrest expire` (default `4`) |
 | `WAL_BACKUP_RETENTION_DIFF` | differentials kept by `pgbackrest expire` (default `14`) |
+| `WAL_BACKUP_STALL_SECONDS` | a running base backup whose reported progress has not advanced for this long is killed and retried (default `1800`; the window grows with backup size so large backups are never cut between progress updates; `0` disables) |
 
 Image-level tuning knobs (pgBackRest-native, internal):
 

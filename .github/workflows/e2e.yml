@@ -13,6 +13,20 @@ permissions:
   contents: read
 
 jobs:
+  # Shell unit tests: watcher functions sourced against stub binaries. No
+  # image build, so they finish in seconds.
+  unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Backup stall watchdog
+        shell: bash
+        run: ./test/unit-backup-stall.sh
+
   e2e:
     runs-on: ubuntu-latest
     timeout-minutes: 120
