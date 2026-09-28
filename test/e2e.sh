@@ -21,6 +21,7 @@ PG_VERSION="${PG_VERSION:-17}"
 IMAGE="postgres-ssl-pitr:${PG_VERSION}"
 NET="pgssl-test-net"
 MINIO="minio-test"
+MINIO_IMAGE="postgres-ssl-test-minio:local"
 MINIO_USER="minioadmin"
 MINIO_PASS="minioadmin123"
 BUCKET="pgbackrest"
@@ -147,6 +148,9 @@ ensure_network() {
 }
 
 ensure_minio() {
+  log "building test MinIO server and client"
+  docker build -q -f "$REPO_ROOT/test/Dockerfile.minio" \
+    -t "$MINIO_IMAGE" "$REPO_ROOT/test" >/dev/null || exit 1
   if docker ps --format '{{.Names}}' | grep -q "^${MINIO}$"; then
     return
   fi
@@ -158,10 +162,10 @@ ensure_minio() {
     -e "MINIO_ROOT_USER=$MINIO_USER" \
     -e "MINIO_ROOT_PASSWORD=$MINIO_PASS" \
     -v minio-test-data:/data \
-    quay.io/minio/minio:latest server /data >/dev/null
+    "$MINIO_IMAGE" server /data >/dev/null || exit 1
   # wait for ready
   for _ in 1 2 3 4 5 6 7 8 9 10; do
-    if docker run --rm --network "$NET" --entrypoint /bin/sh quay.io/minio/mc:latest -c \
+    if docker run --rm --network "$NET" --entrypoint /bin/sh "$MINIO_IMAGE" -c \
        "mc alias set local http://${MINIO}:9000 ${MINIO_USER} ${MINIO_PASS}" >/dev/null 2>&1; then
       return
     fi
@@ -172,7 +176,7 @@ ensure_minio() {
 }
 
 mc() {
-  docker run --rm --network "$NET" --entrypoint /bin/sh quay.io/minio/mc:latest -c "
+  docker run --rm --network "$NET" --entrypoint /bin/sh "$MINIO_IMAGE" -c "
     mc alias set local http://${MINIO}:9000 ${MINIO_USER} ${MINIO_PASS} >/dev/null
     $*
   "
@@ -1942,7 +1946,12 @@ t_watcher_initial_full() {
   reset_bucket
   new_volume "$vol"
   docker rm -f "$name" >/dev/null 2>&1 || true
-  run_archiving_pg_fast_watcher "$name" "$vol"
+  # Render the template overrides, then keep them out of pgBackRest's JSON.
+  run_archiving_pg_fast_watcher "$name" "$vol" \
+    -e PGBACKREST_BACKUP_PROCESS_MAX=4 \
+    -e PGBACKREST_ARCHIVE_PUSH_PROCESS_MAX=3 \
+    -e PGBACKREST_ARCHIVE_GET_PROCESS_MAX=3 \
+    -e PGBACKREST_RESTORE_PROCESS_MAX=24
   wait_for_pg "$name" || { ko t_watcher_initial_full "no startup"; fail_dump t_watcher_initial_full "$name"; return; }
 
   # Force a WAL switch so the watcher sees ARCHIVED_COUNT > 0 and trips
@@ -1971,6 +1980,17 @@ t_watcher_initial_full() {
   fulls=$(count_backups_of_type "$name" full)
   if [ "$fulls" != "1" ]; then
     ko t_watcher_initial_full "expected 1 full in repo, got $fulls"
+    return
+  fi
+  if ! docker exec -u postgres "$name" bash -e -o pipefail -c '
+    pgbackrest --stanza=main info --output=json | jq empty
+    for setting in backup:4 archive-push:3 archive-get:3 restore:24; do
+      output=$(pgbackrest help "${setting%:*}" process-max)
+      grep -Fx "current: ${setting#*:}" <<<"$output"
+    done
+  '; then
+    ko t_watcher_initial_full "template overrides corrupted JSON or command-specific worker counts"
+    fail_dump t_watcher_initial_full "$name"
     return
   fi
   ok t_watcher_initial_full

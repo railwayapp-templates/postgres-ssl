@@ -1,0 +1,10 @@
+# Test-only S3 server and client; upstream removed the public registry images.
+FROM golang:1.26.7-bookworm AS build
+# MinIO RELEASE.2025-10-15T17-29-55Z and mc RELEASE.2025-08-13T08-35-41Z.
+RUN CGO_ENABLED=0 GOBIN=/out go install github.com/minio/minio@9e49d5e7a648f00e26f2246f4dc28e6b07f8c84a
+RUN CGO_ENABLED=0 GOBIN=/out go install github.com/minio/mc@7394ce0dd2a80935aded936b09fa12cbb3cb8096
+
+FROM debian:bookworm-slim
+COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=build /out/minio /out/mc /usr/local/bin/
+ENTRYPOINT ["minio"]

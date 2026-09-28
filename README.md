@@ -210,7 +210,7 @@ Operator-facing env contract:
 | `WAL_BACKUP_RETENTION_FULL` | full backups kept by `pgbackrest expire` (default `4`) |
 | `WAL_BACKUP_RETENTION_DIFF` | differentials kept by `pgbackrest expire` (default `14`) |
 
-Image-level tuning knobs (pgBackRest-native, internal):
+Image-level tuning knobs:
 
 | Env var | Purpose |
 |---|---|
@@ -219,6 +219,11 @@ Image-level tuning knobs (pgBackRest-native, internal):
 | `PGBACKREST_ARCHIVE_GET_PROCESS_MAX` | parallel workers for `archive-get`. Default `1` (WAL replay is serial). |
 | `PGBACKREST_BACKUP_PROCESS_MAX` | parallel workers for `backup`. Default auto-sized as `clamp(cpus/4, 1, 16)` (≤25% of CPUs to leave room for live DB). |
 | `PGBACKREST_RESTORE_PROCESS_MAX` | parallel workers for `restore`. Default auto-sized as `clamp(cpus, 1, 32)` (DB is down, but pgBackRest plateaus past ~32 workers). |
+
+The four worker overrides are template settings rendered by `wrapper.sh`.
+The `pgbackrest` launcher removes them only from pgBackRest's environment
+to keep unknown-option warnings out of `info --output=json`. Native
+pgBackRest options remain available.
 
 Per-command worker counts (`process-max`) are auto-sized at container
 start from the cgroup-reported vCPU allocation (`cpu.max` on cgroup v2,
