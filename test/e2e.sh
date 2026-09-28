@@ -3785,7 +3785,7 @@ t_unusable_repo_marker_rederived_from_archive_path() {
     fail_dump "${FUNCNAME[0]}" "${name}-b"
     return
   fi
-  if docker logs "${name}-b" 2>&1 | grep -qF "must begin with /"; then
+  if docker logs "${name}-b" 2>&1 | grep -qE "ERROR:.*must begin with /"; then
     ko "${FUNCNAME[0]}" "pgBackRest still rejected a repo1-path after the re-derive"
     fail_dump "${FUNCNAME[0]}" "${name}-b"
     return
@@ -3857,7 +3857,7 @@ t_unusable_wal_archive_path_falls_back_to_default() {
     fail_dump "${FUNCNAME[0]}" "$name"
     return
   fi
-  if docker logs "$name" 2>&1 | grep -qF "must begin with /"; then
+  if docker logs "$name" 2>&1 | grep -qE "ERROR:.*must begin with /"; then
     ko "${FUNCNAME[0]}" "pgBackRest was handed an unusable repo1-path"
     fail_dump "${FUNCNAME[0]}" "$name"
     return
