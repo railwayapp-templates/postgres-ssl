@@ -573,7 +573,7 @@ half_created_stanza_step() {
   now=$(date +%s)
   first_seen=$(read_state half_stanza_first_seen_at)
   case "$first_seen" in
-    ''|*[!0-9]*)
+    ''|0*|*[!0-9]*)
       write_state_field half_stanza_first_seen_at "$now"
       log "half-created stanza: ${kind} at ${PGBACKREST_REPO1_PATH:-unset}; re-checking on a later poll (>= ${HALF_STANZA_CONFIRM_SECONDS}s) before moving archiving to a fresh path"
       return 0
@@ -581,7 +581,7 @@ half_created_stanza_step() {
   esac
 
   # Corrupt state or a backwards clock must start a fresh confirmation window.
-  if [ "$first_seen" -eq 0 ] || [ "$first_seen" -gt "$now" ]; then
+  if [ "${#first_seen}" -gt "${#now}" ] || [ "$first_seen" -gt "$now" ]; then
     write_state_field half_stanza_first_seen_at "$now"
     return 0
   fi
