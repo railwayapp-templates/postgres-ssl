@@ -580,6 +580,12 @@ half_created_stanza_step() {
       ;;
   esac
 
+  # Corrupt state or a backwards clock must start a fresh confirmation window.
+  if [ "$first_seen" -eq 0 ] || [ "$first_seen" -gt "$now" ]; then
+    write_state_field half_stanza_first_seen_at "$now"
+    return 0
+  fi
+
   local age=$((now - first_seen))
   if [ "$age" -lt "$HALF_STANZA_CONFIRM_SECONDS" ]; then
     return 0
