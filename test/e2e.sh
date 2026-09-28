@@ -1942,7 +1942,12 @@ t_watcher_initial_full() {
   reset_bucket
   new_volume "$vol"
   docker rm -f "$name" >/dev/null 2>&1 || true
-  run_archiving_pg_fast_watcher "$name" "$vol"
+  # Render the template overrides, then keep them out of pgBackRest's JSON.
+  run_archiving_pg_fast_watcher "$name" "$vol" \
+    -e PGBACKREST_BACKUP_PROCESS_MAX=4 \
+    -e PGBACKREST_ARCHIVE_PUSH_PROCESS_MAX=3 \
+    -e PGBACKREST_ARCHIVE_GET_PROCESS_MAX=3 \
+    -e PGBACKREST_RESTORE_PROCESS_MAX=24
   wait_for_pg "$name" || { ko t_watcher_initial_full "no startup"; fail_dump t_watcher_initial_full "$name"; return; }
 
   # Force a WAL switch so the watcher sees ARCHIVED_COUNT > 0 and trips
@@ -1971,6 +1976,17 @@ t_watcher_initial_full() {
   fulls=$(count_backups_of_type "$name" full)
   if [ "$fulls" != "1" ]; then
     ko t_watcher_initial_full "expected 1 full in repo, got $fulls"
+    return
+  fi
+  if ! docker exec -u postgres "$name" bash -e -o pipefail -c '
+    pgbackrest --stanza=main info --output=json | jq empty
+    for setting in backup:4 archive-push:3 archive-get:3 restore:24; do
+      output=$(pgbackrest help "${setting%:*}" process-max)
+      grep -Fx "current: ${setting#*:}" <<<"$output"
+    done
+  '; then
+    ko t_watcher_initial_full "template overrides corrupted JSON or command-specific worker counts"
+    fail_dump t_watcher_initial_full "$name"
     return
   fi
   ok t_watcher_initial_full
