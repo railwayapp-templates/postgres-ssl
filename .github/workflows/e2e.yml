@@ -13,6 +13,20 @@ permissions:
   contents: read
 
 jobs:
+  # Shell unit tests: test/unit.sh runs every test/unit-*.sh against stub
+  # binaries. No image build, so they finish in seconds.
+  unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Run shell unit tests
+        shell: bash
+        run: ./test/unit.sh
+
   e2e:
     runs-on: ubuntu-latest
     timeout-minutes: 120
