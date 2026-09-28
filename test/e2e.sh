@@ -147,6 +147,11 @@ ensure_network() {
 }
 
 ensure_minio() {
+  if ! docker image inspect postgres-test-minio:01ce918-d6541ea >/dev/null 2>&1; then
+    log "building pinned MinIO test tools from official source"
+    docker build -f "$REPO_ROOT/test/minio.Dockerfile" \
+      -t postgres-test-minio:01ce918-d6541ea "$REPO_ROOT/test" || exit 1
+  fi
   if docker ps --format '{{.Names}}' | grep -q "^${MINIO}$"; then
     return
   fi
@@ -158,10 +163,10 @@ ensure_minio() {
     -e "MINIO_ROOT_USER=$MINIO_USER" \
     -e "MINIO_ROOT_PASSWORD=$MINIO_PASS" \
     -v minio-test-data:/data \
-    quay.io/minio/minio:latest server /data >/dev/null
+    postgres-test-minio:01ce918-d6541ea server /data >/dev/null
   # wait for ready
   for _ in 1 2 3 4 5 6 7 8 9 10; do
-    if docker run --rm --network "$NET" --entrypoint /bin/sh quay.io/minio/mc:latest -c \
+    if docker run --rm --network "$NET" --entrypoint /bin/sh postgres-test-minio:01ce918-d6541ea -c \
        "mc alias set local http://${MINIO}:9000 ${MINIO_USER} ${MINIO_PASS}" >/dev/null 2>&1; then
       return
     fi
@@ -172,7 +177,7 @@ ensure_minio() {
 }
 
 mc() {
-  docker run --rm --network "$NET" --entrypoint /bin/sh quay.io/minio/mc:latest -c "
+  docker run --rm --network "$NET" --entrypoint /bin/sh postgres-test-minio:01ce918-d6541ea -c "
     mc alias set local http://${MINIO}:9000 ${MINIO_USER} ${MINIO_PASS} >/dev/null
     $*
   "
