@@ -659,6 +659,52 @@ validate_wal_archive_bucket() {
 }
 validate_wal_archive_bucket
 
+# True when pgBackRest can accept $1 as repo1-path. pgBackRest rejects any
+# repo1-path that does not begin with `/` (`ERROR: [032]: '<path>' must begin
+# with / for 'repo1-path' option`) during option parsing, before it opens a
+# single connection — so a value that fails this check can never have written
+# (or read) a single object in the bucket. Multi-line values are rejected too:
+# the marker is one line by construction, and a newline would split the
+# rendered `repo1-path=` line in pgbackrest.conf.
+#
+# The same check lives in pgbackrest-backup-watcher.sh and
+# pgbackrest-archive-push-wrapper.sh (standalone scripts, nothing sourced);
+# keep the three in step.
+pgbackrest_repo_path_is_usable() {
+  local path="$1"
+  case "$path" in
+    /*) ;;
+    *) return 1 ;;
+  esac
+  case "$path" in
+    *$'\n'*|*$'\r'*) return 1 ;;
+  esac
+  return 0
+}
+
+# Screen WAL_ARCHIVE_PATH the way validate_wal_archive_bucket screens the
+# bucket. The shape seen in the fleet is a path mangled by an MSYS shell (Git
+# Bash on Windows rewrites a `/pgbackrest-staging` CLI argument into
+# `C:/Program Files/Git/pgbackrest-staging`). pgBackRest rejects every command
+# against such a path, so honouring it means archive-push failing on every WAL
+# switch until the drop threshold throws WAL away, and no backup ever landing.
+#
+# Falls back to the image default rather than disabling archiving: the bucket
+# and credentials are fine, only the prefix is unusable, and the per-cluster
+# sub-path (`cluster-<sysid>`) makes the default prefix collision-free. The
+# fallback cannot strand data — the rejected value never produced an object.
+# Exported so every consumer (pgbackrest.conf rendering, marker derivation,
+# pgbackrest-init.sh during initdb, the watcher) sees the same value. Never
+# fails the boot.
+validate_wal_archive_path() {
+  local val="${WAL_ARCHIVE_PATH:-}"
+  [ -z "$val" ] && return 0
+  pgbackrest_repo_path_is_usable "$val" && return 0
+  echo "pgbackrest: WAL_ARCHIVE_PATH=\"${val}\" is not an absolute path (pgBackRest requires repo1-path to begin with /); archiving under the image default /pgbackrest instead. Set WAL_ARCHIVE_PATH to an absolute path such as /pgbackrest — a shell like Git Bash on Windows rewrites a leading-slash argument into a C:/... path." >&2
+  export WAL_ARCHIVE_PATH=/pgbackrest
+}
+validate_wal_archive_path
+
 # Add `include_dir = 'conf.d'` to postgresql.conf if not already present.
 # postgresql.conf is not rewritten by Postgres at runtime (only auto.conf is,
 # by ALTER SYSTEM), so this single line is durable. Called from both the
@@ -722,8 +768,12 @@ write_pgbackrest_repo_anchor() {
 
 # Resolve the effective repo1-path for archiving:
 #
-#   1. Marker file present → trust it. Idempotent across boots; survives
-#      container restarts; wiped with the volume.
+#   1. Marker file present and usable → trust it. Idempotent across boots;
+#      survives container restarts; wiped with the volume. A marker pgBackRest
+#      can never accept (see pgbackrest_repo_path_is_usable) is not a stable
+#      path, it is a broken one — it falls through to derivation below and
+#      gets rewritten. The boot normally repairs it earlier, in
+#      rederive_unusable_pgbackrest_repo_path; this is the backstop.
 #   2. pg_control exists, marker absent → derive
 #      `${WAL_ARCHIVE_PATH}/cluster-<sysid>`, write marker.
 #   3. Pre-initdb (no pg_control) → return `${WAL_ARCHIVE_PATH}` as a
@@ -739,8 +789,13 @@ derive_pgbackrest_repo_path() {
   local user_path="${WAL_ARCHIVE_PATH:-/pgbackrest}"
 
   if [ -f "$PGBACKREST_REPO_PATH_MARKER" ]; then
-    cat "$PGBACKREST_REPO_PATH_MARKER"
-    return 0
+    local marker_path
+    marker_path=$(cat "$PGBACKREST_REPO_PATH_MARKER" 2>/dev/null || true)
+    if pgbackrest_repo_path_is_usable "$marker_path"; then
+      printf '%s\n' "$marker_path"
+      return 0
+    fi
+    echo "pgbackrest: repo-path marker holds \"${marker_path}\", which pgBackRest can never use; re-deriving it from WAL_ARCHIVE_PATH" >&2
   fi
 
   local sysid
@@ -981,6 +1036,65 @@ reanchor_pgbackrest_repo_path_if_reidentified() {
   fi
 
   echo "pgbackrest: re-anchored to ${new_path}; stanza-create and an immediate full backup follow there. The previous cluster's archive is untouched at ${current_path}."
+  return 0
+}
+
+# Repair a repo-path marker that pgBackRest can never accept. The marker wins
+# verbatim over derivation so that the active path stays stable across boots —
+# but that only holds for a path pgBackRest can use. A marker derived from a
+# WAL_ARCHIVE_PATH that was not absolute (an MSYS-mangled `C:/Program Files/...`
+# value, for one) pins the service to a path every pgBackRest command rejects
+# during option parsing: stanza-create fails every retry, archive-push fails
+# every WAL switch until the drop threshold discards WAL, no backup ever lands.
+# Correcting WAL_ARCHIVE_PATH does not help, because the marker outranks it.
+#
+# Such a marker anchors nothing: pgBackRest refused the option before any I/O,
+# so no object exists at it and there is no history to keep reachable. The
+# path is re-derived from the current (already screened) WAL_ARCHIVE_PATH,
+# `${WAL_ARCHIVE_PATH%/}/cluster-<sysid>` — the exact path a first-time derive
+# would have produced — and the move goes through the same flip as a
+# re-anchor: the watcher's state is replaced (it only ever described failed
+# attempts at the unusable path), the marker and pgbackrest.conf flip, the
+# spool's .error statuses from the rejected pushes and any gap sentinel are
+# dropped, and the anchor is written last with the live identity, so the
+# re-identification check that runs next is a no-op.
+#
+# A usable marker is never touched here — marker-wins stays the rule for every
+# path pgBackRest accepts, including a watcher WAL_REGRESSION migration's
+# cluster-<sysid>-<epoch>. Runs before Postgres starts (nothing is archiving
+# yet) and never fails the boot.
+rederive_unusable_pgbackrest_repo_path() {
+  [ -z "${WAL_ARCHIVE_BUCKET:-}" ] && return 0
+  [ ! -f "$PGDATA/global/pg_control" ] && return 0
+  [ ! -f "$PGBACKREST_REPO_PATH_MARKER" ] && return 0
+
+  local current_path
+  current_path=$(cat "$PGBACKREST_REPO_PATH_MARKER" 2>/dev/null || true)
+  pgbackrest_repo_path_is_usable "$current_path" && return 0
+
+  local live_sysid live_major
+  live_sysid=$(read_postgres_sysid)
+  live_major=$(read_postgres_major)
+  if [ -z "$live_sysid" ] || [ -z "$live_major" ]; then
+    echo "pgbackrest: repo-path marker holds \"${current_path}\", which pgBackRest can never use, but the cluster identity is unreadable (sysid='${live_sysid}', PG_VERSION='${live_major}'); stanza bootstrap re-derives it once Postgres is up" >&2
+    return 0
+  fi
+
+  local user_path new_path
+  user_path="${WAL_ARCHIVE_PATH:-/pgbackrest}"
+  new_path="${user_path%/}/cluster-${live_sysid}"
+
+  echo "pgbackrest: repo-path marker holds \"${current_path}\", which pgBackRest can never use (repo1-path must begin with /); nothing was ever archived there. Re-deriving archiving onto ${new_path}" >&2
+
+  if ! reanchor_pgbackrest_repo_path "$current_path" "$new_path"; then
+    echo "pgbackrest: could not move archiving onto ${new_path}; stanza bootstrap re-derives it once Postgres is up. The database is starting regardless." >&2
+    return 0
+  fi
+
+  write_pgbackrest_repo_anchor "$live_sysid" "$live_major" \
+    || echo "pgbackrest: re-derived the repo path to ${new_path} but could not write the anchor; the re-identification check backfills it" >&2
+
+  echo "pgbackrest: repo path re-derived to ${new_path}; stanza-create and an immediate full backup follow there"
   return 0
 }
 
@@ -1874,6 +1988,11 @@ if [ -n "${WAL_ARCHIVE_BUCKET:-}" ] && [ -f "$PGDATA/global/pg_control" ] && [ !
   echo "pgbackrest: pre-fork repo-path marker = ${_early_repo_path}"
   unset _early_repo_path
 fi
+
+# A marker pgBackRest can never accept is re-derived before anything reads it
+# (the archive-push wrapper, stanza bootstrap, the watcher). Ahead of the
+# re-identification check so that one only ever compares a usable path.
+rederive_unusable_pgbackrest_repo_path || true
 
 # …and when a marker IS present, check it still belongs to the cluster on disk.
 # Disjoint from the block above (that one only fires with no marker at all) and
