@@ -148,7 +148,7 @@ WAL_LAG_GAP_THRESHOLD_SEGMENTS="${WAL_LAG_GAP_THRESHOLD_SEGMENTS:-32}"
 # (src/command/backup/backup.c, backupJobCallback: `if (percentComplete -
 # *currentPercentComplete > 10)` → cmdLockWriteP), so the reported bytes
 # advance in ~11 % steps. A multi-TB backup legitimately spends a long time
-# between steps, so the window is max(floor, 11 % of size / this rate): only
+# between steps, so the window is max(floor, 0.11 % of size / this rate): only
 # a backup copying slower than 4 MiB/s sustained could be cut, and at that
 # rate a 1 TiB backup would take three days.
 #
@@ -389,11 +389,13 @@ is_standby() {
 # lock is read from this host's lock-path, which is where the child runs.
 
 # Effective stall window for a backup of $1 bytes (0 = size not reported yet):
-# max(WAL_BACKUP_STALL_SECONDS, 11 % of size / WAL_BACKUP_STALL_MIN_BYTES_PER_SECOND).
+# pgBackRest stores percent-complete in hundredths: 100% == 10000.
+# Its >10 threshold is >0.10 percentage points, rounded up here to 0.11%.
+# max(WAL_BACKUP_STALL_SECONDS, 0.11 % of size / WAL_BACKUP_STALL_MIN_BYTES_PER_SECOND).
 backup_stall_window_seconds() {
   local size="${1:-0}" scaled
   case "$size" in ''|*[!0-9]*) size=0 ;; esac
-  scaled=$(( size * 11 / 100 / BACKUP_STALL_MIN_BYTES_PER_SECOND ))
+  scaled=$(( size / 10000 * 11 / BACKUP_STALL_MIN_BYTES_PER_SECOND ))
   if [ "$scaled" -gt "$BACKUP_STALL_SECONDS" ]; then
     echo "$scaled"
   else
@@ -414,10 +416,10 @@ backup_is_stalled() {
 # "<size-cplt>/<size>", "-" for a field not reported yet) and
 # BACKUP_PROGRESS_SIZE (total bytes, 0 when unknown). Returns 1 when the probe
 # is inconclusive (info errored or unparseable) — the caller keeps its last
-# observation, so a failed probe never counts as progress.
+# observation, and resets the observation window. Missing telemetry is not proof of a stall.
 probe_backup_progress() {
   local info_out parsed
-  info_out=$(timeout 60 pgbackrest --stanza=main --repo=1 info --output=json 2>/dev/null) || return 1
+  info_out=$(timeout --kill-after=5 60 pgbackrest --stanza=main --repo=1 info --output=json 2>/dev/null) || return 1
   [ -z "$info_out" ] && return 1
   parsed=$(printf '%s' "$info_out" | jq -r '
     [.[]? | select(.name == "main")][0].status.lock.backup as $l
@@ -479,7 +481,14 @@ run_backup_supervised() {
     now=$(date +%s)
     [ "$now" -lt "$next_probe" ] && continue
     next_probe=$((now + BACKUP_STALL_POLL_SECONDS))
-    if probe_backup_progress && [ "$BACKUP_PROGRESS_TOKEN" != "$last_token" ]; then
+    if ! probe_backup_progress; then
+      # Do not infer a frozen backup from a failed/unparseable info request.
+      # Require a fresh full window of successful observations after recovery.
+      last_token=""
+      last_progress_at="$now"
+      continue
+    fi
+    if [ "$BACKUP_PROGRESS_TOKEN" != "$last_token" ]; then
       last_token="$BACKUP_PROGRESS_TOKEN"
       size="$BACKUP_PROGRESS_SIZE"
       last_progress_at="$now"
@@ -591,7 +600,7 @@ run_backup() {
 # null/empty/false, exit 2 on parse error.
 catalog_check_backup() {
   local info_out rc
-  info_out=$(timeout 60 pgbackrest --stanza=main --repo=1 info --output=json 2>/dev/null)
+  info_out=$(timeout --kill-after=5 60 pgbackrest --stanza=main --repo=1 info --output=json 2>/dev/null)
   rc=$?
   [ "$rc" -ne 0 ] && return 2
   [ -z "$info_out" ] && return 2

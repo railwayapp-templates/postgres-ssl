@@ -53,6 +53,10 @@ case " $* " in
     esac
     ;;
   *" info "*)
+    case "$(cat "$d/info-mode" 2>/dev/null)" in
+      error) exit 1 ;;
+      malformed) echo 'not-json'; exit 0 ;;
+    esac
     pid=$(cat "$d/backup.pid" 2>/dev/null)
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
       echo "[{\"name\":\"main\",\"status\":{\"code\":0,\"lock\":{\"backup\":{\"held\":true,\"size-cplt\":$(cat "$d/size-cplt"),\"size\":100000},\"restore\":{\"held\":false}}}}]"
@@ -73,6 +77,7 @@ STUB
 if ! command -v timeout >/dev/null 2>&1; then
   cat > "$WORK/bin/timeout" <<'STUB'
 #!/usr/bin/env bash
+[ "${1:-}" = "--kill-after=5" ] && shift
 shift
 exec "$@"
 STUB
@@ -91,14 +96,14 @@ echo "window + verdict"
 BACKUP_STALL_SECONDS=1800
 BACKUP_STALL_MIN_BYTES_PER_SECOND=4194304
 assert_eq "no size reported → floor" "$(backup_stall_window_seconds 0)" 1800
-assert_eq "112 GiB → one 11% step at 4 MiB/s (~53 min)" \
-  "$(backup_stall_window_seconds $((112 * 1024 * 1024 * 1024)))" 3153
-assert_eq "1 TiB → 11% of size at 4 MiB/s" \
-  "$(backup_stall_window_seconds $((1024 * 1024 * 1024 * 1024)))" 28835
+assert_eq "112 GiB → floor covers progress granularity" \
+  "$(backup_stall_window_seconds $((112 * 1024 * 1024 * 1024)))" 1800
+assert_eq "1 TiB → floor covers 0.11% at 4 MiB/s" \
+  "$(backup_stall_window_seconds $((1024 * 1024 * 1024 * 1024)))" 1800
 assert_eq "junk size → floor" "$(backup_stall_window_seconds abc)" 1800
 backup_is_stalled 2000 200 0 && pass "1800s without progress is a stall" || fail "1800s without progress is a stall"
 backup_is_stalled 1999 200 0 && fail "1799s without progress is not a stall" || pass "1799s without progress is not a stall"
-backup_is_stalled 20000 0 $((1024 * 1024 * 1024 * 1024)) \
+backup_is_stalled 1700 0 $((1024 * 1024 * 1024 * 1024)) \
   && fail "1 TiB backup between progress steps is not a stall" \
   || pass "1 TiB backup between progress steps is not a stall"
 
@@ -146,6 +151,21 @@ assert_eq "run_backup succeeds" "$rc" 0
 grep -q "backup stalled" "$WORK/progress.log" && fail "progressing backup was killed" || pass "no stall kill"
 grep -q "backup --type=diff completed" "$WORK/progress.log" && pass "completed normally" || fail "completion line missing"
 [ -n "$(read_state last_diff_at)" ] && pass "last_diff_at recorded" || fail "last_diff_at missing"
+
+# Missing telemetry must never kill an otherwise completing backup.
+for info_mode in error malformed; do
+  reset_state
+  BACKUP_STALL_SECONDS=2
+  echo progress > "$STUB_DIR/mode"
+  echo 5 > "$STUB_DIR/steps"
+  echo "$info_mode" > "$STUB_DIR/info-mode"
+  run_backup_supervised diff > "$WORK/$info_mode.log" 2>&1
+  assert_eq "$info_mode telemetry leaves backup running to completion" "$?" 0
+  grep -q 'backup stalled' "$WORK/$info_mode.log" && fail "$info_mode caused a kill"
+done
+BACKUP_STALL_SECONDS=1800
+assert_eq "100 TiB uses 0.11% scaled window" \
+  "$(backup_stall_window_seconds $((100 * 1024 * 1024 * 1024 * 1024)))" 28835
 
 # ---- 4. watchdog off --------------------------------------------------------
 echo "WAL_BACKUP_STALL_SECONDS=0 runs unsupervised"
