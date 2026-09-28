@@ -21,6 +21,7 @@ PG_VERSION="${PG_VERSION:-17}"
 IMAGE="postgres-ssl-pitr:${PG_VERSION}"
 NET="pgssl-test-net"
 MINIO="minio-test"
+MINIO_IMAGE="postgres-ssl-test-minio:local"
 MINIO_USER="minioadmin"
 MINIO_PASS="minioadmin123"
 BUCKET="pgbackrest"
@@ -147,6 +148,9 @@ ensure_network() {
 }
 
 ensure_minio() {
+  log "building test MinIO server and client"
+  docker build -q -f "$REPO_ROOT/test/Dockerfile.minio" \
+    -t "$MINIO_IMAGE" "$REPO_ROOT/test" >/dev/null || exit 1
   if docker ps --format '{{.Names}}' | grep -q "^${MINIO}$"; then
     return
   fi
@@ -158,10 +162,10 @@ ensure_minio() {
     -e "MINIO_ROOT_USER=$MINIO_USER" \
     -e "MINIO_ROOT_PASSWORD=$MINIO_PASS" \
     -v minio-test-data:/data \
-    quay.io/minio/minio:latest server /data >/dev/null
+    "$MINIO_IMAGE" server /data >/dev/null || exit 1
   # wait for ready
   for _ in 1 2 3 4 5 6 7 8 9 10; do
-    if docker run --rm --network "$NET" --entrypoint /bin/sh quay.io/minio/mc:latest -c \
+    if docker run --rm --network "$NET" --entrypoint /bin/sh "$MINIO_IMAGE" -c \
        "mc alias set local http://${MINIO}:9000 ${MINIO_USER} ${MINIO_PASS}" >/dev/null 2>&1; then
       return
     fi
@@ -172,7 +176,7 @@ ensure_minio() {
 }
 
 mc() {
-  docker run --rm --network "$NET" --entrypoint /bin/sh quay.io/minio/mc:latest -c "
+  docker run --rm --network "$NET" --entrypoint /bin/sh "$MINIO_IMAGE" -c "
     mc alias set local http://${MINIO}:9000 ${MINIO_USER} ${MINIO_PASS} >/dev/null
     $*
   "
