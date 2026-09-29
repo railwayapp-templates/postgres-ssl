@@ -808,6 +808,8 @@ t_collation_drift_reindexes_before_refresh() {
   # a uuid column — never collatable, must never be touched.
   cd_psql_must "$name" "CREATE SCHEMA \"Weird Schema\"; CREATE COLLATION \"Weird Schema\".\"my coll\" (provider = libc, locale = 'en_US.utf8'); CREATE TABLE \"Weird Schema\".\"w t\"(a text COLLATE \"Weird Schema\".\"my coll\", u uuid); INSERT INTO \"Weird Schema\".\"w t\" VALUES ('x1', gen_random_uuid()), ('x2', gen_random_uuid()); CREATE INDEX \"w idx\" ON \"Weird Schema\".\"w t\"(a); CREATE INDEX w_u_idx ON \"Weird Schema\".\"w t\"(u)" || { ko "$t" "seed failed"; return; }
 
+  cd_psql_must "$name" "CREATE INDEX ct_default_partial ON ct ((length(a))) WHERE a > 'm'; CREATE INDEX ct_default_expression ON ct ((a > 'm'))" || { ko "$t" "implicit default seed failed"; return; }
+
   # Act 1: fake the recorded default-collation version AND the named
   # collation's version, restart.
   cd_psql_must "$name" "SET allow_system_table_mods = on; UPDATE pg_database SET datcollversion = '0.fake' WHERE datname = current_database()" || { ko "$t" "could not fake datcollversion"; return; }
@@ -820,6 +822,9 @@ t_collation_drift_reindexes_before_refresh() {
   logs=$(docker logs "$name" 2>&1)
   assert_contains "$logs" "collation-refresh: postgres: collation version mismatch — default collation recorded 0.fake" "mismatch logged with recorded vs. provided version" || { ko "$t" "mismatch not logged"; fail_dump "$t" "$name"; return; }
   assert_contains "$logs" "collation-refresh: reindexing postgres.public.ct_a_idx (collation version changed)" "default-collation index rebuilt concurrently" || { ko "$t" "ct_a_idx not rebuilt"; fail_dump "$t" "$name"; return; }
+  for idx in ct_default_partial ct_default_expression; do
+    assert_contains "$logs" "collation-refresh: reindexing postgres.public.$idx (collation version changed)" "implicit default dependency rebuilt" || { ko "$t" "$idx not rebuilt"; fail_dump "$t" "$name"; return; }
+  done
   assert_contains "$logs" "non-concurrently (exclusion constraint" "exclusion index took the non-concurrent path" || { ko "$t" "exclusion index path"; fail_dump "$t" "$name"; return; }
   assert_contains "$logs" 'collation-refresh: reindexing postgres."Weird Schema"."w idx" (collation version changed)' "quote-needing index rebuilt" || { ko "$t" "w idx not rebuilt"; fail_dump "$t" "$name"; return; }
   if echo "$logs" | grep -q "w_u_idx"; then

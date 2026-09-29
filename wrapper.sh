@@ -2034,8 +2034,8 @@ fork_post_upgrade_config_restore() {
           # non-archiving image restoring it is harmless, but with archiving
           # enabled a stashed 'minimal' would refuse the next boot
           # (archive_mode=on requires wal_level >= replica).
-          if [ "$key" = "wal_level" ] && [ -n "${WAL_ARCHIVE_BUCKET:-}" ]; then
-            echo "post-upgrade:   wal_level: not re-applied (archiving is enabled on this image; a stashed value below 'replica' would refuse the next boot)"
+          if [ "$key" = "wal_level" ] && [ -n "${WAL_ARCHIVE_BUCKET:-}" ] && [ "$value" = "'minimal'" ]; then
+            echo "post-upgrade:   wal_level=minimal: not re-applied (archiving requires replica or logical)"
             skipped=$((skipped + 1)); continue
           fi
           case " $CONFIG_RESTORE_SKIP_GUCS " in
@@ -2202,6 +2202,13 @@ _rx_suspect_indexes() {
       WHERE d.classid = 'pg_class'::regclass
         AND d.refclassid = 'pg_collation'::regclass
         AND d.refobjid IN (SELECT oid FROM suspect)
+      UNION
+      -- PostgreSQL omits pg_depend edges to pinned default collation.
+      -- Boolean expressions and partial predicates have indcollation=0.
+      -- Conservatively rebuild these when default ordering is suspect.
+      SELECT i.indexrelid FROM pg_index i
+      WHERE (i.indexprs IS NOT NULL OR i.indpred IS NOT NULL)
+        AND 100::oid IN (SELECT oid FROM suspect)
     )
     SELECT DISTINCT (EXISTS (SELECT 1 FROM pg_constraint x WHERE x.conindid = i.indexrelid AND x.contype = 'x'))::int
            || ' ' || format('%I.%I', n.nspname, c.relname)
