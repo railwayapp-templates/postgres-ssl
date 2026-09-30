@@ -218,24 +218,35 @@ Image-level tuning knobs:
 | `WAL_DROP_THRESHOLD_MB` | `pg_wal/` size at which the archive-push wrapper drops failing segments to keep Postgres running (default computed as half the data volume, capped at 5 GiB, floor 128 MiB — same formula as `PGBACKREST_ARCHIVE_PUSH_QUEUE_MAX`; falls back to a flat 5 GiB if volume size can't be detected). Outside the `PGBACKREST_*` namespace on purpose — pgBackRest treats unknown `PGBACKREST_*` vars as config options and warns about them on every push. |
 | `PGBACKREST_ARCHIVE_PUSH_PROCESS_MAX` | parallel workers for `archive-push`. Default auto-sized as `clamp(cpus/8, 2, 8)`. |
 | `PGBACKREST_ARCHIVE_GET_PROCESS_MAX` | parallel workers for `archive-get`. Default `1` (WAL replay is serial). |
-| `PGBACKREST_BACKUP_PROCESS_MAX` | parallel workers for `backup`. Default auto-sized as `clamp(cpus/4, 1, 16)` (≤25% of CPUs to leave room for live DB). |
+| `PGBACKREST_BACKUP_PROCESS_MAX` | parallel workers for `backup`. Default `1`, independent of vCPU, to reduce contention with live queries on IOPS-limited volumes. Explicit overrides still win. |
 | `PGBACKREST_RESTORE_PROCESS_MAX` | parallel workers for `restore`. Default auto-sized as `clamp(cpus, 1, 32)` (DB is down, but pgBackRest plateaus past ~32 workers). |
+| `PGBACKREST_START_FAST` | native pgBackRest option. Default `n` in the image config: spread the backup-start checkpoint instead of forcing a fast one. Set `y` to opt into the previous behavior. |
+
+Full and differential backups use one worker and `start-fast=n` by default.
+This reduces reader concurrency and checkpoint write bursts; it is not a hard
+IOPS or bytes/sec cap, and one reader can still saturate a busy volume. Backups
+can take longer to start and finish. WAL shipping, archive-get, restore worker
+counts, backup cadence and retention are unchanged. Redeploy to pick up the
+new defaults; an existing explicit override continues to apply.
+
+The default 30-minute pgBackRest `db-timeout` and backup stall window allow
+for the normal checkpoint wait. If you use unusually long or slow checkpoints,
+align `PGBACKREST_DB_TIMEOUT`, `PGBACKREST_PROTOCOL_TIMEOUT` (greater than
+`db-timeout`) and `WAL_BACKUP_STALL_SECONDS` with that wait. Do not shorten the
+stall window below the expected checkpoint duration.
 
 The four worker overrides are template settings rendered by `wrapper.sh`.
 The `pgbackrest` launcher removes them only from pgBackRest's environment
 to keep unknown-option warnings out of `info --output=json`. Native
 pgBackRest options remain available.
 
-Per-command worker counts (`process-max`) are auto-sized at container
-start from the cgroup-reported vCPU allocation (`cpu.max` on cgroup v2,
-`cpu.cfs_quota_us` on v1, `nproc` as a fallback). The four commands have
-different bottleneck shapes — `archive-push` is gated by serial WAL
-arrival and S3 PUT overhead, `archive-get` by serial replay inside
-Postgres, `backup` by the need to leave CPU for live DB traffic,
-`restore` by nothing (DB is down) — so each gets its own derived
-default. The `PGBACKREST_*_PROCESS_MAX` env vars (table above) are
-escape hatches for workloads that disprove the heuristic. On vertical
-autoscale, the new values take effect on the next container restart.
+Archive-push and restore worker counts (`process-max`) are auto-sized at
+container start from the cgroup-reported vCPU allocation (`cpu.max` on cgroup
+v2, `cpu.cfs_quota_us` on v1, `nproc` as a fallback). Archive-get defaults to
+one worker because replay is serial; backup defaults to one because volume
+IOPS do not scale with vCPU. The `PGBACKREST_*_PROCESS_MAX` env vars (table
+above) override each command independently. Changes take effect on the next
+container restart.
 
 Stanza initialization (`pgbackrest stanza-create --repo=1`) runs
 automatically the first time the container boots with `WAL_ARCHIVE_BUCKET`
@@ -370,9 +381,9 @@ fresh full fires once grace elapses instead of waiting for the next
 periodic full (#85, hardened by #86).
 
 `pgbackrest backup` is invoked with `--type=full` or `--type=diff`
-depending on the trigger; the `process-max=backup` setting (default
-`clamp(cpus/4, 1, 16)`) caps copy concurrency to leave CPU for live DB
-traffic. Backups run with `--no-expire-auto`; `pgbackrest expire` is then
+depending on the trigger; `[global:backup] process-max=1` defaults to one
+copy worker to reduce disk contention with live DB traffic. Backups run with
+`--no-expire-auto`; `pgbackrest expire` is then
 called as its own step right after a *successful* backup, and removes
 fulls/diffs beyond `WAL_BACKUP_RETENTION_FULL` / `_DIFF`, plus the WAL
 their manifests no longer pin. Splitting the two matters because

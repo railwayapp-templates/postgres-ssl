@@ -143,7 +143,7 @@ WAL_LAG_GAP_THRESHOLD_SEGMENTS="${WAL_LAG_GAP_THRESHOLD_SEGMENTS:-32}"
 #
 # WAL_BACKUP_STALL_SECONDS (default 1800 = 30 min; 0 disables the watchdog):
 # the floor of the window. It has to cover the phases where pgBackRest reports
-# no byte progress at all: pg_backup_start (start-fast=y, so one immediate
+# no byte progress at all: pg_backup_start (start-fast=n, so allow a spread
 # checkpoint), removing a non-resumable earlier attempt from the bucket,
 # building and saving the manifest, and the tail after the last progress write
 # (pg_backup_stop plus the archive-timeout wait for the closing WAL). On a
