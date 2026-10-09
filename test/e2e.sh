@@ -992,7 +992,7 @@ t_invalid_bucket_skips_archive() {
     # suite-load. Without this polling loop, the test is a flake.
     local log_deadline=$(($(date +%s) + 30)) log_hit=0
     while [ "$(date +%s)" -lt "$log_deadline" ]; do
-      if docker logs "$name" 2>&1 | grep -q "WAL_ARCHIVE_BUCKET.*looks invalid"; then
+      if docker logs "$name" 2>&1 | grep -q "WAL_ARCHIVE_BUCKET.*doesn't resolve to a bucket name"; then
         log_hit=1; break
       fi
       sleep 1

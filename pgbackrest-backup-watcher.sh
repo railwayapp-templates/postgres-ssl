@@ -223,6 +223,9 @@ sanitize_uint WAL_BACKUP_STALL_KILL_GRACE_SECONDS BACKUP_STALL_KILL_GRACE_SECOND
 [ "$BACKUP_STALL_POLL_SECONDS" -eq 0 ] && BACKUP_STALL_POLL_SECONDS=60
 
 log() { echo "pgbackrest-watcher: $*"; }
+# Per-iteration chatter (a replica skipping, an idle primary with nothing to
+# do) is printed only when PGBACKREST_WATCHER_DEBUG=1.
+debug() { [ "${PGBACKREST_WATCHER_DEBUG:-0}" = "1" ] && echo "pgbackrest-watcher: $*"; return 0; }
 
 # State file is `key=value\n`-shaped: trivially read/written by bash without
 # adding a JSON dep. Schema (all values are integer epoch seconds or counts):
@@ -1710,11 +1713,11 @@ emit_wal_heartbeat() {
 
 watcher_iteration() {
   if ! pg_isready -h 127.0.0.1 -p 5432 -U "${PGUSER:-postgres}" -q 2>/dev/null; then
-    log "iteration skipped: pg_isready=fail (postgres not yet listening on TCP)"
+    debug "iteration skipped: pg_isready=fail (postgres not yet listening on TCP)"
     return 0
   fi
   if is_standby; then
-    log "iteration skipped: standby"
+    debug "iteration skipped: standby"
     return 0
   fi
 
@@ -1748,7 +1751,7 @@ watcher_iteration() {
   if [ -z "$DECIDED_ACTION" ]; then
     # Surface why decide_action stayed silent so post-mortems on "watcher
     # ran for N minutes and never took a backup" don't require guessing.
-    log "iteration: no action (last_full=${LAST_FULL_DIAG:-?}, archived=${ARCHIVED_COUNT:-?}, failed=${FAILED_COUNT:-?}, gap_marker=${GAP_MARKER_DIAG:-?}, gap_state=${GAP_STATE_DIAG:-?}, last_full_failed=${LAST_FULL_FAILED_DIAG:-?}, lag=${LAST_OBSERVED_LAG_SEGMENTS:-?}, migration_pending=${MIGRATION_PENDING_DIAG:-none})"
+    debug "iteration: no action (last_full=${LAST_FULL_DIAG:-?}, archived=${ARCHIVED_COUNT:-?}, failed=${FAILED_COUNT:-?}, gap_marker=${GAP_MARKER_DIAG:-?}, gap_state=${GAP_STATE_DIAG:-?}, last_full_failed=${LAST_FULL_FAILED_DIAG:-?}, lag=${LAST_OBSERVED_LAG_SEGMENTS:-?}, migration_pending=${MIGRATION_PENDING_DIAG:-none})"
     return 0
   fi
 

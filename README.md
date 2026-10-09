@@ -47,8 +47,10 @@ levels on the one stream, so this trades per-line severity for a log view
 where an error is an error. Unset — or any other value — keeps the upstream
 behavior.
 
-The image's own diagnostics are unaffected either way: certificate,
-volume-lock and pgBackRest warnings from `wrapper.sh` stay on stderr.
+The image's own diagnostics are unaffected either way: certificate and
+pgBackRest warnings and every boot refusal from `wrapper.sh` go to stderr,
+and notes that the boot continues (a lock file that could not be opened)
+go to stdout.
 
 ### Available image tags
 
@@ -202,7 +204,7 @@ Operator-facing env contract:
 | `WAL_ARCHIVE_REGION` | bucket region |
 | `WAL_ARCHIVE_KEY` / `WAL_ARCHIVE_SECRET` | bucket credentials |
 | `WAL_ARCHIVE_PATH` | path prefix where archive-push writes (default `/pgbackrest`) |
-| `WAL_RECOVER_FROM_BUCKET` / `_ENDPOINT` / `_REGION` / `_KEY` / `_SECRET` / `_PATH` | source-bucket coordinates on a PITR-restored fork; mounted as `repo2` (read-only) so `archive-get` and the empty-volume `pgbackrest restore` can pull source WAL during replay. Set by backboard on restore; not normally a manual knob. |
+| `WAL_RECOVER_FROM_BUCKET` / `_ENDPOINT` / `_REGION` / `_KEY` / `_SECRET` / `_PATH` | source-bucket coordinates on a PITR-restored fork; mounted as `repo2` (read-only) so `archive-get` and the empty-volume `pgbackrest restore` can pull source WAL during replay. Set by Railway on restore; not normally a manual knob. |
 | `POSTGRES_RECOVERY_TARGET_TIME` | ISO 8601 timestamp; stages archive-recovery replay on next start |
 | `POSTGRES_ARCHIVE_TIMEOUT` | seconds Postgres waits before forcing a WAL switch (default `60`) |
 | `WAL_BACKUP_FULL_INTERVAL_HOURS` | image-owned full base-backup cadence (default `168` = weekly; `0` disables periodic fulls). Initial / gap-recovery fulls fire regardless. |
@@ -346,9 +348,9 @@ to restore from.
 
 `WAL_RECOVER_FROM_PATH` on a restored service must point at the
 specific source-side `cluster-<sysid>` sub-prefix the user wants to
-restore from — `pgbackrest restore` reads from one path. Backboard
-discovers per-cluster sub-prefixes by listing the bucket and
-surfaces them as separate "histories" in the restore UI.
+restore from — `pgbackrest restore` reads from one path. Railway
+reads the bucket's per-cluster sub-prefixes and shows them as
+separate "histories" in the restore UI.
 
 In HA, every Postgres node runs the watcher and standbys exit early on
 `SELECT pg_is_in_recovery()` — only the leader performs backups. v1 of
@@ -452,9 +454,9 @@ docker build -f Dockerfile.upgrade \
 
 It runs against the database's own volume while the service is stopped, and
 selects its mode from the `UPGRADE_JOB_MODE` env var — never `startCommand`
-or a positional arg, which the dispatcher (railwayapp/mono#34384) can't rely
-on: Railway's two container runtimes disagree on how a deployment's
-`startCommand` composes with the image's own `ENTRYPOINT`. A positional arg
+or a positional arg, which Railway can't rely on: how a deployment's
+`startCommand` composes with the image's own `ENTRYPOINT` isn't
+guaranteed. A positional arg
 still works for local/manual runs and the e2e harness, which invoke the
 script directly, but only as a fallback — an env var takes priority, and an
 unrecognized positional arg refuses rather than silently defaulting to
@@ -761,7 +763,7 @@ the old prefix stays in the bucket as a browsable, restorable history of
 the pre-upgrade cluster, but nothing expires it — its retention was driven
 by `pgbackrest expire` runs that now happen on the new prefix only. Adding
 expiry/cleanup for orphaned `cluster-*` prefixes (after a safety window) is
-an open follow-up, tracked for the dashboard/backboard side; the image does
+an open follow-up on the Railway side; the image does
 not delete archive data.
 
 There's also a small tail gap at the old prefix specifically: WAL written

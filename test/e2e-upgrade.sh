@@ -1385,7 +1385,7 @@ t_recover_refuses_past_commit_point() {
   " || return 1
   run_job "$vol" recover
   assert_eq "$JOB_RC" 2 "refused on the finished-run disk shape" || { echo "$JOB_OUT" | tail -10; return 1; }
-  assert_contains "$JOB_OUT" "run upgrade mode to finish the swap" "points at upgrade mode" || return 1
+  assert_contains "$JOB_OUT" "Run the major version upgrade again to finish switching" "points at running the upgrade again" || return 1
   # And the refusal touched nothing: the shape is still resolvable forward.
   in_volume "$vol" "test -f ${PGDATA_IN_VOLUME}/global/pg_control.old && test -f ${PGDATA_IN_VOLUME}.upgrade-${TO_VERSION}/.railway_pg_upgrade_complete" \
     || { echo "  refusal mutated the volume"; return 1; }

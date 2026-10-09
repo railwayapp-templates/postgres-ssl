@@ -163,7 +163,7 @@ fi
 # foreground output does not — grep both.
 if { printf '%s\n' "$pgb_out"; [ -f "$SPOOL_ERR" ] && cat "$SPOOL_ERR"; } \
   | grep -qE 'NoSuchBucket|InvalidAccessKeyId'; then
-  echo "pgbackrest-wrapper: bucket gone or credentials revoked; dropping ${WAL_FILE} immediately" >&2
+  echo "pgbackrest-wrapper: bucket gone or credentials revoked; dropping ${WAL_FILE} immediately. Point-in-time recovery now has a gap from $(date -u +%Y-%m-%dT%H:%M:%SZ)." >&2
   touch "$PGDATA/.pgbackrest_gap_pending" 2>/dev/null || true
   exit 0
 fi
@@ -186,7 +186,7 @@ TOTAL_BYTES=$(( PGWAL_BYTES + SPOOL_BYTES ))
 if [ "$TOTAL_BYTES" -ge "$PGWAL_THRESHOLD_BYTES" ]; then
   PGWAL_MB=$(( PGWAL_BYTES / 1024 / 1024 ))
   SPOOL_MB=$(( SPOOL_BYTES / 1024 / 1024 ))
-  echo "pgbackrest-wrapper: pg_wal+spool at ${PGWAL_MB}+${SPOOL_MB} MiB (threshold ${PGWAL_THRESHOLD_MB} MiB combined) and archive-push failing; dropping ${WAL_FILE} to keep Postgres up" >&2
+  echo "pgbackrest-wrapper: pg_wal+spool at ${PGWAL_MB}+${SPOOL_MB} MiB (threshold ${PGWAL_THRESHOLD_MB} MiB combined) and archive-push failing; dropping ${WAL_FILE} to keep Postgres up. Point-in-time recovery now has a gap from $(date -u +%Y-%m-%dT%H:%M:%SZ)." >&2
   # Signal to pgbackrest-backup-watcher.sh that a gap was just created. The
   # watcher takes a fresh full backup once archiving recovers, sealing the
   # gap forward (the dropped segment itself is unrestorable, as before).
