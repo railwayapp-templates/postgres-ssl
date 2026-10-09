@@ -1088,8 +1088,8 @@ t_foreign_pair_upgraded_marker_refused() {
   in_volume "$vol" "echo '{\"phase\": \"upgraded\", \"from\": 13, \"to\": 14}' > $MARKER_PATH" || return 1
   run_job "$vol" upgrade
   assert_eq "$JOB_RC" 2 "foreign-pair upgraded marker refused" || { echo "$JOB_OUT" | tail -10; return 1; }
-  assert_contains "$JOB_OUT" "refuses to finish another pair's swap" "refusal names the mismatch" || return 1
-  assert_contains "$JOB_OUT" "13 -> 14" "numeric marker majors normalized in the message" || return 1
+  assert_contains "$JOB_OUT" "so it stops here" "refusal names the mismatch" || return 1
+  assert_contains "$JOB_OUT" "13 to 14" "numeric marker majors normalized in the message" || return 1
   assert_eq "$(volume_data_major "$vol")" "$FROM_VERSION" "volume untouched" || return 1
 
   # check mode must also name the in-flight marker instead of preflighting
@@ -1119,7 +1119,7 @@ t_unknown_marker_phase_refused() {
   in_volume "$vol" "echo '{not json' > $MARKER_PATH" || return 1
   run_job "$vol" upgrade
   assert_eq "$JOB_RC" 2 "unreadable marker refused by upgrade" || { echo "$JOB_OUT" | tail -10; return 1; }
-  assert_contains "$JOB_OUT" "cannot be read" "refusal names the unreadable marker" || return 1
+  assert_contains "$JOB_OUT" "can't be read. Check the file or delete it" "refusal names the unreadable marker" || return 1
   run_job "$vol" check
   assert_eq "$JOB_RC" 2 "unreadable marker refused by check" || { echo "$JOB_OUT" | tail -10; return 1; }
   assert_eq "$(volume_data_major "$vol")" "$FROM_VERSION" "volume still untouched" || return 1
@@ -1369,7 +1369,7 @@ t_recover_refuses_past_commit_point() {
   in_volume "$vol" "printf '%s' '{\"phase\":\"upgraded\",\"from\":\"${FROM_VERSION}\",\"to\":\"${TO_VERSION}\"}' > $MARKER_PATH" || return 1
   run_job "$vol" recover
   assert_eq "$JOB_RC" 2 "refused on an upgraded marker" || { echo "$JOB_OUT" | tail -10; return 1; }
-  assert_contains "$JOB_OUT" "roll FORWARD" "points at upgrade mode" || return 1
+  assert_contains "$JOB_OUT" "already passed its point of no return" "points at upgrade mode" || return 1
   in_volume "$vol" "rm -f $MARKER_PATH" || return 1
 
   # Shape 2: no marker, but the finished-run disk shape (pg_control.old +
@@ -1770,7 +1770,7 @@ t_upgraded_marker_missing_new_dir_refused() {
   in_volume "$vol" "echo '{\"phase\": \"upgraded\", \"from\": \"$FROM_VERSION\", \"to\": \"$TO_VERSION\"}' > $MARKER_PATH" || return 1
   run_job "$vol" upgrade
   assert_eq "$JOB_RC" 3 "refused to swap without a valid new data dir" || { echo "$JOB_OUT" | tail -10; return 1; }
-  assert_contains "$JOB_OUT" "cannot finish the swap" "refusal names the missing target" || return 1
+  assert_contains "$JOB_OUT" "The upgrade can't finish:" "refusal names the missing target" || return 1
   assert_eq "$(volume_data_major "$vol")" "$FROM_VERSION" "PGDATA left in place" || return 1
   in_volume "$vol" "test ! -e ${PGDATA_IN_VOLUME}.old-${FROM_VERSION}" \
     || { echo "  old-keep dir appeared — the swap began despite the refusal"; return 1; }
