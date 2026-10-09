@@ -2004,6 +2004,73 @@ t_watcher_initial_full() {
   docker volume rm "$vol" >/dev/null
 }
 
+# The watcher adds --start-fast when a spread backup-start checkpoint could
+# reach pgBackRest's db-timeout (2 x completion_target x checkpoint_timeout,
+# see decide_backup_start_fast), and leaves the decision to the operator when
+# PGBACKREST_START_FAST is set. A bare `-e PGBACKREST_START_FAST` keeps the
+# first container free of any harness-wide value (docker drops a variable
+# named without a value that the harness shell does not export).
+t_backup_start_fast_when_checkpoint_outlasts_db_timeout() {
+  local t=t_backup_start_fast_when_checkpoint_outlasts_db_timeout
+  local name=t-start-fast-${PG_VERSION}
+  local vol=${name}-vol
+  local line="backup start: a spread checkpoint could wait up to 2160s"
+  reset_bucket
+  new_volume "$vol"
+  docker rm -f "$name" >/dev/null 2>&1 || true
+  run_archiving_pg_fast_watcher "$name" "$vol" -e PGBACKREST_START_FAST
+  wait_for_pg "$name" || { ko "$t" "no startup"; fail_dump "$t" "$name"; return; }
+  # 20min x 0.9 x 2 = 2160s > 1800s db-timeout. Reloadable, so no restart.
+  docker exec "$name" psql -U postgres \
+    -c "ALTER SYSTEM SET checkpoint_timeout = '20min';" \
+    -c "SELECT pg_reload_conf();" >/dev/null
+  for _ in $(seq 1 15); do
+    docker logs "$name" 2>&1 | grep -q "stanza-create completed" && break
+    sleep 1
+  done
+  docker exec "$name" psql -U postgres -c "SELECT pg_switch_wal();" >/dev/null
+  if ! wait_for_watcher_backup "$name" full 60; then
+    ko "$t" "watcher did not take an initial full within 60s"
+    fail_dump "$t" "$name"
+    return
+  fi
+  if ! docker logs "$name" 2>&1 | grep -qF "$line"; then
+    ko "$t" "watcher did not switch to --start-fast for checkpoint_timeout=20min"
+    fail_dump "$t" "$name"
+    return
+  fi
+  docker rm -f "$name" >/dev/null
+  docker volume rm "$vol" >/dev/null
+
+  # Operator's explicit choice: same server settings, no heuristic.
+  reset_bucket
+  new_volume "$vol"
+  run_archiving_pg_fast_watcher "$name" "$vol" -e PGBACKREST_START_FAST=n
+  wait_for_pg "$name" || { ko "$t" "no startup (explicit)"; fail_dump "$t" "$name"; return; }
+  docker exec "$name" psql -U postgres \
+    -c "ALTER SYSTEM SET checkpoint_timeout = '20min';" \
+    -c "SELECT pg_reload_conf();" >/dev/null
+  for _ in $(seq 1 15); do
+    docker logs "$name" 2>&1 | grep -q "stanza-create completed" && break
+    sleep 1
+  done
+  docker exec "$name" psql -U postgres -c "SELECT pg_switch_wal();" >/dev/null
+  if ! wait_for_watcher_backup "$name" full 60; then
+    ko "$t" "explicit PGBACKREST_START_FAST=n: no initial full within 60s"
+    fail_dump "$t" "$name"
+    return
+  fi
+  if docker logs "$name" 2>&1 | grep -qF "backup start: a spread checkpoint"; then
+    ko "$t" "watcher overrode an explicit PGBACKREST_START_FAST"
+    fail_dump "$t" "$name"
+    return
+  fi
+  ok "$t"
+  note "--start-fast chosen for checkpoint_timeout=20min; explicit PGBACKREST_START_FAST left alone"
+  docker rm -f "$name" >/dev/null
+  docker volume rm "$vol" >/dev/null
+}
+
 t_watcher_periodic_full() {
   local name=t-period-full-${PG_VERSION}
   local vol=${name}-vol
@@ -5405,6 +5472,7 @@ ALL_TESTS=(
   t_pitr_retry_after_failed_staging
   t_disable_cleanup
   t_watcher_initial_full
+  t_backup_start_fast_when_checkpoint_outlasts_db_timeout
   t_watcher_periodic_full
   t_watcher_periodic_diff
   t_watcher_gap_recovery_full
