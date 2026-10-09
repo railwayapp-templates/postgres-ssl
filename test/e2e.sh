@@ -1955,6 +1955,10 @@ t_watcher_initial_full() {
   new_volume "$vol"
   docker rm -f "$name" >/dev/null 2>&1 || true
   # Render the template overrides, then keep them out of pgBackRest's JSON.
+  # PGBACKREST_START_FAST=n cancels the harness-wide =y (docker keeps the last
+  # -e), so this full runs with the image default; the assertions below check
+  # the config/env precedence, not checkpoint timing: on this empty cluster a
+  # spread checkpoint completes in well under a second.
   run_archiving_pg_fast_watcher "$name" "$vol" \
     -e PGBACKREST_START_FAST=n \
     -e PGBACKREST_BACKUP_PROCESS_MAX=4 \
@@ -1963,8 +1967,6 @@ t_watcher_initial_full() {
     -e PGBACKREST_RESTORE_PROCESS_MAX=24
   wait_for_pg "$name" || { ko t_watcher_initial_full "no startup"; fail_dump t_watcher_initial_full "$name"; return; }
 
-  # Exercise a real full with spread checkpoints; allow the normal five-minute
-  # checkpoint interval instead of the fast-checkpoint fixture deadline.
   # Force a WAL switch so the watcher sees ARCHIVED_COUNT > 0 and trips
   # NEEDS_INITIAL_BACKUP. Without traffic it could sit idle indefinitely.
   for _ in $(seq 1 15); do
@@ -1973,8 +1975,8 @@ t_watcher_initial_full() {
   done
   docker exec "$name" psql -U postgres -c "SELECT pg_switch_wal();" >/dev/null
 
-  if ! wait_for_watcher_backup "$name" full 420; then
-    ko t_watcher_initial_full "watcher did not take an initial full within 420s"
+  if ! wait_for_watcher_backup "$name" full 60; then
+    ko t_watcher_initial_full "watcher did not take an initial full within 60s"
     fail_dump t_watcher_initial_full "$name"
     return
   fi
