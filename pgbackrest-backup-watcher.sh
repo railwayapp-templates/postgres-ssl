@@ -485,14 +485,80 @@ kill_backup_tree() {
   done
 }
 
+# ---- Backup start mode ------------------------------------------------------
+#
+# pgBackRest opens a backup with pg_backup_start(label, fast). Without
+# start-fast Postgres spreads the backup-start checkpoint over
+# checkpoint_completion_target x checkpoint_timeout however little is dirty
+# (measured on 16: 275 MB dirty, checkpoint_timeout=60s -> 55 s wait, 0.5 s
+# with fast), and a request that lands while a spread checkpoint is already
+# running waits for that one and then for its own, so the worst case is about
+# twice that. pg_backup_start runs under pgBackRest's db-timeout (default
+# 1800 s) and the stall watchdog sees no byte progress while it waits, so a
+# checkpoint_timeout long enough to push the worst case past either limit
+# would make every backup fail before it copies a byte. When the server's
+# settings say so, the watcher passes --start-fast (one immediate checkpoint)
+# instead of letting the backup time out. An operator who sets
+# PGBACKREST_START_FAST has decided already: pgBackRest reads that variable
+# directly and it wins over the config file, so the watcher stays out of it.
+
+# Prints the worst-case seconds pg_backup_start(fast => false) can wait on
+# this server: 2 x checkpoint_completion_target x checkpoint_timeout, rounded
+# up. Fails when the server cannot be asked.
+spread_checkpoint_wait_seconds() {
+  psql -U "${PGUSER:-postgres}" -tAXq -c "
+    SELECT ceil(2 * t.setting::numeric * c.setting::numeric)::bigint
+    FROM pg_settings t, pg_settings c
+    WHERE t.name = 'checkpoint_timeout' AND c.name = 'checkpoint_completion_target'" 2>/dev/null
+}
+
+# Prints the bound the backup-start wait must stay under: pgBackRest's
+# db-timeout (PGBACKREST_DB_TIMEOUT as seconds or with an s/m/h suffix, else
+# its 1800 s default) or the stall watchdog floor, whichever is lower; a
+# disabled watchdog (0) does not bound it.
+backup_start_wait_limit_seconds() {
+  local raw="${PGBACKREST_DB_TIMEOUT:-}" num limit=1800
+  num=${raw%[smh]}
+  case "$num" in ''|*[!0-9]*) num="" ;; esac
+  if [ -n "$num" ]; then
+    case "$raw" in
+      *m) limit=$((num * 60)) ;;
+      *h) limit=$((num * 3600)) ;;
+      *) limit=$num ;;
+    esac
+  fi
+  if [ "$BACKUP_STALL_SECONDS" -gt 0 ] && [ "$BACKUP_STALL_SECONDS" -lt "$limit" ]; then
+    limit=$BACKUP_STALL_SECONDS
+  fi
+  echo "$limit"
+}
+
+# Sets BACKUP_START_FAST_ARGS to --start-fast when a spread checkpoint could
+# reach the limit above, and to nothing otherwise (unknown settings included:
+# a failed query is not a reason to change how the backup starts).
+decide_backup_start_fast() {
+  BACKUP_START_FAST_ARGS=""
+  [ -n "${PGBACKREST_START_FAST+set}" ] && return 0
+  local wait limit
+  wait=$(spread_checkpoint_wait_seconds) || return 0
+  case "$wait" in ''|*[!0-9]*) return 0 ;; esac
+  limit=$(backup_start_wait_limit_seconds)
+  [ "$wait" -lt "$limit" ] && return 0
+  BACKUP_START_FAST_ARGS="--start-fast"
+  log "backup start: a spread checkpoint could wait up to ${wait}s (2 x checkpoint_completion_target x checkpoint_timeout), reaching the ${limit}s backup-start limit; starting with --start-fast (set PGBACKREST_START_FAST=y or n to decide explicitly)"
+}
+
 # Runs `pgbackrest backup --type=$1` under the stall watchdog and returns its
 # exit code — always non-zero when the watchdog killed it. A backup whose
 # progress keeps moving runs to completion exactly as an unsupervised call
 # would; WAL_BACKUP_STALL_SECONDS=0 turns supervision off.
 run_backup_supervised() {
   local type="$1" pid now last_progress_at next_probe last_token="" size=0 rc
-  # --repo=1 / --no-expire-auto: see run_backup.
-  pgbackrest --stanza=main --repo=1 backup --type="$type" --no-expire-auto &
+  decide_backup_start_fast
+  # --repo=1 / --no-expire-auto: see run_backup. BACKUP_START_FAST_ARGS is
+  # empty or one flag, hence unquoted.
+  # shellcheck disable=SC2086
+  pgbackrest --stanza=main --repo=1 backup --type="$type" --no-expire-auto $BACKUP_START_FAST_ARGS &
   pid=$!
   if [ "$BACKUP_STALL_SECONDS" -eq 0 ]; then
     wait "$pid"

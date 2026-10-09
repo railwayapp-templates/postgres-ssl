@@ -371,6 +371,17 @@ gap-recovery state machine the same way the other two signals do, so a
 fresh full fires once grace elapses instead of waiting for the next
 periodic full (#85, hardened by #86).
 
+Before each backup the watcher reads `checkpoint_timeout` and
+`checkpoint_completion_target` from the server. A backup opened without
+`start-fast` waits for a spread checkpoint, up to about twice
+`checkpoint_completion_target × checkpoint_timeout` when one is already
+running, with no byte progress for the stall watchdog to see and under
+pgBackRest's 30-minute `db-timeout`. When that worst case reaches the lower
+of the two, the watcher adds `--start-fast` (one immediate checkpoint) and
+logs why, instead of letting every backup time out. Setting
+`PGBACKREST_START_FAST` (`y` or `n`) turns the heuristic off; pgBackRest reads
+that variable directly and it wins over the config file.
+
 `pgbackrest backup` is invoked with `--type=full` or `--type=diff`
 depending on the trigger; the `process-max=backup` setting (default
 `clamp(cpus/4, 1, 16)`) caps copy concurrency to leave CPU for live DB
