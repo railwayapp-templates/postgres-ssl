@@ -1711,11 +1711,30 @@ emit_wal_heartbeat() {
     >/dev/null 2>&1 || true
 }
 
+# Deferred to the first iteration that finds postgres listening rather than
+# run at startup: the watcher is forked before the entrypoint's ownership
+# sweep over $PGDATA, and the rename's mktemp + mv inside $PGDATA can vanish
+# between that sweep's readdir and stat, which fails the sweep and with it the
+# boot. Once postgres answers, the sweep is long done, and no reader of the
+# renamed fields runs before this point. Each iteration runs in its own
+# subshell, so this is called every time; the rename is a no-op once the
+# legacy names are gone.
+migrate_legacy_state_field_names_when_ready() {
+  # Convert a state file written by the pre-generalization field names before
+  # any reader touches it. Non-fatal: a failure here leaves the legacy names in
+  # place, which reads as "no migration pending" — the same state a fresh volume
+  # starts in, and one the WAL_REGRESSION probe re-detects from the .error
+  # files that caused it.
+  migrate_legacy_state_field_names \
+    || log "state: could not rename legacy wal_regression_* fields; continuing"
+}
+
 watcher_iteration() {
   if ! pg_isready -h 127.0.0.1 -p 5432 -U "${PGUSER:-postgres}" -q 2>/dev/null; then
     debug "iteration skipped: pg_isready=fail (postgres not yet listening on TCP)"
     return 0
   fi
+  migrate_legacy_state_field_names_when_ready
   if is_standby; then
     debug "iteration skipped: standby"
     return 0
@@ -1783,14 +1802,6 @@ sync_repo_path_from_marker() {
 }
 
 sync_repo_path_from_marker
-
-# Convert a state file written by the pre-generalization field names before any
-# reader touches it. Non-fatal: a failure here leaves the legacy names in
-# place, which reads as "no migration pending" — the same state a fresh volume
-# starts in, and one the WAL_REGRESSION probe re-detects from the .error files
-# that caused it.
-migrate_legacy_state_field_names \
-  || log "state: could not rename legacy wal_regression_* fields; continuing"
 
 log "starting (poll=${POLL_INTERVAL_SECONDS}s, initial_poll=${INITIAL_POLL_SECONDS}s, full=${FULL_INTERVAL_SECONDS}s, diff=${DIFF_INTERVAL_SECONDS}s, gap_backoff=${GAP_RECOVERY_BACKOFF_SECONDS}s, lag_threshold=${WAL_LAG_GAP_THRESHOLD_SEGMENTS} segments, repo1-path=${PGBACKREST_REPO1_PATH:-unset})"
 
