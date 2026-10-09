@@ -992,7 +992,7 @@ t_invalid_bucket_skips_archive() {
     # suite-load. Without this polling loop, the test is a flake.
     local log_deadline=$(($(date +%s) + 30)) log_hit=0
     while [ "$(date +%s)" -lt "$log_deadline" ]; do
-      if docker logs "$name" 2>&1 | grep -q "WAL_ARCHIVE_BUCKET.*looks invalid"; then
+      if docker logs "$name" 2>&1 | grep -q "WAL_ARCHIVE_BUCKET.*doesn't resolve to a bucket name"; then
         log_hit=1; break
       fi
       sleep 1
@@ -1621,8 +1621,8 @@ t_empty_volume_restore_refuses_when_no_backup() {
     return
   fi
 
-  if ! wait_for_log_line "$name" "restore from source bucket failed"; then
-    ko t_empty_volume_restore_refuses_when_no_backup "expected 'restore from source bucket failed' in logs"
+  if ! wait_for_log_line "$name" "The point-in-time restore couldn't read the archive"; then
+    ko t_empty_volume_restore_refuses_when_no_backup "expected the restore refusal in logs"
     fail_dump t_empty_volume_restore_refuses_when_no_backup "$name"
     return
   fi
@@ -3149,8 +3149,8 @@ t_empty_volume_restore_refuses_on_bad_creds() {
     ko t_empty_volume_restore_refuses_on_bad_creds "wrapper exited 0; expected non-zero refusal"
     return
   fi
-  if ! wait_for_log_line "$rest_name" "restore from source bucket failed"; then
-    ko t_empty_volume_restore_refuses_on_bad_creds "expected 'restore from source bucket failed' in logs"
+  if ! wait_for_log_line "$rest_name" "The point-in-time restore couldn't read the archive"; then
+    ko t_empty_volume_restore_refuses_on_bad_creds "expected the restore refusal in logs"
     fail_dump t_empty_volume_restore_refuses_on_bad_creds "$rest_name"
     return
   fi

@@ -256,7 +256,7 @@ read_marker_field() {
 refuse_unreadable_marker() {
   [ -f "$MARKER_FILE" ] || return 0
   if [ -z "$(read_marker_field phase)" ]; then
-    die 2 "the upgrade marker at $MARKER_FILE exists but cannot be read (or has no phase) — refusing to guess; inspect or remove it, then re-run"
+    die 2 "The upgrade marker at $MARKER_FILE can't be read. Check the file or delete it, then run the upgrade again."
   fi
 }
 
@@ -439,7 +439,7 @@ ensure_clean_shutdown() {
       ;;
     "")
       if [ -f "$PGDATA/global/pg_control.old" ]; then
-        die 2 "no pg_control at $PGDATA but pg_control.old exists — an interrupted pg_upgrade disabled this cluster; run upgrade mode, which restores it and re-runs"
+        die 2 "An earlier upgrade attempt was interrupted and left the database disabled (pg_control.old exists, pg_control does not). Run the major version upgrade again; it restores the file and retries."
       fi
       die 2 "could not read cluster state from $PGDATA (pg_controldata failed)"
       ;;
@@ -798,7 +798,7 @@ mode_check() {
   local phase
   phase="$(read_marker_field phase)"
   if [ -n "$phase" ] && [ "$phase" != "completed" ]; then
-    die 2 "a major upgrade is already in progress on this volume (marker phase: $phase) — resolve it before running check"
+    die 2 "A major version upgrade is already in progress on this volume (marker phase: $phase). Finish it before running the check."
   fi
 
   clear_stale_pidfile
@@ -924,7 +924,7 @@ finish_swap() {
   # data dir at all" when the new dir was lost or is a partial initdb.
   if [ "$(data_major)" != "$TO_MAJOR" ] \
     && [ "$(cat "$NEW_DATA_DIR/PG_VERSION" 2>/dev/null)" != "$TO_MAJOR" ]; then
-    die 3 "cannot finish the swap: $NEW_DATA_DIR is missing or is not a $TO_MAJOR cluster — volume left untouched; a plain re-run dies here again (the marker still says upgraded), restore the pre-upgrade backup or remove the marker to redo pg_upgrade from scratch"
+    die 3 "The upgrade can't finish: $NEW_DATA_DIR is missing or isn't a PostgreSQL $TO_MAJOR data directory. The volume is unchanged, and running the upgrade again stops here again. Restore the pre-upgrade backup, or delete $MARKER_FILE and run the upgrade again to redo it from scratch."
   fi
 
   # Before the renames, carry auth config + PITR sentinels from wherever the
@@ -1010,7 +1010,7 @@ mode_recover() {
   marker_to="$(read_marker_field to)"
   case "$marker_phase" in
     upgraded)
-      die 2 "marker phase 'upgraded' (${marker_from:-?} -> ${marker_to:-?}) — the commit point has passed; run upgrade mode to roll FORWARD instead (recover never discards a committed upgrade)"
+      die 2 "The ${marker_from:-?} to ${marker_to:-?} upgrade already passed its point of no return (marker phase 'upgraded'). Run the major version upgrade again to finish it; recovery never discards a committed upgrade."
       ;;
     completed)
       # A completed marker of a PREVIOUS pair over FROM-major data is
@@ -1036,7 +1036,7 @@ mode_recover() {
   if [ -f "$PGDATA/global/pg_control.old" ]; then
     if [ -f "$NEW_DATA_DIR/.railway_pg_upgrade_complete" ] \
       && [ "$(cat "$NEW_DATA_DIR/PG_VERSION" 2>/dev/null)" = "$TO_MAJOR" ]; then
-      die 2 "the disk shape shows a FINISHED pg_upgrade (completion sentinel in the $TO_MAJOR dir) — run upgrade mode to finish the swap; recover never discards a finished upgrade"
+      die 2 "pg_upgrade already finished on this volume (completion sentinel in the $TO_MAJOR directory). Run the major version upgrade again to finish switching to the upgraded data; recovery never discards a finished upgrade."
     fi
     log "pg_control.old present without a completion sentinel — pg_upgrade crashed mid-link; restoring the old cluster's pg_control"
     restore_disabled_pg_control
@@ -1104,7 +1104,7 @@ mode_upgrade() {
       # be swapping directories that belong to a different job. Refuse
       # loudly; only the matching pair's job can resolve the volume.
       if [ "$marker_from" != "$FROM_MAJOR" ] || [ "$marker_to" != "$TO_MAJOR" ]; then
-        die 2 "marker records an in-flight ${marker_from:-?} -> ${marker_to:-?} upgrade; this job ($FROM_MAJOR -> $TO_MAJOR) refuses to finish another pair's swap — run the ${marker_from:-?}-${marker_to:-?} job to resolve it"
+        die 2 "A ${marker_from:-?} to ${marker_to:-?} upgrade is in progress on this volume. This job upgrades $FROM_MAJOR to $TO_MAJOR, so it stops here. Run the ${marker_from:-?} to ${marker_to:-?} upgrade to finish it."
       fi
       log "marker says upgraded — resuming directory swap"
       finish_swap

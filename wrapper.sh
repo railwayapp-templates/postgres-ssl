@@ -72,8 +72,8 @@ if command -v flock >/dev/null 2>&1 && [ -d "$EXPECTED_VOLUME_MOUNT_PATH" ] \
   # permanent either way.
   if { exec 8>>"$UPGRADE_LOCK_FILE"; } 2>/dev/null; then
     if ! flock -n -s 8; then
-      echo "A major version upgrade job is currently running against this volume."
-      echo "The database must not start until it finishes; retry the deploy once the upgrade completes."
+      echo "A major version upgrade job is currently running against this volume." >&2
+      echo "The database must not start until it finishes; retry the deploy once the upgrade completes." >&2
       exit 1
     fi
     # Self-describing, written once while the lock is held: bare lock files
@@ -83,7 +83,7 @@ if command -v flock >/dev/null 2>&1 && [ -d "$EXPECTED_VOLUME_MOUNT_PATH" ] \
       "Created on every boot; its presence is not a record of any upgrade or other event." \
       >>"$UPGRADE_LOCK_FILE" 2>/dev/null || true
   else
-    echo "wrapper: could not open $UPGRADE_LOCK_FILE; continuing without the upgrade lock" >&2
+    echo "wrapper: could not open $UPGRADE_LOCK_FILE; continuing without the upgrade lock"
   fi
   # Transition: builds from before the rename rendezvous on the legacy path,
   # so contend there too whenever the file exists — an upgrade job from an
@@ -100,8 +100,8 @@ if command -v flock >/dev/null 2>&1 && [ -d "$EXPECTED_VOLUME_MOUNT_PATH" ] \
   if [ -f "$LEGACY_UPGRADE_LOCK_FILE" ]; then
     if { exec 7>>"$LEGACY_UPGRADE_LOCK_FILE"; } 2>/dev/null; then
       if ! flock -n -s 7; then
-        echo "A major version upgrade job is currently running against this volume."
-        echo "The database must not start until it finishes; retry the deploy once the upgrade completes."
+        echo "A major version upgrade job is currently running against this volume." >&2
+        echo "The database must not start until it finishes; retry the deploy once the upgrade completes." >&2
         exit 1
       fi
       [ -s "$LEGACY_UPGRADE_LOCK_FILE" ] || printf '%s\n' \
@@ -109,7 +109,7 @@ if command -v flock >/dev/null 2>&1 && [ -d "$EXPECTED_VOLUME_MOUNT_PATH" ] \
         "file on EVERY boot; its presence is not evidence that a major version upgrade ran." \
         >>"$LEGACY_UPGRADE_LOCK_FILE" 2>/dev/null || true
     else
-      echo "wrapper: could not open $LEGACY_UPGRADE_LOCK_FILE; continuing without the legacy upgrade lock" >&2
+      echo "wrapper: could not open $LEGACY_UPGRADE_LOCK_FILE; continuing without the legacy upgrade lock"
     fi
   fi
 fi
@@ -158,13 +158,13 @@ if command -v flock >/dev/null 2>&1 && [ -d "$EXPECTED_VOLUME_MOUNT_PATH" ] \
     if ! flock -n -x 9; then
       echo "wrapper: another postgres container still holds this volume (overlapping deploy); waiting up to ${RUNTIME_LOCK_WAIT_SECONDS}s for it to shut down"
       if ! flock -w "$RUNTIME_LOCK_WAIT_SECONDS" -x 9; then
-        echo "wrapper: previous container did not release the volume within ${RUNTIME_LOCK_WAIT_SECONDS}s; refusing to start postgres on a volume another postmaster may still be using"
+        echo "wrapper: previous container did not release the volume within ${RUNTIME_LOCK_WAIT_SECONDS}s; refusing to start postgres on a volume another postmaster may still be using" >&2
         exit 1
       fi
       echo "wrapper: previous container released the volume; continuing boot"
     fi
   else
-    echo "wrapper: could not open $RUNTIME_LOCK_FILE; continuing without the runtime lock" >&2
+    echo "wrapper: could not open $RUNTIME_LOCK_FILE; continuing without the runtime lock"
   fi
 fi
 
@@ -188,8 +188,8 @@ if [ -f "$UPGRADE_MARKER_FILE" ]; then
   # below instead of tripping set -e with no message.
   MARKER_PHASE=$(jq -r '.phase // empty' "$UPGRADE_MARKER_FILE" 2>/dev/null || true)
   if [ "$MARKER_PHASE" != "completed" ]; then
-    echo "A major version upgrade is in progress on this volume (marker phase: ${MARKER_PHASE:-unreadable})."
-    echo "The database must not start until the upgrade workflow finishes or rolls back."
+    echo "A major version upgrade is in progress on this volume (marker phase: ${MARKER_PHASE:-unreadable})." >&2
+    echo "The database must not start until the upgrade finishes or rolls back." >&2
     exit 1
   fi
 fi
@@ -205,9 +205,9 @@ fi
 # without this check postgres would fail deep in startup with a bare "could
 # not open file "global/pg_control"" instead of naming the actual cause.
 if [ -f "$PGDATA/global/pg_control.old" ] && [ ! -f "$PGDATA/global/pg_control" ]; then
-  echo "This looks like an interrupted major version upgrade: pg_control is disabled (renamed to pg_control.old),"
-  echo "the shape pg_upgrade leaves if it crashes mid-link. A database major-version-upgrade job resolves this"
-  echo "volume; starting postgres against it directly will fail."
+  echo "This looks like an interrupted major version upgrade: pg_control is disabled (renamed to pg_control.old)," >&2
+  echo "the shape pg_upgrade leaves if it crashes mid-link. Run the major version upgrade again from the service's" >&2
+  echo "settings to finish it; starting postgres against this volume directly will fail." >&2
   exit 1
 fi
 
@@ -221,11 +221,11 @@ fi
 # what's actually a split, unfinished upgrade sitting in those siblings.
 if [ ! -f "$PGDATA/PG_VERSION" ] \
   && { compgen -G "${PGDATA}.upgrade-*" >/dev/null 2>&1 || compgen -G "${PGDATA}.old-*" >/dev/null 2>&1; }; then
-  echo "PGDATA is empty or missing, but upgrade-job sibling directories exist next to it"
-  echo "(${PGDATA}.upgrade-* / ${PGDATA}.old-*) — this looks like an interrupted major version"
-  echo "upgrade caught mid-swap, not a fresh volume. A database major-version-upgrade job"
-  echo "resolves this volume; starting postgres against it directly would initdb a new, empty"
-  echo "cluster over real data sitting in those siblings."
+  echo "PGDATA is empty or missing, but upgrade-job sibling directories exist next to it" >&2
+  echo "(${PGDATA}.upgrade-* / ${PGDATA}.old-*) — this looks like an interrupted major version" >&2
+  echo "upgrade caught mid-swap, not a fresh volume. Run the major version upgrade again from the" >&2
+  echo "service's settings to finish it; starting postgres against this volume directly would initdb" >&2
+  echo "a new, empty cluster over real data sitting in those siblings." >&2
   exit 1
 fi
 
@@ -260,9 +260,9 @@ IMAGE_MAJOR=$(detect_image_major)
 if [ -f "$PGDATA/PG_VERSION" ]; then
   DATA_MAJOR=$(cat "$PGDATA/PG_VERSION")
   if [ -n "$IMAGE_MAJOR" ] && [ "$DATA_MAJOR" != "$IMAGE_MAJOR" ]; then
-    echo "This image runs PostgreSQL $IMAGE_MAJOR but the data directory holds major version $DATA_MAJOR."
-    echo "Changing the image tag does not upgrade the data files. Set the image back to postgres $DATA_MAJOR,"
-    echo "or run a major version upgrade from the service's settings."
+    echo "This image runs PostgreSQL $IMAGE_MAJOR but the data directory holds major version $DATA_MAJOR." >&2
+    echo "Changing the image tag does not upgrade the data files. Set the image back to postgres $DATA_MAJOR," >&2
+    echo "or run a major version upgrade from the service's settings." >&2
     exit 1
   fi
 fi
@@ -634,9 +634,9 @@ validate_wal_archive_bucket() {
 
   if [ -n "$invalid" ]; then
     if [ "$invalid" = "uuid-shape" ]; then
-      echo "pgbackrest: WAL_ARCHIVE_BUCKET=\"${val}\" looks invalid (uuid-shape); refusing to enable archiving. If this UUID is your legitimate bucket name, set WAL_ARCHIVE_BUCKET_ALLOW_UUID=1 to override." >&2
+      echo "pgbackrest: WAL archiving is off this boot: WAL_ARCHIVE_BUCKET=\"${val}\" doesn't resolve to a bucket name (uuid-shape). Disable and re-enable point-in-time recovery, or contact support. If this UUID really is your bucket's name, set WAL_ARCHIVE_BUCKET_ALLOW_UUID=1 and redeploy." >&2
     else
-      echo "pgbackrest: WAL_ARCHIVE_BUCKET=\"${val}\" looks invalid (${invalid}); refusing to enable archiving" >&2
+      echo "pgbackrest: WAL archiving is off this boot: WAL_ARCHIVE_BUCKET=\"${val}\" doesn't resolve to a bucket name (${invalid}). Disable and re-enable point-in-time recovery, or contact support." >&2
     fi
     # Export so pgbackrest-init.sh can write the sentinel during initdb.
     # Writing to PGDATA here would break initdb on a fresh volume:
@@ -1568,11 +1568,11 @@ EOF
 # so pgbackrest accepts --delta and checksum-diffs the partial PGDATA
 # against the base, only refetching what's missing.
 restore_from_pgbackrest_if_empty_volume() {
-  # Log gate state up front so post-mortems on "why did pgbackrest restore
-  # run when I expected it to be skipped" don't require guessing.
-  echo "pgbackrest: restore-gate WAL_RECOVER_FROM_BUCKET=${WAL_RECOVER_FROM_BUCKET:+set} POSTGRES_RECOVERY_TARGET_TIME=${POSTGRES_RECOVERY_TARGET_TIME:+set} PG_VERSION=$([ -f "$PGDATA/PG_VERSION" ] && echo present || echo missing) PG_CONTROL=$([ -f "$PGDATA/global/pg_control" ] && echo present || echo missing) RESTORED_MARKER=$([ -f "$PGBACKREST_RESTORED_MARKER" ] && echo present || echo missing) PGDATA=$PGDATA"
-
   [ -z "${WAL_RECOVER_FROM_BUCKET:-}" ] && return 0
+  # A point-in-time restore is configured: log the gate state so "why did
+  # the restore run (or not)" can be read from the log.
+  echo "pgbackrest: restore-gate POSTGRES_RECOVERY_TARGET_TIME=${POSTGRES_RECOVERY_TARGET_TIME:+set} PG_VERSION=$([ -f "$PGDATA/PG_VERSION" ] && echo present || echo missing) PG_CONTROL=$([ -f "$PGDATA/global/pg_control" ] && echo present || echo missing) RESTORED_MARKER=$([ -f "$PGBACKREST_RESTORED_MARKER" ] && echo present || echo missing) PGDATA=$PGDATA"
+
   [ -z "${POSTGRES_RECOVERY_TARGET_TIME:-}" ] && return 0
   [ -f "$PGBACKREST_RESTORED_MARKER" ] && return 0
   # PG_VERSION + pg_control both present = completed external restore.
@@ -1658,7 +1658,7 @@ EOF
        --delta \
        --type="$restore_type" --target="$restore_target" \
        --target-action=promote; then
-    echo "pgbackrest: restore from source bucket failed; fix env vars (WAL_RECOVER_FROM_*, POSTGRES_RECOVERY_TARGET_TIME, POSTGRES_RECOVERY_TARGET_XID) and redeploy" >&2
+    echo "pgbackrest: The point-in-time restore couldn't read the archive. Check the source bucket still exists, then redeploy. If it keeps failing, contact support." >&2
     exit 1
   fi
 
