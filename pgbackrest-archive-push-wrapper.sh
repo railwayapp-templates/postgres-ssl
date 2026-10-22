@@ -162,11 +162,34 @@ fi
 # spool's .error file carries the same verdicts in async mode, where the
 # foreground output does not — grep both.
 if { printf '%s\n' "$pgb_out"; [ -f "$SPOOL_ERR" ] && cat "$SPOOL_ERR"; } \
-  | grep -qE 'NoSuchBucket|InvalidAccessKeyId'; then
-  echo "pgbackrest-wrapper: bucket gone or credentials revoked; dropping ${WAL_FILE} immediately. Point-in-time recovery now has a gap from $(date -u +%Y-%m-%dT%H:%M:%SZ)." >&2
+  | grep -qE 'NoSuchBucket|InvalidAccessKeyId|SignatureDoesNotMatch'; then
+  echo "pgbackrest-wrapper: bucket gone or credentials revoked/rotated (NoSuchBucket, InvalidAccessKeyId or SignatureDoesNotMatch); dropping ${WAL_FILE} immediately. Point-in-time recovery now has a gap from $(date -u +%Y-%m-%dT%H:%M:%SZ)." >&2
   touch "$PGDATA/.pgbackrest_gap_pending" 2>/dev/null || true
   exit 0
 fi
+
+# Free-space backstop (2026-10-22 incident): WAL_DROP_THRESHOLD_MB is sized from
+# the volume's TOTAL size (min 5 GiB, 50% of volume), not from what is actually
+# free. On a volume where the database already occupies most of the space the
+# disk fills long before pg_wal+spool reach that threshold, and Postgres crashes
+# with "No space left on device" — which is what took 65 services down when the
+# archive bucket credentials were rotated. Whatever the threshold says, once the
+# data filesystem has less than max(256 MiB, 10% of its size) free and
+# archive-push is failing, drop the segment so Postgres can recycle it.
+FS_FREE_KIB=$(df -Pk "$PGDATA" 2>/dev/null | awk 'NR==2 {print $4}')
+FS_TOTAL_KIB=$(df -Pk "$PGDATA" 2>/dev/null | awk 'NR==2 {print $2}')
+case "${FS_FREE_KIB:-}${FS_TOTAL_KIB:-}" in
+  ''|*[!0-9]*) ;;
+  *)
+    FS_FLOOR_KIB=$(( FS_TOTAL_KIB / 10 ))
+    [ "$FS_FLOOR_KIB" -lt 262144 ] && FS_FLOOR_KIB=262144
+    if [ "$FS_FREE_KIB" -lt "$FS_FLOOR_KIB" ]; then
+      echo "pgbackrest-wrapper: data volume has $(( FS_FREE_KIB / 1024 )) MiB free (floor $(( FS_FLOOR_KIB / 1024 )) MiB) and archive-push is failing; dropping ${WAL_FILE} to keep Postgres up. Point-in-time recovery now has a gap from $(date -u +%Y-%m-%dT%H:%M:%SZ)." >&2
+      touch "$PGDATA/.pgbackrest_gap_pending" 2>/dev/null || true
+      exit 0
+    fi
+    ;;
+esac
 
 PGWAL_BYTES=$(du -sb "$PGDATA/pg_wal" 2>/dev/null | awk '{print $1}')
 if [ -z "${PGWAL_BYTES:-}" ]; then
