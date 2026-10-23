@@ -73,6 +73,34 @@ docker run ghcr.io/railwayapp-templates/postgres-ssl:17
 docker run ghcr.io/railwayapp-templates/postgres-ssl:17.6
 ```
 
+### Extensions
+
+Besides Postgres's own contrib modules, the image ships
+[pgvector](https://github.com/pgvector/pgvector) and
+[pgaudit](https://github.com/pgaudit/pgaudit) (PGDG's
+`postgresql-<major>-pgvector` and `postgresql-<major>-pgaudit`), so
+`CREATE EXTENSION vector` works out of the box. pgaudit is opt-in: it refuses
+to load anywhere but `shared_preload_libraries`, so enabling it is
+
+```sql
+ALTER SYSTEM SET shared_preload_libraries = pg_stat_statements, pgaudit;
+```
+
+(list syntax — `ALTER SYSTEM` quotes a single `'pg_stat_statements,pgaudit'`
+string as *one* library name, and the next boot refuses with `could not
+access file "pg_stat_statements,pgaudit"`), followed by a restart of the
+service, then `CREATE EXTENSION pgaudit` and the
+audit classes you want (`ALTER SYSTEM SET pgaudit.log = 'ddl, role'` and
+`SELECT pg_reload_conf()`). Keep `pg_stat_statements` in the list: the image
+preloads it and the dashboard's Stats tab reads its view. Audit lines land in
+the [server log stream](#server-log-stream).
+
+After a [major version upgrade](#major-version-upgrades) the preload list is
+not carried over (see the config-restore note there), and with pgaudit's
+event triggers still in the catalog every DDL on the upgraded database fails
+with `pgaudit must be loaded via shared_preload_libraries` until you set it
+again — do that before the first schema change.
+
 ### Base distro
 
 Every `Dockerfile.<major>` (and `Dockerfile.upgrade`) builds `FROM

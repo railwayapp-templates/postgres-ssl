@@ -24,10 +24,12 @@ ENV PG_UPGRADE_FROM=${FROM_VERSION}
 ENV PG_UPGRADE_TO=${TO_VERSION}
 
 # The official image's PGDG apt source is pinned to its own major's component;
-# widen it so the source major's packages resolve too. pgvector installs for
-# BOTH majors: pg_upgrade starts the old server (its loaded libraries must
-# resolve) and the new cluster must be able to load every library the old one
-# references, or --check fails with "loadable libraries" errors.
+# widen it so the source major's packages resolve too. pgvector and pgaudit
+# install for BOTH majors: pg_upgrade starts the old server (its loaded
+# libraries must resolve — a volume that preloads pgaudit needs the source
+# major's .so) and the new cluster must be able to load every library the old
+# one references (pgaudit's event-trigger functions point at $libdir/pgaudit),
+# or --check fails with "loadable libraries" errors.
 # CI content key (see the build workflow's content gate) — busts this layer
 # exactly when the repo code, the upstream base, or Debian's pending-fix set
 # moved, and keeps it byte-cached (stable digest) otherwise.
@@ -46,6 +48,8 @@ RUN echo "refresh key: ${PKG_REFRESH}" \
       postgresql-${FROM_VERSION} \
       postgresql-${FROM_VERSION}-pgvector \
       postgresql-${TO_VERSION}-pgvector \
+      postgresql-${FROM_VERSION}-pgaudit \
+      postgresql-${TO_VERSION}-pgaudit \
       jq \
     && apt-mark unhold postgresql-${TO_VERSION} postgresql-client-${TO_VERSION} \
     && rm -rf /var/lib/apt/lists/*

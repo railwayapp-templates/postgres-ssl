@@ -1115,6 +1115,58 @@ t_alter_system_survives_restart() {
   docker volume rm "$vol" >/dev/null
 }
 
+# pgaudit ships in the image but stays opt-in: it refuses to load anywhere but
+# shared_preload_libraries, so enabling it is the operator path exercised
+# here — ALTER SYSTEM the preload list (keeping pg_stat_statements, whose
+# view the dashboard's Stats tab reads), restart, CREATE EXTENSION. The
+# wrapper edits that same GUC for pg_stat_statements at every boot
+# (add_pg_stat_statements), so the second restart pins that its edit leaves
+# the operator's pgaudit entry in place. The list is set with list syntax:
+# ALTER SYSTEM quotes a single 'a,b' string literal as ONE library name
+# ("a,b"), and the next boot then refuses with `could not access file`.
+t_pgaudit_ships_and_preloads() {
+  local t=t_pgaudit_ships_and_preloads
+  local name=t-pgaudit-${PG_VERSION}
+  local vol=${name}-vol
+  new_volume "$vol"
+  docker rm -f "$name" >/dev/null 2>&1 || true
+  spawn "$name" "$vol" -e POSTGRES_PASSWORD=test -v "$vol:/var/lib/postgresql/data"
+  wait_for_pg "$name" || { ko "$t" "postgres did not start"; fail_dump "$t" "$name"; return; }
+
+  local available
+  available=$(docker exec "$name" psql -U postgres -At -c "SELECT count(*) FROM pg_available_extensions WHERE name = 'pgaudit'")
+  assert_eq "$available" "1" "pgaudit is installable" || { ko "$t" ""; fail_dump "$t" "$name"; return; }
+
+  docker exec "$name" psql -U postgres -v ON_ERROR_STOP=1 \
+    -c "ALTER SYSTEM SET shared_preload_libraries = pg_stat_statements, pgaudit" >/dev/null \
+    || { ko "$t" "ALTER SYSTEM shared_preload_libraries failed"; fail_dump "$t" "$name"; return; }
+  docker restart "$name" >/dev/null
+  wait_for_pg "$name" || { ko "$t" "postgres did not come back with pgaudit preloaded"; fail_dump "$t" "$name"; return; }
+
+  local libs
+  libs=$(docker exec "$name" psql -U postgres -At -c "SHOW shared_preload_libraries")
+  assert_eq "$libs" "pg_stat_statements, pgaudit" "preload list after restart" || { ko "$t" ""; fail_dump "$t" "$name"; return; }
+
+  # One session: the SET scopes pgaudit.log to it, and the CREATE TABLE is the
+  # DDL it must log (pgaudit's SESSION line goes to the server log stream).
+  docker exec "$name" psql -U postgres -v ON_ERROR_STOP=1 \
+    -c "CREATE EXTENSION pgaudit" \
+    -c "SET pgaudit.log = 'ddl'; CREATE TABLE pgaudit_canary (id int)" >/dev/null \
+    || { ko "$t" "CREATE EXTENSION pgaudit / audited DDL failed"; fail_dump "$t" "$name"; return; }
+  wait_for_log_line "$name" "AUDIT: SESSION,.*,DDL,CREATE TABLE,TABLE,public.pgaudit_canary" 10 \
+    || { ko "$t" "no pgaudit SESSION line for the CREATE TABLE in the server log"; fail_dump "$t" "$name"; return; }
+
+  # The wrapper's own preload management must not undo the operator's entry.
+  docker restart "$name" >/dev/null
+  wait_for_pg "$name" || { ko "$t" "postgres did not come back (second restart)"; fail_dump "$t" "$name"; return; }
+  libs=$(docker exec "$name" psql -U postgres -At -c "SHOW shared_preload_libraries")
+  assert_eq "$libs" "pg_stat_statements, pgaudit" "preload list survives a wrapper boot" || { ko "$t" ""; fail_dump "$t" "$name"; return; }
+
+  ok "$t"
+  docker rm -f "$name" >/dev/null
+  docker volume rm "$vol" >/dev/null
+}
+
 t_s3_unreachable_pg_stays_up() {
   local name=t-s3down-${PG_VERSION}
   local vol=${name}-vol
@@ -5395,6 +5447,7 @@ ALL_TESTS=(
   t_archiving_boot
   t_archiving_boot_survives_pghostaddr
   t_alter_system_survives_restart
+  t_pgaudit_ships_and_preloads
   t_s3_unreachable_pg_stays_up
   t_queue_max_5gib_trips
   t_wrapper_drop_on_bad_creds

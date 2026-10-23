@@ -624,9 +624,55 @@ init_new_cluster() {
     || die 3 "initdb of the target cluster failed"
 }
 
+# The old cluster's effective shared_preload_libraries, one name per line:
+# the last assignment in postgresql.auto.conf wins over the last one in
+# postgresql.conf (ALTER SYSTEM's precedence; includes are not followed).
+# Parsed, never passed verbatim — auto.conf is operator input and the names
+# end up on a shell command line — so each entry is reduced to a bare library
+# name (quotes of both kinds and whitespace stripped; ALTER SYSTEM's
+# single-string gotcha '"a,b"' therefore still yields a and b) and anything
+# outside [A-Za-z0-9_./$-] is dropped.
+old_cluster_preload_libraries() {
+  local f line raw=""
+  for f in "$PGDATA/postgresql.conf" "$PGDATA/postgresql.auto.conf"; do
+    [ -f "$f" ] || continue
+    line=$(grep -E '^[[:space:]]*shared_preload_libraries[[:space:]]*=' "$f" 2>/dev/null | tail -1)
+    [ -n "$line" ] && raw="${line#*=}"
+  done
+  raw="${raw%%#*}"
+  printf '%s\n' "$raw" | tr -d "'\"[:space:]" | tr ',' '\n' | grep -E '^[A-Za-z0-9_./$-]+$' | awk '!seen[$0]++'
+}
+
+# pg_upgrade starts the TARGET cluster from a bare initdb, so nothing the old
+# cluster preloads is loaded there — and --check's loadable-libraries probe is
+# a plain `LOAD '$libdir/<lib>'` for every library the old catalog references.
+# pgaudit refuses to load any way but shared_preload_libraries, so a source
+# with it installed failed --check on the target with "pgaudit must be loaded
+# via shared_preload_libraries" however complete the job image was. Carry the
+# old cluster's preload list onto the target server's command line
+# (--new-options), restricted to libraries the TARGET major ships: an
+# unshipped one is left out so the target server still starts and
+# pg_upgrade's own check names it in its loadable-libraries report, instead
+# of a server-failed-to-start with the reason buried in a log.
+new_server_preload_options() {
+  local libdir="/usr/lib/postgresql/${TO_MAJOR}/lib" libs="" lib
+  while IFS= read -r lib; do
+    [ -n "$lib" ] || continue
+    if [ -f "$libdir/${lib#\$libdir/}.so" ]; then
+      libs="${libs:+$libs,}$lib"
+    else
+      log "the old cluster preloads '$lib', which the ${TO_MAJOR} binaries do not ship — not preloaded on the target server; pg_upgrade's loadable-libraries check decides"
+    fi
+  done < <(old_cluster_preload_libraries)
+  [ -n "$libs" ] && printf -- '-c shared_preload_libraries=%s' "$libs"
+  return 0
+}
+
 run_pg_upgrade() {
-  local extra="$1" new_dir="$2" out rc
+  local extra="$1" new_dir="$2" out rc new_opts
   cd /tmp || die 3 "cannot cd to /tmp"
+  new_opts=$(new_server_preload_options)
+  [ -n "$new_opts" ] && log "target server starts with ${new_opts#-c }"
   out=$(as_postgres "$NEW_BINDIR/pg_upgrade" \
     --old-bindir "$OLD_BINDIR" \
     --new-bindir "$NEW_BINDIR" \
@@ -634,6 +680,7 @@ run_pg_upgrade() {
     --new-datadir "$new_dir" \
     --username="$PG_SUPERUSER" \
     --jobs "$(detect_cpus)" \
+    ${new_opts:+--new-options "$new_opts"} \
     $extra 2>&1)
   rc=$?
   echo "$out"
