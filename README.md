@@ -780,3 +780,5 @@ default flip in 18, which needs explicit parity flags. The re-anchor
 tests need a bucket, so they live in the archive harness instead:
 `./test/e2e.sh t_upgrade_archive_reanchors_to_new_cluster_path
 t_reanchor_stale_marker_after_upgrade t_reanchor_backfills_missing_anchor`.
+
+<!-- ruleset probe 1 -->
