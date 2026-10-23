@@ -42,9 +42,10 @@ ARG PGVECTOR_PKG_VERSION=0.8.*
 # drift across. Within a branch, patch releases ship empty catalog upgrade
 # scripts (1.7->1.7.1, 16.0->16.1 are both bare \echo guards), so a
 # refreshed .so under an older catalog is the same bugfix stream the
-# pgvector wildcard admits. It is installed but not preloaded: pgaudit
-# refuses to load anywhere but shared_preload_libraries, so enabling it is
-# an operator act (see README "Extensions").
+# pgvector wildcard admits. The image preloads it next to pg_stat_statements
+# (init-ssl.sh at initdb, wrapper.sh on every boot): pgaudit refuses to load
+# any other way, and preloaded with pgaudit.log unset it is inert, so
+# CREATE EXTENSION pgaudit simply works (see README "Extensions").
 
 # Install OpenSSL, sudo, pgvector, pgaudit, pgbackrest, tini (PID 1, see ENTRYPOINT
 # below), and ca-certificates (needed

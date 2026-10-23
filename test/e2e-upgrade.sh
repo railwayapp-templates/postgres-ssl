@@ -616,24 +616,16 @@ t_manifest_mode() {
 # event-trigger functions) against the TO major's binaries — by LOADing it
 # on the target server, which pgaudit refuses unless preloaded there too, so
 # the job carries the old cluster's preload list onto the target server
-# (new_server_preload_options in upgrade-job.sh). Config restore
-# deliberately never re-applies preload GUCs (t_config_restore_self_heals),
-# so the first TO boot runs without pgaudit — and with pgaudit's event
-# triggers still in the catalog, every DDL on that boot fails until the
-# operator preloads it again (pgaudit refuses to load any other way). That
-# refusal is pinned here on purpose: a config-restore change that re-applies
-# a preload list whose every library the new image ships would flip it, and
-# should update this test when it does.
+# (new_server_preload_options in upgrade-job.sh). Config restore still never
+# re-applies preload GUCs, but the image preloads pgaudit itself, so the
+# upgraded database's first boot has it loaded and its DDL (event triggers
+# included) works at once.
 t_pgaudit_survives_upgrade() {
   local vol="upg-e2e-pgaudit"
   fresh_volume "$vol" || return 1
   run_pg pgaudit-pg "$vol" "$FROM_IMAGE" || return 1
   wait_for_pg pgaudit-pg || { fail_dump pgaudit pgaudit-pg; return 1; }
-  psql_must pgaudit-pg "ALTER SYSTEM SET shared_preload_libraries = pg_stat_statements, pgaudit" || return 1
-  stop_pg pgaudit-pg
-  run_pg pgaudit-pg "$vol" "$FROM_IMAGE" || return 1
-  wait_for_pg pgaudit-pg || { fail_dump pgaudit pgaudit-pg; return 1; }
-  assert_eq "$(psql_in pgaudit-pg 'SHOW shared_preload_libraries')" "pg_stat_statements, pgaudit" "pgaudit preloaded on the FROM major" || return 1
+  assert_eq "$(psql_in pgaudit-pg 'SHOW shared_preload_libraries')" "pg_stat_statements,pgaudit" "image preloads pgaudit on the FROM major" || return 1
   psql_must pgaudit-pg "CREATE EXTENSION pgaudit" || return 1
   psql_must pgaudit-pg "CREATE TABLE pgaudit_canary (id int)" || return 1
   stop_pg pgaudit-pg
@@ -646,24 +638,8 @@ t_pgaudit_survives_upgrade() {
 
   run_pg pgaudit2-pg "$vol" "$TO_IMAGE" || return 1
   wait_for_pg pgaudit2-pg || { fail_dump pgaudit2 pgaudit2-pg; return 1; }
-  # Let the config-restore helper finish before touching auto.conf ourselves.
-  local deadline=$(($(date +%s) + 120))
-  while [ "$(date +%s)" -lt "$deadline" ]; do
-    [ "$(marker_field "$vol" needsConfigReview)" = "false" ] && break
-    sleep 5
-  done
-  assert_eq "$(marker_field "$vol" needsConfigReview)" "false" "config review self-healed" || { fail_dump pgaudit2 pgaudit2-pg; return 1; }
   assert_eq "$(psql_in pgaudit2-pg "SELECT count(*) FROM pg_extension WHERE extname = 'pgaudit'")" "1" "pgaudit extension survived the upgrade" || return 1
-  assert_eq "$(psql_in pgaudit2-pg 'SHOW shared_preload_libraries')" "pg_stat_statements" "preload GUC not carried by config restore" || return 1
-  assert_contains "$(psql_in pgaudit2-pg 'CREATE TABLE pgaudit_after_upgrade (id int)')" \
-    "pgaudit must be loaded via shared_preload_libraries" "DDL refused until pgaudit is preloaded again" || return 1
-
-  # The operator path on the TO major: preload again, restart, audit again.
-  psql_must pgaudit2-pg "ALTER SYSTEM SET shared_preload_libraries = pg_stat_statements, pgaudit" || return 1
-  stop_pg pgaudit2-pg
-  run_pg pgaudit2-pg "$vol" "$TO_IMAGE" || return 1
-  wait_for_pg pgaudit2-pg || { fail_dump pgaudit2 pgaudit2-pg; return 1; }
-  assert_eq "$(psql_in pgaudit2-pg 'SHOW shared_preload_libraries')" "pg_stat_statements, pgaudit" "pgaudit preloaded on the TO major" || return 1
+  assert_eq "$(psql_in pgaudit2-pg 'SHOW shared_preload_libraries')" "pg_stat_statements,pgaudit" "image preloads pgaudit on the TO major's first boot" || return 1
   psql_must pgaudit2-pg "SET pgaudit.log = 'ddl'; CREATE TABLE pgaudit_after_upgrade (id int)" || return 1
   assert_contains "$(docker logs pgaudit2-pg 2>&1)" "AUDIT: SESSION" "pgaudit logs DDL on the TO major" || return 1
   assert_eq "$(psql_in pgaudit2-pg 'SELECT count(*) FROM pgaudit_canary')" "0" "pre-upgrade table readable" || return 1
