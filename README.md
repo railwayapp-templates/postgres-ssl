@@ -73,6 +73,39 @@ docker run ghcr.io/railwayapp-templates/postgres-ssl:17
 docker run ghcr.io/railwayapp-templates/postgres-ssl:17.6
 ```
 
+### Extensions
+
+Besides Postgres's own contrib modules, the image ships
+[pgvector](https://github.com/pgvector/pgvector) and
+[pgaudit](https://github.com/pgaudit/pgaudit) (PGDG's
+`postgresql-<major>-pgvector` and `postgresql-<major>-pgaudit`). Both are a
+`CREATE EXTENSION` away (`vector`, `pgaudit`), from psql or the dashboard's
+Extensions card.
+
+pgaudit refuses to load any way but `shared_preload_libraries`, so the image
+preloads it next to `pg_stat_statements` on every volume: `init-ssl.sh`
+writes `shared_preload_libraries = 'pg_stat_statements,pgaudit'` at initdb
+and `wrapper.sh` adds whichever of the two is missing on every boot, to
+volumes initialized before this and to an operator's own `ALTER SYSTEM` list
+(which overrides `postgresql.conf` as a whole). Preloaded with `pgaudit.log`
+unset it logs nothing and costs nothing; turning auditing on is
+
+```sql
+CREATE EXTENSION pgaudit;
+ALTER SYSTEM SET pgaudit.log = 'ddl, role';
+SELECT pg_reload_conf();
+```
+
+Audit lines land in the [server log stream](#server-log-stream). If you set
+`shared_preload_libraries` yourself, use list syntax (`= pg_stat_statements,
+pgaudit`): `ALTER SYSTEM` quotes a single `'a,b'` string as *one* library
+name and the next boot refuses with `could not access file "a,b"`.
+
+The [major version upgrade](#major-version-upgrades) job starts pg_upgrade's
+target server with the same preload list the volume had, so an installed
+pgaudit passes `--check`, and the upgraded database boots with it preloaded
+again.
+
 ### Base distro
 
 Every `Dockerfile.<major>` (and `Dockerfile.upgrade`) builds `FROM
@@ -581,8 +614,8 @@ validates those only syntactically — the libraries load at postmaster or
 connection start — so re-applying a value naming a library the new major's
 image doesn't ship would pass the statement and then refuse every subsequent
 boot, the exact failure not carrying the file exists to avoid (they stay in
-the stash for manual review, and the image manages `pg_stat_statements`
-preloading itself). A statement the server *rejects* still counts as a
+the stash for manual review, and the image manages `pg_stat_statements` and
+`pgaudit` preloading itself). A statement the server *rejects* still counts as a
 verdict; only settings that never reached the server (connection lost
 mid-restore, psql exit 2) keep the flag for a retry on the next boot.
 `postgresql.conf` itself is initdb + entrypoint output, not a user surface,

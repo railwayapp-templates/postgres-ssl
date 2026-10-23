@@ -34,8 +34,20 @@ FROM postgres:${POSTGRES_VERSION}-${DEBIAN_RELEASE}
 # pool, the daily rebuild fails loudly - a human decides, never a nightly
 # accident.
 ARG PGVECTOR_PKG_VERSION=0.8.*
+# pgaudit is deliberately NOT version-pinned. Upstream keeps one release
+# branch per Postgres major (1.5 for 13, 1.6 for 14, 1.7 for 15, 16.x for
+# 16, 17.x for 17, ...) and pgdg's postgresql-<major>-pgaudit package only
+# ever carries that major's branch, so the package name already fixes the
+# line a tag can move along — there is no minor for the nightly rebuild to
+# drift across. Within a branch, patch releases ship empty catalog upgrade
+# scripts (1.7->1.7.1, 16.0->16.1 are both bare \echo guards), so a
+# refreshed .so under an older catalog is the same bugfix stream the
+# pgvector wildcard admits. The image preloads it next to pg_stat_statements
+# (init-ssl.sh at initdb, wrapper.sh on every boot): pgaudit refuses to load
+# any other way, and preloaded with pgaudit.log unset it is inert, so
+# CREATE EXTENSION pgaudit simply works (see README "Extensions").
 
-# Install OpenSSL, sudo, pgvector, pgbackrest, tini (PID 1, see ENTRYPOINT
+# Install OpenSSL, sudo, pgvector, pgaudit, pgbackrest, tini (PID 1, see ENTRYPOINT
 # below), and ca-certificates (needed
 # so pgbackrest can verify the TLS cert of the S3 endpoint — postgres base
 # image disables apt Recommends, so ca-certificates isn't pulled implicitly)
@@ -51,7 +63,7 @@ ARG PKG_REFRESH=none
 RUN echo "refresh key: ${PKG_REFRESH}" \
     && apt-mark hold postgresql-15 postgresql-client-15 \
     && apt-get update && apt-get upgrade -y \
-    && apt-get install -y openssl sudo ca-certificates jq pgbackrest tini "postgresql-15-pgvector=${PGVECTOR_PKG_VERSION}" \
+    && apt-get install -y openssl sudo ca-certificates jq pgbackrest tini "postgresql-15-pgvector=${PGVECTOR_PKG_VERSION}" postgresql-15-pgaudit \
     && apt-mark unhold postgresql-15 postgresql-client-15 \
     && rm -rf /var/lib/apt/lists/*
 

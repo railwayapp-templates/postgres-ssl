@@ -385,22 +385,67 @@ EOF
   sync "$PG_HBA_FILE"
 fi
 
-# Adds pg_stat_statements to shared_preload_libraries in a config file
-# Usage: add_pg_stat_statements <config_file>
-add_pg_stat_statements() {
-  local config_file="$1"
-  local current_libs
-  # Extract value - handles quoted ('val', "val") and unquoted (val) formats
-  current_libs=$(grep -E "^[[:space:]]*shared_preload_libraries" "$config_file" 2>/dev/null | tail -1 | sed "s/.*=[[:space:]]*//; s/^['\"]//; s/['\"].*$//; s/[[:space:]]*$//")
-  if [ -n "$current_libs" ]; then
-    echo "shared_preload_libraries = '${current_libs},pg_stat_statements'" >> "$config_file"
-  else
-    echo "shared_preload_libraries = 'pg_stat_statements'" >> "$config_file"
-  fi
+# The libraries the image itself preloads, on every volume, at every boot:
+# pg_stat_statements because the dashboard's Stats tab reads its view, and
+# pgaudit because it refuses to load any other way (its _PG_init errors
+# outside shared_preload_libraries, so CREATE EXTENSION pgaudit — the
+# dashboard's Install button — only works when it is already here) while
+# costing nothing until pgaudit.log is set. init-ssl.sh writes both at
+# initdb; ensure_image_preload_libraries below adds whichever is missing
+# to a volume initialized before it was (and to an operator's own
+# ALTER SYSTEM list, which overrides postgresql.conf wholesale).
+IMAGE_PRELOAD_LIBRARIES="pg_stat_statements pgaudit"
+
+# The effective value of the LAST shared_preload_libraries assignment in a
+# config file, normalized to a bare comma list: quotes of both kinds and
+# whitespace stripped, trailing comment dropped. Empty when the file has no
+# assignment. The quote stripping is what makes ALTER SYSTEM's single-string
+# form ('"a,b"', which Postgres reads as ONE library named a,b) come out as
+# a,b here — the line this appends then repairs it.
+# Usage: preload_value <config_file>
+preload_value() {
+  grep -E '^[[:space:]]*shared_preload_libraries[[:space:]]*=' "$1" 2>/dev/null | tail -1 \
+    | sed 's/^[^=]*=//; s/#.*$//' | tr -d "'\"[:space:]"
 }
 
-# Ensure pg_stat_statements is in shared_preload_libraries for existing databases
-# This handles databases created before this setting was added
+# True when the file's effective preload list names <lib> as an element —
+# never a substring match: pgaudit.log = 'ddl' on another line must not
+# count as pgaudit being preloaded.
+# Usage: preload_has <config_file> <lib>
+preload_has() {
+  preload_value "$1" | tr ',' '\n' | grep -qx -- "$2"
+}
+
+# Appends an assignment that keeps the current list and adds <lib>.
+# Usage: add_preload_library <config_file> <lib>
+add_preload_library() {
+  local config_file="$1" lib="$2" current_libs
+  current_libs=$(preload_value "$config_file")
+  echo "shared_preload_libraries = '${current_libs:+${current_libs},}${lib}'" >> "$config_file"
+}
+
+# postgresql.conf always carries the image's list (init-ssl.sh wrote it;
+# older volumes get it appended). postgresql.auto.conf is only touched when
+# it already assigns the GUC — an ALTER SYSTEM there overrides
+# postgresql.conf as a whole, so a list set by the operator without the
+# image's libraries would silently drop them.
+# Usage: ensure_image_preload_libraries <postgresql.conf> <postgresql.auto.conf>
+ensure_image_preload_libraries() {
+  local conf="$1" auto_conf="$2" file lib
+  [ -f "$conf" ] || return 0
+  for file in "$conf" "$auto_conf"; do
+    [ -f "$file" ] || continue
+    if [ "$file" = "$auto_conf" ] && ! grep -qE '^[[:space:]]*shared_preload_libraries[[:space:]]*=' "$file"; then
+      continue
+    fi
+    for lib in $IMAGE_PRELOAD_LIBRARIES; do
+      preload_has "$file" "$lib" && continue
+      echo "wrapper: adding $lib to shared_preload_libraries in $(basename "$file")"
+      add_preload_library "$file" "$lib"
+    done
+  done
+}
+
 AUTO_CONF_FILE="$PGDATA/postgresql.auto.conf"
 
 # Raise max_connections so PgBouncer (3 replicas × default_pool_size=20 = 60
@@ -411,15 +456,7 @@ if [ -f "$POSTGRES_CONF_FILE" ] && ! grep -q "^[[:space:]]*max_connections" "$AU
   echo "wrapper: setting max_connections = 500 in postgresql.auto.conf"
   echo "max_connections = 500" >> "$AUTO_CONF_FILE"
 fi
-if [ -f "$POSTGRES_CONF_FILE" ] && ! grep -q "pg_stat_statements" "$POSTGRES_CONF_FILE"; then
-  echo "Adding pg_stat_statements to shared_preload_libraries..."
-  add_pg_stat_statements "$POSTGRES_CONF_FILE"
-  # Only update auto.conf if it has shared_preload_libraries set (which would override postgresql.conf)
-  # and doesn't already have pg_stat_statements
-  if grep -q "^[[:space:]]*shared_preload_libraries" "$AUTO_CONF_FILE" 2>/dev/null && ! grep -q "pg_stat_statements" "$AUTO_CONF_FILE" 2>/dev/null; then
-    add_pg_stat_statements "$AUTO_CONF_FILE"
-  fi
-fi
+ensure_image_preload_libraries "$POSTGRES_CONF_FILE" "$AUTO_CONF_FILE"
 
 # -----------------------------------------------------------------------------
 # WAL archiving + PITR (tool-agnostic env contract)
@@ -1825,7 +1862,7 @@ configure_pgbackrest_recovery
 # regenerate cert files; postgresql.conf is already restored from source and
 # already references these paths, so we don't re-run init-ssl.sh (which would
 # append duplicate ssl_*_file lines and clobber any custom
-# shared_preload_libraries with `'pg_stat_statements'`).
+# shared_preload_libraries with the image's own list).
 if [ -f "$POSTGRES_CONF_FILE" ] && [ ! -f "$SSL_DIR/server.crt" ]; then
   echo "Generating SSL certs after restore (cert files were not in pgbackrest backup)..."
   sudo mkdir -p "$SSL_DIR"
@@ -1971,8 +2008,9 @@ fork_post_upgrade_analyze() {
 # so re-applying a value that names a library the new major's image doesn't
 # ship would pass here and then refuse every subsequent boot or connection,
 # which is the exact disaster class not carrying the file avoids. The image
-# also actively manages shared_preload_libraries itself (pg_stat_statements,
-# see add_pg_stat_statements above).
+# also actively manages shared_preload_libraries itself (pg_stat_statements
+# and pgaudit, see ensure_image_preload_libraries above), so the libraries
+# the platform relies on are back on the first boot regardless.
 # postgresql.conf itself is not re-applied: on this image it is initdb +
 # entrypoint output, not a user surface — its stash stays as reference.
 # One-shot across restarts via the marker's needsConfigReview flag.

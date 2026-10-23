@@ -605,7 +605,45 @@ t_manifest_mode() {
   run_job "$vol" manifest
   assert_eq "$JOB_RC" 0 "manifest exit code" || return 1
   assert_contains "$JOB_OUT" '"vector"' "pgvector present in manifest" || return 1
+  assert_contains "$JOB_OUT" '"pgaudit"' "pgaudit present in manifest" || return 1
   assert_contains "$JOB_OUT" '"pg_stat_statements"' "contrib extension present" || return 1
+}
+
+# pgaudit on BOTH sides of the job image (Dockerfile.upgrade): pg_upgrade
+# starts the OLD server with the volume's own shared_preload_libraries, so
+# the FROM major's pgaudit.so must resolve, and --check verifies every
+# library the catalog references ($libdir/pgaudit, via the extension's
+# event-trigger functions) against the TO major's binaries — by LOADing it
+# on the target server, which pgaudit refuses unless preloaded there too, so
+# the job carries the old cluster's preload list onto the target server
+# (new_server_preload_options in upgrade-job.sh). Config restore still never
+# re-applies preload GUCs, but the image preloads pgaudit itself, so the
+# upgraded database's first boot has it loaded and its DDL (event triggers
+# included) works at once.
+t_pgaudit_survives_upgrade() {
+  local vol="upg-e2e-pgaudit"
+  fresh_volume "$vol" || return 1
+  run_pg pgaudit-pg "$vol" "$FROM_IMAGE" || return 1
+  wait_for_pg pgaudit-pg || { fail_dump pgaudit pgaudit-pg; return 1; }
+  assert_eq "$(psql_in pgaudit-pg 'SHOW shared_preload_libraries')" "pg_stat_statements,pgaudit" "image preloads pgaudit on the FROM major" || return 1
+  psql_must pgaudit-pg "CREATE EXTENSION pgaudit" || return 1
+  psql_must pgaudit-pg "CREATE TABLE pgaudit_canary (id int)" || return 1
+  stop_pg pgaudit-pg
+
+  run_job "$vol" check
+  assert_eq "$JOB_RC" 0 "--check passes with pgaudit preloaded and installed on the source" || { echo "$JOB_OUT" | tail -30; return 1; }
+  assert_contains "$JOB_OUT" "target server starts with shared_preload_libraries=pg_stat_statements,pgaudit" "preload list carried onto the target server" || return 1
+  run_job "$vol" upgrade
+  assert_eq "$JOB_RC" 0 "upgrade exit code" || { echo "$JOB_OUT" | tail -30; return 1; }
+
+  run_pg pgaudit2-pg "$vol" "$TO_IMAGE" || return 1
+  wait_for_pg pgaudit2-pg || { fail_dump pgaudit2 pgaudit2-pg; return 1; }
+  assert_eq "$(psql_in pgaudit2-pg "SELECT count(*) FROM pg_extension WHERE extname = 'pgaudit'")" "1" "pgaudit extension survived the upgrade" || return 1
+  assert_eq "$(psql_in pgaudit2-pg 'SHOW shared_preload_libraries')" "pg_stat_statements,pgaudit" "image preloads pgaudit on the TO major's first boot" || return 1
+  psql_must pgaudit2-pg "SET pgaudit.log = 'ddl'; CREATE TABLE pgaudit_after_upgrade (id int)" || return 1
+  assert_contains "$(docker logs pgaudit2-pg 2>&1)" "AUDIT: SESSION" "pgaudit logs DDL on the TO major" || return 1
+  assert_eq "$(psql_in pgaudit2-pg 'SELECT count(*) FROM pgaudit_canary')" "0" "pre-upgrade table readable" || return 1
+  stop_pg pgaudit2-pg
 }
 
 # pg_upgrade promotes a freshly initdb'd data directory, so postgresql.conf
@@ -2096,6 +2134,7 @@ ALL_TESTS=(
   t_upgrade_idempotent
   t_status_mode
   t_manifest_mode
+  t_pgaudit_survives_upgrade
   t_ssl_survives_upgrade
   t_analyze_staged
   t_config_restore_self_heals

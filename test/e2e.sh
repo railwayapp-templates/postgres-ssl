@@ -1115,6 +1115,70 @@ t_alter_system_survives_restart() {
   docker volume rm "$vol" >/dev/null
 }
 
+# pgaudit is image-managed like pg_stat_statements: preloaded on every
+# volume by init-ssl.sh at initdb and by the wrapper on every boot, because
+# it refuses to load any other way (so CREATE EXTENSION — the dashboard's
+# Install button — must find it already there) and is inert until
+# pgaudit.log is set. Three volume shapes: fresh, one initialized before the
+# image preloaded pgaudit (its postgresql.conf names pg_stat_statements
+# alone), and an operator ALTER SYSTEM list that overrides postgresql.conf
+# without the image's libraries — with a pgaudit.* GUC on another line of
+# auto.conf, so the check must match the list, not the file.
+t_pgaudit_preloaded_by_image() {
+  local t=t_pgaudit_preloaded_by_image
+  local name=t-pgaudit-${PG_VERSION}
+  local vol=${name}-vol
+  rebuild_image  # asserts on init-ssl.sh / wrapper.sh behavior, which the tag alone does not pin
+  new_volume "$vol"
+  docker rm -f "$name" >/dev/null 2>&1 || true
+  spawn "$name" "$vol" -e POSTGRES_PASSWORD=test -v "$vol:/var/lib/postgresql/data"
+  wait_for_pg "$name" || { ko "$t" "postgres did not start"; fail_dump "$t" "$name"; return; }
+
+  local libs
+  libs=$(docker exec "$name" psql -U postgres -At -c "SHOW shared_preload_libraries")
+  assert_eq "$libs" "pg_stat_statements,pgaudit" "fresh volume preloads both image libraries" || { ko "$t" ""; fail_dump "$t" "$name"; return; }
+
+  # One session: the SET scopes pgaudit.log to it, and the CREATE TABLE is the
+  # DDL it must log (pgaudit's SESSION line goes to the server log stream).
+  docker exec "$name" psql -U postgres -v ON_ERROR_STOP=1 \
+    -c "CREATE EXTENSION pgaudit" \
+    -c "SET pgaudit.log = 'ddl'; CREATE TABLE pgaudit_canary (id int)" >/dev/null \
+    || { ko "$t" "CREATE EXTENSION pgaudit / audited DDL failed"; fail_dump "$t" "$name"; return; }
+  wait_for_log_line "$name" "AUDIT: SESSION,.*,DDL,CREATE TABLE,TABLE,public.pgaudit_canary" 10 \
+    || { ko "$t" "no pgaudit SESSION line for the CREATE TABLE in the server log"; fail_dump "$t" "$name"; return; }
+
+  # A volume from before the image preloaded pgaudit.
+  docker exec "$name" sed -i "s/^shared_preload_libraries = 'pg_stat_statements,pgaudit'$/shared_preload_libraries = 'pg_stat_statements'/" /var/lib/postgresql/data/postgresql.conf
+  docker restart "$name" >/dev/null
+  wait_for_pg "$name" || { ko "$t" "postgres did not come back (legacy postgresql.conf)"; fail_dump "$t" "$name"; return; }
+  libs=$(docker exec "$name" psql -U postgres -At -c "SHOW shared_preload_libraries")
+  assert_eq "$libs" "pg_stat_statements,pgaudit" "wrapper re-adds pgaudit to a legacy postgresql.conf" || { ko "$t" ""; fail_dump "$t" "$name"; return; }
+  wait_for_log_line "$name" "adding pgaudit to shared_preload_libraries in postgresql.conf" 5 \
+    || { ko "$t" "wrapper did not report the postgresql.conf repair"; fail_dump "$t" "$name"; return; }
+
+  # An operator list in auto.conf that drops the image's libraries, with a
+  # pgaudit GUC on a neighbouring line.
+  docker exec "$name" psql -U postgres -v ON_ERROR_STOP=1 \
+    -c "ALTER SYSTEM SET pgaudit.log = 'ddl'" \
+    -c "ALTER SYSTEM SET shared_preload_libraries = pg_stat_statements" >/dev/null \
+    || { ko "$t" "ALTER SYSTEM failed"; fail_dump "$t" "$name"; return; }
+  docker restart "$name" >/dev/null
+  wait_for_pg "$name" || { ko "$t" "postgres did not come back (auto.conf override)"; fail_dump "$t" "$name"; return; }
+  libs=$(docker exec "$name" psql -U postgres -At -c "SHOW shared_preload_libraries")
+  assert_eq "$libs" "pg_stat_statements,pgaudit" "wrapper re-adds pgaudit to an operator auto.conf list" || { ko "$t" ""; fail_dump "$t" "$name"; return; }
+  wait_for_log_line "$name" "adding pgaudit to shared_preload_libraries in postgresql.auto.conf" 5 \
+    || { ko "$t" "wrapper did not report the auto.conf repair"; fail_dump "$t" "$name"; return; }
+  # The system-wide pgaudit.log now audits every session's DDL.
+  docker exec "$name" psql -U postgres -v ON_ERROR_STOP=1 -c "CREATE TABLE pgaudit_canary_2 (id int)" >/dev/null \
+    || { ko "$t" "DDL failed after the auto.conf repair"; fail_dump "$t" "$name"; return; }
+  wait_for_log_line "$name" "AUDIT: SESSION,.*,DDL,CREATE TABLE,TABLE,public.pgaudit_canary_2" 10 \
+    || { ko "$t" "no pgaudit SESSION line under the system-wide pgaudit.log"; fail_dump "$t" "$name"; return; }
+
+  ok "$t"
+  docker rm -f "$name" >/dev/null
+  docker volume rm "$vol" >/dev/null
+}
+
 t_s3_unreachable_pg_stays_up() {
   local name=t-s3down-${PG_VERSION}
   local vol=${name}-vol
@@ -5395,6 +5459,7 @@ ALL_TESTS=(
   t_archiving_boot
   t_archiving_boot_survives_pghostaddr
   t_alter_system_survives_restart
+  t_pgaudit_preloaded_by_image
   t_s3_unreachable_pg_stays_up
   t_queue_max_5gib_trips
   t_wrapper_drop_on_bad_creds

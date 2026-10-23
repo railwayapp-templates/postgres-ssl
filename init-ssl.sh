@@ -112,7 +112,7 @@ ssl = on
 ssl_cert_file = '$SSL_SERVER_CRT'
 ssl_key_file = '$SSL_SERVER_KEY'
 ssl_ca_file = '$SSL_ROOT_CRT'
-shared_preload_libraries = 'pg_stat_statements'
+shared_preload_libraries = 'pg_stat_statements,pgaudit'
 EOF
 fi
 # Flush the ssl append to disk. postgresql.conf is parsed at every boot but
