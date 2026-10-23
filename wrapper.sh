@@ -1073,8 +1073,8 @@ compute_volume_thresholds() {
 #     that the bottleneck is WAL arrival itself, not worker count.
 #   archive-get: WAL replay is serial inside Postgres, so prefetching with
 #     >1 worker yields diminishing returns. Pinned to 1.
-#   backup: Steele's "≤25% of CPUs" rule (don't starve live DB traffic).
-#     Floor 1, ceiling 16 to bound per-worker zstd buffer memory.
+#   backup: one reader by default. Volume IOPS/throughput do not scale
+#     with vCPU; extra readers compete with live queries for the same disk.
 #   restore: DB is down, no other workload to protect — but ceiling at 32
 #     because pgBackRest's restore throughput plateaus around there
 #     (S3 GET-per-prefix and per-worker memory dominate past that).
@@ -1113,7 +1113,7 @@ render_pgbackrest_conf() {
   local push_max get_max backup_max restore_max
   push_max=${PGBACKREST_ARCHIVE_PUSH_PROCESS_MAX:-$(clamp $((cpus / 8)) 2 8)}
   get_max=${PGBACKREST_ARCHIVE_GET_PROCESS_MAX:-1}
-  backup_max=${PGBACKREST_BACKUP_PROCESS_MAX:-$(clamp $((cpus / 4)) 1 16)}
+  backup_max=${PGBACKREST_BACKUP_PROCESS_MAX:-1}
   restore_max=${PGBACKREST_RESTORE_PROCESS_MAX:-$(clamp "$cpus" 1 32)}
 
   echo "pgbackrest: detected ${cpus} vCPU; process-max push=${push_max} get=${get_max} backup=${backup_max} restore=${restore_max}"
@@ -1153,7 +1153,7 @@ archive-get-queue-max=1GiB
 spool-path=${PGBACKREST_SPOOL_DIR}
 compress-type=zst
 compress-level=3
-start-fast=y
+start-fast=n
 ${retention_block}
 [global:archive-push]
 process-max=${push_max}

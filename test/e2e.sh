@@ -222,6 +222,8 @@ gosu postgres pgbackrest --stanza=main --pg1-path=/var/lib/postgresql/data \
     >/dev/null 2>&1
 }
 
+# Use fast checkpoints in timing-sensitive tests; the config-default and
+# override precedence are checked in t_watcher_initial_full.
 # Common runner for an archiving service. All test containers carry the
 # postgres-ssl-e2e=1 label so the trap can find and clean them up.
 #
@@ -241,6 +243,7 @@ run_archiving_pg() {
     -e "WAL_ARCHIVE_SECRET=$MINIO_PASS" \
     -e "WAL_ARCHIVE_PATH=/pgbackrest" \
     -e "PGBACKREST_REPO1_S3_URI_STYLE=path" \
+    -e "PGBACKREST_START_FAST=y" \
     "$@" \
     -v "$vol:/var/lib/postgresql/data" \
     "${ARCHIVING_PG_IMAGE:-$IMAGE}" >/dev/null
@@ -1952,7 +1955,12 @@ t_watcher_initial_full() {
   new_volume "$vol"
   docker rm -f "$name" >/dev/null 2>&1 || true
   # Render the template overrides, then keep them out of pgBackRest's JSON.
+  # PGBACKREST_START_FAST=n cancels the harness-wide =y (docker keeps the last
+  # -e), so this full runs with the image default; the assertions below check
+  # the config/env precedence, not checkpoint timing: on this empty cluster a
+  # spread checkpoint completes in well under a second.
   run_archiving_pg_fast_watcher "$name" "$vol" \
+    -e PGBACKREST_START_FAST=n \
     -e PGBACKREST_BACKUP_PROCESS_MAX=4 \
     -e PGBACKREST_ARCHIVE_PUSH_PROCESS_MAX=3 \
     -e PGBACKREST_ARCHIVE_GET_PROCESS_MAX=3 \
@@ -1989,6 +1997,8 @@ t_watcher_initial_full() {
   fi
   if ! docker exec -u postgres "$name" bash -e -o pipefail -c '
     pgbackrest --stanza=main info --output=json | jq empty
+    env PGBACKREST_START_FAST=y pgbackrest help backup start-fast | grep -Fx "current: true"
+    env -u PGBACKREST_START_FAST pgbackrest help backup start-fast | grep -Fx "current: false"
     for setting in backup:4 archive-push:3 archive-get:3 restore:24; do
       output=$(pgbackrest help "${setting%:*}" process-max)
       grep -Fx "current: ${setting#*:}" <<<"$output"
