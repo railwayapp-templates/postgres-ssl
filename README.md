@@ -106,6 +106,52 @@ target server with the same preload list the volume had, so an installed
 pgaudit passes `--check`, and the upgraded database boots with it preloaded
 again.
 
+### gosu helper
+
+Every runtime and upgrade image replaces the base image's prebuilt `gosu` with
+gosu 1.20, built from checksum-verified upstream source at commit
+`29b939aa5bd4dc588af765b8248f6e39150d2565` using Go 1.27.2. Both the source and
+the multi-platform builder image are pinned. The statically linked helper keeps
+the upstream user-switch and exec interface; the Go compiler and build sources
+stay in the build stage. Updating Debian packages alone cannot patch the Go
+standard library embedded in the base image's helper.
+
+An earlier scanner baseline associated seven Go advisories with the helper's
+toolchain version.
+Validation against the Go advisories on October 30, 2026 found that these are
+not demonstrated Linux gosu vulnerabilities:
+
+| Advisory | Actual affected functionality | Applicability to this helper |
+| --- | --- | --- |
+| [CVE-2025-68121](https://pkg.go.dev/vuln/GO-2026-4337) | TLS session resumption after CA configuration changes | gosu does not import `crypto/tls`. |
+| [CVE-2026-39821](https://pkg.go.dev/vuln/GO-2026-5026) | IDNA Punycode validation, including HTTP's bundled implementation | gosu does not import `net/http` or `golang.org/x/net/idna`. |
+| [CVE-2026-42505](https://pkg.go.dev/vuln/GO-2026-5856) | TLS Encrypted Client Hello privacy leak | gosu does not import `crypto/tls`. |
+| [CVE-2026-56857](https://pkg.go.dev/vuln/GO-2026-6604) | Windows `os.Root.Mkdir` / `MkdirAll` junction escape | Windows-only; these images run Linux. |
+| [CVE-2026-78663](https://pkg.go.dev/vuln/GO-2026-6612) | HTTP/2 server flow-control double refund | gosu does not import the affected HTTP packages. |
+| [CVE-2026-78669](https://pkg.go.dev/vuln/GO-2026-6611) | HTTP/2 CPU exhaustion from repeated window changes | gosu does not import the affected HTTP packages. |
+| [CVE-2026-97031](https://pkg.go.dev/vuln/GO-2026-6607) | TLS ECH memory amplification | gosu does not import `crypto/tls`. |
+
+The pinned source's Linux dependency graph excludes the affected network
+packages. The inspected baseline gosu 1.19 / Go 1.24.6 executable also has
+no `crypto/tls`, `net/http`, or `golang.org/x/net/idna` / `http2` symbols. That
+baseline binary check is not an attestation of every published image tag.
+See [gosu's security policy](https://github.com/tianon/gosu/blob/29b939aa5bd4dc588af765b8248f6e39150d2565/SECURITY.md):
+toolchain-version scanner matches must be checked for actual affected code.
+This rebuild refreshes the helper and its toolchain; it must not be described
+as fixing seven exploitable gosu CVEs.
+
+The dependency update does address
+[CVE-2026-61801 / GHSA-mjcv-p78q-w5fw](https://github.com/moby/sys/security/advisories/GHSA-mjcv-p78q-w5fw):
+gosu 1.20 uses `github.com/moby/sys/user` 0.4.1, which limits parsing of
+user/group database files. Exploitation requires attacker influence over the
+files being parsed. `govulncheck` 1.1.4 in binary mode identified affected
+user-parsing symbols in the inspected old helper and none in the replacement.
+The checked replacement matches the local Postgres 17 image's helper SHA-256,
+`c03d596db1283b3a418e852ad874343c2b775547e84816beabad2af183e575f8`.
+
+When updating gosu or Go, update the pins in every `Dockerfile.*`. Build the
+images and run the existing database and upgrade E2E suites before publishing.
+
 ### Base distro
 
 Every `Dockerfile.<major>` (and `Dockerfile.upgrade`) builds `FROM
