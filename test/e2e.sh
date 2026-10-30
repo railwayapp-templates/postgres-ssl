@@ -5443,9 +5443,19 @@ t_log_to_stdout_moves_server_stream() {
   docker volume rm "$vol" >/dev/null
 }
 
+t_encrypted_repository_pitr() {
+  rebuild_image || { ko "${FUNCNAME[0]}" "image build failed"; return; }
+  if python3 "$REPO_ROOT/test/encryption.py" --image "$IMAGE" --storage-image "$MINIO_IMAGE"; then
+    ok "${FUNCNAME[0]}"
+  else
+    ko "${FUNCNAME[0]}" "encrypted repository/PITR qualification failed"
+  fi
+}
+
 # ----- runner ----------------------------------------------------------------
 
 ALL_TESTS=(
+  t_encrypted_repository_pitr
   t_vanilla_boot
   t_log_to_stdout_moves_server_stream
   t_runtime_lock_blocks_overlapping_boot

@@ -1124,14 +1124,60 @@ clamp() {
   echo "$v"
 }
 
-# Render /etc/pgbackrest/pgbackrest.conf with the service's own archive
-# bucket as repo1 + operator-policy defaults + stanza definition. Recovery
-# (when needed) lives in a separate file written by
-# restore_from_pgbackrest_if_empty_volume / configure_pgbackrest_recovery,
-# never touching this file. Idempotent: rewritten on every boot when the
-# gate var is set.
+# Each config numbers its single repository as repo1. Keep source-recovery
+# encryption independent from the service's own archive encryption.
+pgbackrest_cipher_config() {
+  local type_var="${1}_CIPHER_TYPE" pass_var="${1}_CIPHER_PASS"
+  local cipher_type="${!type_var:-none}" cipher_pass="${!pass_var:-}"
+  case "$cipher_type" in
+    none)
+      if [ -n "$cipher_pass" ]; then
+        echo "pgbackrest: ${pass_var} requires ${type_var}=aes-256-cbc" >&2
+        return 1
+      fi
+      ;;
+    aes-256-cbc)
+      if [ -z "$cipher_pass" ]; then
+        echo "pgbackrest: ${type_var}=aes-256-cbc requires ${pass_var}" >&2
+        return 1
+      fi
+      # Config is line-oriented: a secret must never inject another option.
+      if [[ "$cipher_pass" == *$'\n'* || "$cipher_pass" == *$'\r'* ]]; then
+        echo "pgbackrest: ${pass_var} must be a single line" >&2
+        return 1
+      fi
+      # pgBackRest trims INI values, unlike native environment values.
+      # Reject rather than silently encrypt/decrypt with a different key.
+      if [[ "$cipher_pass" == [[:space:]]* || "$cipher_pass" == *[[:space:]] ]]; then
+        echo "pgbackrest: ${pass_var} must not begin or end with whitespace" >&2
+        return 1
+      fi
+      ;;
+    *)
+      echo "pgbackrest: ${type_var} must be none or aes-256-cbc" >&2
+      return 1
+      ;;
+  esac
+  printf 'repo1-cipher-type=%s\n' "$cipher_type"
+  [ "$cipher_type" = none ] || printf 'repo1-cipher-pass=%s\n' "$cipher_pass"
+}
+
+validate_pgbackrest_encryption() {
+  local prefix
+  for prefix in WAL_ARCHIVE WAL_RECOVER_FROM; do
+    local bucket_var="${prefix}_BUCKET"
+    [ -n "${!bucket_var:-}" ] || continue
+    pgbackrest_cipher_config "$prefix" >/dev/null || return 1
+  done
+}
+
+# Render the service's own archive config. Recovery uses a separate file;
+# both files are regenerated from their role's settings on boot.
 render_pgbackrest_conf() {
   [ -z "${WAL_ARCHIVE_BUCKET:-}" ] && return 0
+
+  local cipher_config
+  cipher_config=$(pgbackrest_cipher_config WAL_ARCHIVE) || return 1
 
   mkdir -p /etc/pgbackrest
   # Only create the spool dir once $PGDATA is initialized; before initdb,
@@ -1182,6 +1228,7 @@ repo1-s3-region=${WAL_ARCHIVE_REGION}
 repo1-s3-endpoint=${WAL_ARCHIVE_ENDPOINT}
 repo1-s3-uri-style=${WAL_ARCHIVE_S3_URI_STYLE:-path}
 repo1-path=${WAL_ARCHIVE_PATH:-/pgbackrest}
+${cipher_config}
 log-level-console=info
 log-level-file=off
 archive-async=y
@@ -1411,10 +1458,28 @@ bootstrap_pgbackrest_stanza() {
 # (translated from `WAL_RECOVER_FROM_*` at the top of this script). Post-
 # promote archive_command writes to repo1 (this fork's own bucket) — see
 # the archive-push wrapper's --repo=1 pin.
+reset_pgbackrest_archive_state_after_restore() {
+  # These files belong to the source repository, not the restored fork.
+  # Recovery has its own config; new archiving must use the fork's settings.
+  rm -f "$PGBACKREST_REPO_PATH_MARKER" "$PGBACKREST_REPO_ANCHOR_FILE" \
+    "$PGDATA/.pgbackrest_backup_state" "$PGDATA/.pgbackrest_gap_pending"
+}
+
+prepare_pgbackrest_snapshot_archive() {
+  # Only the first staging of an external/snapshot restore is a handoff.
+  # Replay retries must retain any archive paths/state established by this
+  # fork (including watcher migrations), rather than reset on every boot.
+  [ -f "$PITR_STAGING_FILE" ] && return 0
+  reset_pgbackrest_archive_state_after_restore
+}
+
 configure_pgbackrest_recovery() {
   [ -z "${WAL_RECOVER_FROM_BUCKET:-}" ] && return 0
   [ -z "$POSTGRES_RECOVERY_TARGET_TIME" ] && return 0
   [ ! -f "$POSTGRES_CONF_FILE" ] && return 0
+
+  local cipher_config
+  cipher_config=$(pgbackrest_cipher_config WAL_RECOVER_FROM) || return 1
 
   # A COMPLETED major-upgrade marker is proof recovery already promoted on
   # this volume, equivalent to .pitr_configured. Two layers guard the
@@ -1469,6 +1534,7 @@ repo1-s3-region=${WAL_RECOVER_FROM_REGION}
 repo1-s3-endpoint=${WAL_RECOVER_FROM_ENDPOINT}
 repo1-s3-uri-style=${WAL_RECOVER_FROM_S3_URI_STYLE:-path}
 repo1-path=${WAL_RECOVER_FROM_PATH:-/pgbackrest}
+${cipher_config}
 
 [main]
 pg1-path=${PGDATA}
@@ -1528,6 +1594,7 @@ EOF
     return 0
   fi
 
+  prepare_pgbackrest_snapshot_archive
   ensure_pg_includes_confd
   install -d -m 0750 -o postgres -g postgres "$PGBACKREST_CONFD_DIR"
 
@@ -1571,6 +1638,9 @@ EOF
   chmod 0640 "$PGBACKREST_RECOVERY_CONF"
   touch "$PGDATA/recovery.signal"
   touch "$PITR_STAGING_FILE"
+  # Commit the handoff before Postgres/archiver/watcher can establish new
+  # state. A crash during replay must not repeat the source-state reset.
+  sync "$PITR_STAGING_FILE" 2>/dev/null || sync
   echo "pgbackrest: PITR replay staged (target=${POSTGRES_RECOVERY_TARGET_TIME})"
 }
 
@@ -1606,6 +1676,8 @@ EOF
 # against the base, only refetching what's missing.
 restore_from_pgbackrest_if_empty_volume() {
   [ -z "${WAL_RECOVER_FROM_BUCKET:-}" ] && return 0
+  local cipher_config
+  cipher_config=$(pgbackrest_cipher_config WAL_RECOVER_FROM) || return 1
   # A point-in-time restore is configured: log the gate state so "why did
   # the restore run (or not)" can be read from the log.
   echo "pgbackrest: restore-gate POSTGRES_RECOVERY_TARGET_TIME=${POSTGRES_RECOVERY_TARGET_TIME:+set} PG_VERSION=$([ -f "$PGDATA/PG_VERSION" ] && echo present || echo missing) PG_CONTROL=$([ -f "$PGDATA/global/pg_control" ] && echo present || echo missing) RESTORED_MARKER=$([ -f "$PGBACKREST_RESTORED_MARKER" ] && echo present || echo missing) PGDATA=$PGDATA"
@@ -1643,6 +1715,7 @@ repo1-s3-region=${WAL_RECOVER_FROM_REGION}
 repo1-s3-endpoint=${WAL_RECOVER_FROM_ENDPOINT}
 repo1-s3-uri-style=${WAL_RECOVER_FROM_S3_URI_STYLE:-path}
 repo1-path=${WAL_RECOVER_FROM_PATH:-/pgbackrest}
+${cipher_config}
 
 [main]
 pg1-path=${PGDATA}
@@ -1721,20 +1794,17 @@ EOF
   chown postgres:postgres "$PGBACKREST_RESTORE_STANDBY_CONF"
   chmod 0640 "$PGBACKREST_RESTORE_STANDBY_CONF"
 
+  # A restored backup carries the source's archive-path marker. Recovery
+  # reads WAL_RECOVER_FROM_PATH from its dedicated config, but new archiving
+  # must derive its path from this fork's WAL_ARCHIVE_PATH, especially when
+  # the two repositories share a bucket and use different encryption keys.
+  # Clear before publishing the restored marker so an interrupted restore
+  # retries this handoff rather than trusting the source's destination.
+  reset_pgbackrest_archive_state_after_restore
+
   touch "$PGBACKREST_RESTORED_MARKER"
   chown postgres:postgres "$PGBACKREST_RESTORED_MARKER" 2>/dev/null || true
 
-  # pgbackrest restore copies ALL of PGDATA — including the source's
-  # watcher state (`.pgbackrest_backup_state` with source's last_full_at,
-  # last_full_failed_count) and any in-flight gap-recovery marker. On
-  # the fork's own bucket those values are meaningless and they cause
-  # the watcher to mis-detect: source's last_full_at makes
-  # NEEDS_INITIAL_BACKUP skip even though the fork's bucket is empty,
-  # while source's last_full_failed_count vs fork's fresh failed_count
-  # triggers a phantom gap-recovery cycle that blocks the watcher's
-  # actual first full. Wipe so the fork starts from a clean slate.
-  rm -f "$PGDATA/.pgbackrest_backup_state" 2>/dev/null || true
-  rm -f "$PGDATA/.pgbackrest_gap_pending" 2>/dev/null || true
 
   echo "pgbackrest: restore complete; postgres will replay forward to ${POSTGRES_RECOVERY_TARGET_TIME} and promote on first start"
 }
@@ -1847,6 +1917,7 @@ if [ -z "${WAL_DROP_THRESHOLD_MB:-}" ]; then
   export WAL_DROP_THRESHOLD_MB="$COMPUTED_WAL_DROP_MB"
 fi
 
+validate_pgbackrest_encryption
 render_pgbackrest_conf
 restore_from_pgbackrest_if_empty_volume
 clear_pgbackrest_state_if_disabled
