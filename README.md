@@ -319,6 +319,16 @@ boots straight into archive recovery. A `.pgbackrest_restored` marker is
 written on success; `configure_pgbackrest_recovery` defers to the
 restore's own settings on subsequent starts of the same volume.
 
+A restore brings back the roles as they were at the recovery target,
+passwords included. Once the restored cluster promotes, the wrapper sets
+the superuser's password (`POSTGRES_USER`, default `postgres`) from the
+restored service's own `POSTGRES_PASSWORD`, so clients configured from
+that service's variables can connect even when the source's password
+changed after the target. It happens once per restore, tracked by
+`$PGDATA/.pitr_superuser_password_pending`: a password changed in the
+database later is left alone on every following start. Other roles keep
+the passwords they had at the target.
+
 #### Image-owned base backups
 
 When `WAL_ARCHIVE_BUCKET` is set, the wrapper forks a background watcher
