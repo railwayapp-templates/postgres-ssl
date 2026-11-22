@@ -663,9 +663,24 @@ log_catalog_probe_error() {
 # A failure is also checked for a half-created stanza (half_created_stanza_kind),
 # the one stanza-create failure that retrying never fixes.
 stanza_create_step() {
-  local out rc
-  out=$(timeout 60 pgbackrest --stanza=main stanza-create 2>&1)
-  rc=$?
+  local out="" rc=124 attempt=1 remaining retry_delay
+  local deadline=$((SECONDS + 60))
+  while :; do
+    remaining=$((deadline - SECONDS))
+    [ "$remaining" -le 0 ] && break
+    out=$(timeout "$remaining" pgbackrest --stanza=main stanza-create 2>&1)
+    rc=$?
+    # A live archive-push owns its lock. Leave ownership to pgBackRest and
+    # retry after a short jitter, within the original 60-second budget.
+    if [ "$rc" -ne 50 ] || [ "$attempt" -ge 3 ]; then
+      break
+    fi
+    retry_delay=$((1 + RANDOM % 3))
+    remaining=$((deadline - SECONDS))
+    [ "$remaining" -le "$retry_delay" ] && break
+    sleep "$retry_delay"
+    attempt=$((attempt + 1))
+  done
   if [ "$rc" -eq 0 ]; then
     # A whole stanza ends any half-created sighting in progress: the earlier
     # sighting was a stanza-create caught between its two writes.
