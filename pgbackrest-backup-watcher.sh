@@ -114,6 +114,15 @@ DIFF_INTERVAL_HOURS="${WAL_BACKUP_DIFF_INTERVAL_HOURS:-24}"
 # fresh state). Default: 3600 (1 hour).
 CATALOG_VERIFY_INTERVAL_SECONDS="${WAL_BACKUP_CATALOG_VERIFY_INTERVAL_SECONDS:-3600}"
 
+# Longest the watcher goes without running `pgbackrest stanza-create` (seconds)
+# — see stanza_create_step. stanza-create holds the stanza's archive lock while
+# it runs, and archive-push cannot start its async worker without that lock, so
+# it runs every iteration only while `pgbackrest info` reports a stanza that is
+# not whole. Otherwise (the stanza reads whole, or the bucket gave no answer)
+# it runs once this interval has passed since the last run. 0 runs it every
+# iteration. Default: 3600 (1 hour).
+STANZA_CREATE_INTERVAL_SECONDS="${WAL_BACKUP_STANZA_CREATE_INTERVAL_SECONDS:-3600}"
+
 # Minimum spacing between retries of a FAILING full backup (seconds).
 # NEEDS_INITIAL_BACKUP and the catalog-verify rc=1 self-heal both leave
 # last_full_at empty, which makes decide_action want a full every poll — so a
@@ -201,6 +210,7 @@ sanitize_uint WAL_BACKUP_GAP_RECOVERY_BACKOFF_SECONDS GAP_RECOVERY_BACKOFF_SECON
 sanitize_uint WAL_BACKUP_FULL_INTERVAL_HOURS FULL_INTERVAL_HOURS 168
 sanitize_uint WAL_BACKUP_DIFF_INTERVAL_HOURS DIFF_INTERVAL_HOURS 24
 sanitize_uint WAL_BACKUP_CATALOG_VERIFY_INTERVAL_SECONDS CATALOG_VERIFY_INTERVAL_SECONDS 3600
+sanitize_uint WAL_BACKUP_STANZA_CREATE_INTERVAL_SECONDS STANZA_CREATE_INTERVAL_SECONDS 3600
 sanitize_uint WAL_BACKUP_FULL_RETRY_BACKOFF_SECONDS FULL_RETRY_BACKOFF_SECONDS 600
 sanitize_uint WAL_LAG_GAP_THRESHOLD_SEGMENTS WAL_LAG_GAP_THRESHOLD_SEGMENTS 32
 : "${HALF_STANZA_CONFIRM_SECONDS:=$POLL_INTERVAL_SECONDS}"
@@ -301,14 +311,18 @@ debug() { [ "${PGBACKREST_WATCHER_DEBUG:-0}" = "1" ] && echo "pgbackrest-watcher
 #                                       archive.info / backup.info present, the
 #                                       other missing) in the current run of
 #                                       such sightings. Empty = none. Cleared
-#                                       by any successful stanza-create and
-#                                       after the fresh-path migration it
-#                                       gates. See half_created_stanza_step.
+#                                       when the stanza is found whole
+#                                       (stanza_create_step) and after the
+#                                       fresh-path migration it gates. See
+#                                       half_created_stanza_step.
 #   probe_fail_archived_at_start=<int> — ARCHIVED_COUNT snapshot taken when the
 #                                       consecutive-failure run began. If count
 #                                       has grown since then, postgres is still
 #                                       handing WAL to the spool while S3 is dark
 #                                       — strengthens the kick signal.
+#   last_stanza_create_at=<epoch>    — epoch of the watcher's last stanza-create
+#                                       run, whatever its outcome. Empty = never.
+#                                       See stanza_create_step.
 read_state() {
   local field="$1"
   [ ! -f "$STATE_FILE" ] && return 0
@@ -663,27 +677,70 @@ log_catalog_probe_error() {
   log "catalog probe diagnostic: pgbackrest info exited rc=${rc}; stderr: $(printf '%s' "$err" | tr '\n' ' ' | cut -c1-300)"
 }
 
-# Runs pgbackrest stanza-create every watcher iteration. stanza-create is
-# idempotent: when the stanza already exists and backup.info is valid, it does
-# a couple of S3 reads and exits 0 (silent). It only writes when backup.info is
-# missing or corrupt — exactly the rc=2 deadlock scenario. Running it every
-# iteration decouples stanza repair from the catalog-verify interval so a broken
-# stanza is fixed on the next poll (~60s) rather than waiting up to
-# CATALOG_VERIFY_INTERVAL_SECONDS (default 1h). Logs only on failure.
+# Runs pgbackrest stanza-create when the stanza needs it, and once every
+# STANZA_CREATE_INTERVAL_SECONDS regardless.
+#
+# stanza-create is idempotent: on a whole stanza it does a few S3 reads and
+# exits 0. It holds the stanza's archive and backup locks for as long as it
+# runs (`lock-type: all` in pgBackRest's command definition), and archive-push
+# starts its async worker only once it gets the archive lock
+# (src/command/archive/push/push.c). While stanza-create waits on a slow
+# bucket, the segment Postgres is handing off waits with it and fails with
+# [082] at archive-timeout.
+#
+# `pgbackrest info` takes no lock and reports what stanza-create would find
+# (probe_stanza_status), so it decides:
+#   - The stanza is not whole (stanza path or info files missing, or an info
+#     file pgBackRest cannot load): stanza-create runs now, and on every
+#     iteration until the stanza is whole. A broken stanza is fixed on the next
+#     poll (~60s) rather than waiting up to CATALOG_VERIFY_INTERVAL_SECONDS.
+#   - The stanza is whole: the one repair left is a missing .info/.info.copy
+#     twin, which info cannot see because it reads either file. stanza-create
+#     runs once per interval for that.
+#   - info gave no answer (bucket unreachable or slow): stanza-create would
+#     spend its timeout holding the locks, so it waits. Once the interval has
+#     passed since its last run it runs anyway, answer or not, so a bucket that
+#     fails only `info` cannot keep it from running for longer than that.
+# The epoch of the last run is last_stanza_create_at in the state file; an
+# empty or unreadable one counts as due. Logs only on failure.
 #
 # A failure is also checked for a half-created stanza (half_created_stanza_kind),
 # the one stanza-create failure that retrying never fixes.
 stanza_create_step() {
+  local now last due=0
+  now=$(date +%s)
+  last=$(read_state last_stanza_create_at)
+  case "$last" in
+    ''|0*|*[!0-9]*) due=1 ;;
+    *)
+      # Corrupt state or a backwards clock counts as due.
+      if [ "${#last}" -gt "${#now}" ] || [ "$last" -gt "$now" ] \
+         || [ $((now - last)) -ge "$STANZA_CREATE_INTERVAL_SECONDS" ]; then
+        due=1
+      fi
+      ;;
+  esac
+
+  if [ "$due" -eq 0 ]; then
+    local code
+    if ! code=$(probe_stanza_status); then
+      debug "stanza-create: waiting — pgbackrest info gave no answer (last run $((now - last))s ago; runs regardless once ${STANZA_CREATE_INTERVAL_SECONDS}s have passed)"
+      return 0
+    fi
+    case "$code" in
+      0|2)
+        end_half_stanza_sighting "pgbackrest info reports a whole stanza"
+        return 0
+        ;;
+    esac
+  fi
+
+  write_state_field last_stanza_create_at "$now"
   local out rc
   out=$(timeout 60 pgbackrest --stanza=main stanza-create 2>&1)
   rc=$?
   if [ "$rc" -eq 0 ]; then
-    # A whole stanza ends any half-created sighting in progress: the earlier
-    # sighting was a stanza-create caught between its two writes.
-    if [ -n "$(read_state half_stanza_first_seen_at)" ]; then
-      write_state_field half_stanza_first_seen_at ""
-      log "half-created stanza: stanza-create now succeeds at ${PGBACKREST_REPO1_PATH:-unset}; the earlier sighting was transient"
-    fi
+    end_half_stanza_sighting "stanza-create now succeeds"
     return 0
   fi
   log "stanza-create: exited rc=${rc}; $(stanza_create_error_excerpt "$out")"
@@ -692,6 +749,31 @@ stanza_create_step() {
   if kind=$(half_created_stanza_kind "$out"); then
     half_created_stanza_step "$kind"
   fi
+}
+
+# Echoes repo1's status code for the stanza from `pgbackrest info`. Codes
+# (src/command/info/info.c): 0 "ok" and 2 "no valid backups" mean backup.info
+# and archive.info both loaded; 1 "missing stanza path", 3 "missing stanza
+# data" and 99 (an error reading the repo or an info file) mean they did not.
+# Returns 1 when info gave no answer: killed by the timeout, a non-zero exit,
+# or output with no status code for the stanza.
+probe_stanza_status() {
+  local info_out code
+  info_out=$(timeout --kill-after=5 30 pgbackrest --stanza=main --repo=1 info --output=json 2>/dev/null) || return 1
+  code=$(printf '%s' "$info_out" \
+    | jq -r '[.[]? | select(.name == "main")][0].status.code // empty' 2>/dev/null) || return 1
+  case "$code" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  echo "$code"
+}
+
+# A whole stanza ends any half-created sighting in progress: the earlier
+# sighting was a stanza-create caught between its two writes.
+end_half_stanza_sighting() {
+  [ -z "$(read_state half_stanza_first_seen_at)" ] && return 0
+  write_state_field half_stanza_first_seen_at ""
+  log "half-created stanza: $1 at ${PGBACKREST_REPO1_PATH:-unset}; the earlier sighting was transient"
 }
 
 # The part of a failed pgBackRest command's output worth logging. With
@@ -759,8 +841,8 @@ half_created_stanza_kind() {
 # few milliseconds apart, so one sighting can be a stanza caught mid-creation.
 # The first sighting only records its epoch in the state file; the migration
 # fires on a later iteration that still sees the half-created stanza at least
-# HALF_STANZA_CONFIRM_SECONDS (default: one normal poll) after it. A successful
-# stanza-create in between clears the sighting (stanza_create_step). The epoch
+# HALF_STANZA_CONFIRM_SECONDS (default: one normal poll) after it. A stanza
+# found whole in between clears the sighting (stanza_create_step). The epoch
 # is in the state file, so a watcher restart does not reset the clock.
 half_created_stanza_step() {
   local kind="$1" now first_seen
@@ -1719,17 +1801,15 @@ decide_action() {
   #                            pgBackRest rejects). Don't clear last_full (that
   #                            would burn a full on every transient hiccup, and
   #                            transient info errors are common). Instead log
-  #                            the otherwise-swallowed stderr and run an
-  #                            idempotent stanza-create — cheap, and it repairs
-  #                            a missing/half-written backup.info so the *next*
-  #                            verify returns rc=1 and the clear path takes
-  #                            over. A truly-unreachable S3 makes stanza-create
-  #                            a no-op; nothing is burned.
+  #                            the otherwise-swallowed stderr. Repairing a
+  #                            missing/half-written backup.info is
+  #                            stanza_create_step's job, earlier in the same
+  #                            iteration; once it has, the *next* verify
+  #                            returns rc=1 and the clear path takes over.
   #
   # last_catalog_verify_at is stamped on ALL outcomes (including rc=2), so the
-  # probe — and the stanza-create — run at most once per interval rather than
-  # every poll. That bound is also what stops the rc=2 case from spewing a log
-  # line every 60s.
+  # probe runs at most once per interval rather than every poll. That bound is
+  # also what stops the rc=2 case from spewing a log line every 60s.
   local last_catalog_verify
   last_catalog_verify=$(read_state last_catalog_verify_at)
   if [ "$CATALOG_VERIFY_INTERVAL_SECONDS" -gt 0 ] \
@@ -1746,7 +1826,7 @@ decide_action() {
       if [ "$full_attempt_ok" -eq 1 ]; then DECIDED_ACTION="full"; return 0; fi
       DECIDED_ACTION=""; return 0
     else
-      log "catalog check inconclusive (pgbackrest info errored); logging probe error (stanza-create ran this iteration)"
+      log "catalog check inconclusive (pgbackrest info errored); logging probe error"
       log_catalog_probe_error
     fi
   fi
@@ -1849,10 +1929,11 @@ watcher_iteration() {
   # never sees an arithmetic crash from a missing global.
   refresh_wal_segment_size || true
 
-  # Idempotent stanza health — every iteration. A no-op (2 S3 reads) when the
-  # stanza is healthy; repairs a missing or corrupt backup.info on the spot.
-  # Running every iteration means a broken stanza is fixed on the next poll
-  # rather than waiting up to CATALOG_VERIFY_INTERVAL_SECONDS.
+  # Stanza health — every iteration. `pgbackrest info` (no lock) says whether
+  # the stanza is whole; stanza-create runs on the spot when it is not, so a
+  # broken stanza is fixed on the next poll rather than waiting up to
+  # CATALOG_VERIFY_INTERVAL_SECONDS, and once per
+  # STANZA_CREATE_INTERVAL_SECONDS otherwise.
   stanza_create_step
 
   # Gap-recovery state machine — detects WAL/catalog divergence and drives
