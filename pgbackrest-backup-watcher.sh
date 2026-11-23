@@ -13,10 +13,14 @@
 #      diverging from the S3 catalog, regardless of cause. Entry conditions
 #      (any of):
 #        - pgbackrest-archive-push-wrapper.sh dropped a segment and touched
-#          .pgbackrest_gap_pending (bucket gone, hard archive-push failure)
+#          .pgbackrest_gap_pending (bucket gone, hard archive-push failure),
+#          or saw pgBackRest drop its queue (archive-push-queue-max)
 #        - LSN-lag probe found pg_stat_archiver.last_archived_wal more than
 #          WAL_LAG_GAP_THRESHOLD_SEGMENTS ahead of the catalog max (async
 #          worker silently wedged — queue-max-trip or hung connection)
+#      A failing archive_command alone (pg_stat_archiver.failed_count
+#      growing) loses no WAL — Postgres keeps the segment and retries it —
+#      and is followed by archive_failure_step until Postgres archives again.
 #      Recovery flow once in the state:
 #        - Wait GAP_RECOVERY_BACKOFF_SECONDS (default 10 min) for natural
 #          async recovery. Most short Tigris/S3 hiccups self-heal here.
@@ -28,7 +32,10 @@
 #          successfully) → take a diff backup to re-anchor latestRestorableAt,
 #          then clear the gap marker.
 #      Diff (not full) is enough because the customer-visible state is
-#      "latestRestorableAt is fresh", which a diff produces in seconds.
+#      "latestRestorableAt is fresh". A diff reads everything changed since
+#      the last full, so on a large database it runs for minutes and competes
+#      with live queries for volume I/O — which is why it is kept for WAL
+#      that is actually missing.
 #      Historical missing segments stay missing in the old chain; retention
 #      eventually rolls them off.
 #   3. Periodic — full every WAL_BACKUP_FULL_INTERVAL_HOURS, diff every
@@ -106,6 +113,15 @@ DIFF_INTERVAL_HOURS="${WAL_BACKUP_DIFF_INTERVAL_HOURS:-24}"
 # path. 0 disables periodic verification (NEEDS_INITIAL_BACKUP still fires on
 # fresh state). Default: 3600 (1 hour).
 CATALOG_VERIFY_INTERVAL_SECONDS="${WAL_BACKUP_CATALOG_VERIFY_INTERVAL_SECONDS:-3600}"
+
+# Longest the watcher goes without running `pgbackrest stanza-create` (seconds)
+# — see stanza_create_step. stanza-create holds the stanza's archive lock while
+# it runs, and archive-push cannot start its async worker without that lock, so
+# it runs every iteration only while `pgbackrest info` reports a stanza that is
+# not whole. Otherwise (the stanza reads whole, or the bucket gave no answer)
+# it runs once this interval has passed since the last run. 0 runs it every
+# iteration. Default: 3600 (1 hour).
+STANZA_CREATE_INTERVAL_SECONDS="${WAL_BACKUP_STANZA_CREATE_INTERVAL_SECONDS:-3600}"
 
 # Minimum spacing between retries of a FAILING full backup (seconds).
 # NEEDS_INITIAL_BACKUP and the catalog-verify rc=1 self-heal both leave
@@ -194,6 +210,7 @@ sanitize_uint WAL_BACKUP_GAP_RECOVERY_BACKOFF_SECONDS GAP_RECOVERY_BACKOFF_SECON
 sanitize_uint WAL_BACKUP_FULL_INTERVAL_HOURS FULL_INTERVAL_HOURS 168
 sanitize_uint WAL_BACKUP_DIFF_INTERVAL_HOURS DIFF_INTERVAL_HOURS 24
 sanitize_uint WAL_BACKUP_CATALOG_VERIFY_INTERVAL_SECONDS CATALOG_VERIFY_INTERVAL_SECONDS 3600
+sanitize_uint WAL_BACKUP_STANZA_CREATE_INTERVAL_SECONDS STANZA_CREATE_INTERVAL_SECONDS 3600
 sanitize_uint WAL_BACKUP_FULL_RETRY_BACKOFF_SECONDS FULL_RETRY_BACKOFF_SECONDS 600
 sanitize_uint WAL_LAG_GAP_THRESHOLD_SEGMENTS WAL_LAG_GAP_THRESHOLD_SEGMENTS 32
 : "${HALF_STANZA_CONFIRM_SECONDS:=$POLL_INTERVAL_SECONDS}"
@@ -240,11 +257,15 @@ debug() { [ "${PGBACKREST_WATCHER_DEBUG:-0}" = "1" ] && echo "pgbackrest-watcher
 #                                      FULL_RETRY_BACKOFF_SECONDS; a full after a
 #                                      deliberate last_full_at clear is never
 #                                      delayed (no fresh failure marker).
-#   last_lag_detected_at=<epoch>     — when current gap-recovery cycle started
+#   last_lag_detected_at=<epoch>     — when current gap-recovery cycle started,
+#                                       or when archive_failure_step first
+#                                       saw the archive_command failure it is
+#                                       following (0 = neither)
 #   catalog_max_at_detection=<wal>   — catalog max segment at detection (recovery
 #                                       proof is "current catalog_max > this")
 #   last_force_recovery_at=<epoch>   — last time we pkill'd the async daemon
-#   force_attempts=<int>             — pkill cycles this gap-recovery cycle
+#   force_attempts=<int>             — pkill cycles this gap-recovery cycle or
+#                                       this archive_command failure
 #   archive_migration_orig_path=<path> — pre-migration repo1-path, set on the
 #                                       first WAL_REGRESSION self-heal and
 #                                       never cleared. Successive migrations
@@ -290,14 +311,18 @@ debug() { [ "${PGBACKREST_WATCHER_DEBUG:-0}" = "1" ] && echo "pgbackrest-watcher
 #                                       archive.info / backup.info present, the
 #                                       other missing) in the current run of
 #                                       such sightings. Empty = none. Cleared
-#                                       by any successful stanza-create and
-#                                       after the fresh-path migration it
-#                                       gates. See half_created_stanza_step.
+#                                       when the stanza is found whole
+#                                       (stanza_create_step) and after the
+#                                       fresh-path migration it gates. See
+#                                       half_created_stanza_step.
 #   probe_fail_archived_at_start=<int> — ARCHIVED_COUNT snapshot taken when the
 #                                       consecutive-failure run began. If count
 #                                       has grown since then, postgres is still
 #                                       handing WAL to the spool while S3 is dark
 #                                       — strengthens the kick signal.
+#   last_stanza_create_at=<epoch>    — epoch of the watcher's last stanza-create
+#                                       run, whatever its outcome. Empty = never.
+#                                       See stanza_create_step.
 read_state() {
   local field="$1"
   [ ! -f "$STATE_FILE" ] && return 0
@@ -652,17 +677,65 @@ log_catalog_probe_error() {
   log "catalog probe diagnostic: pgbackrest info exited rc=${rc}; stderr: $(printf '%s' "$err" | tr '\n' ' ' | cut -c1-300)"
 }
 
-# Runs pgbackrest stanza-create every watcher iteration. stanza-create is
-# idempotent: when the stanza already exists and backup.info is valid, it does
-# a couple of S3 reads and exits 0 (silent). It only writes when backup.info is
-# missing or corrupt — exactly the rc=2 deadlock scenario. Running it every
-# iteration decouples stanza repair from the catalog-verify interval so a broken
-# stanza is fixed on the next poll (~60s) rather than waiting up to
-# CATALOG_VERIFY_INTERVAL_SECONDS (default 1h). Logs only on failure.
+# Runs pgbackrest stanza-create when the stanza needs it, and once every
+# STANZA_CREATE_INTERVAL_SECONDS regardless.
+#
+# stanza-create is idempotent: on a whole stanza it does a few S3 reads and
+# exits 0. It holds the stanza's archive and backup locks for as long as it
+# runs (`lock-type: all` in pgBackRest's command definition), and archive-push
+# starts its async worker only once it gets the archive lock
+# (src/command/archive/push/push.c). While stanza-create waits on a slow
+# bucket, the segment Postgres is handing off waits with it and fails with
+# [082] at archive-timeout.
+#
+# `pgbackrest info` takes no lock and reports what stanza-create would find
+# (probe_stanza_status), so it decides:
+#   - The stanza is not whole (stanza path or info files missing, or an info
+#     file pgBackRest cannot load): stanza-create runs now, and on every
+#     iteration until the stanza is whole. A broken stanza is fixed on the next
+#     poll (~60s) rather than waiting up to CATALOG_VERIFY_INTERVAL_SECONDS.
+#   - The stanza is whole: the one repair left is a missing .info/.info.copy
+#     twin, which info cannot see because it reads either file. stanza-create
+#     runs once per interval for that.
+#   - info gave no answer (bucket unreachable or slow): stanza-create would
+#     spend its timeout holding the locks, so it waits. Once the interval has
+#     passed since its last run it runs anyway, answer or not, so a bucket that
+#     fails only `info` cannot keep it from running for longer than that.
+# The epoch of the last run is last_stanza_create_at in the state file; an
+# empty or unreadable one counts as due. Logs only on failure.
 #
 # A failure is also checked for a half-created stanza (half_created_stanza_kind),
 # the one stanza-create failure that retrying never fixes.
 stanza_create_step() {
+  local now last due=0
+  now=$(date +%s)
+  last=$(read_state last_stanza_create_at)
+  case "$last" in
+    ''|0*|*[!0-9]*) due=1 ;;
+    *)
+      # Corrupt state or a backwards clock counts as due.
+      if [ "${#last}" -gt "${#now}" ] || [ "$last" -gt "$now" ] \
+         || [ $((now - last)) -ge "$STANZA_CREATE_INTERVAL_SECONDS" ]; then
+        due=1
+      fi
+      ;;
+  esac
+
+  if [ "$due" -eq 0 ]; then
+    local code
+    if ! code=$(probe_stanza_status); then
+      debug "stanza-create: waiting — pgbackrest info gave no answer (last run $((now - last))s ago; runs regardless once ${STANZA_CREATE_INTERVAL_SECONDS}s have passed)"
+      return 0
+    fi
+    case "$code" in
+      0|2)
+        end_half_stanza_sighting "pgbackrest info reports a whole stanza"
+        return 0
+        ;;
+    esac
+  fi
+
+  write_state_field last_stanza_create_at "$now"
   local out="" rc=124 attempt=1 remaining retry_delay
   local deadline=$((SECONDS + 60))
   while :; do
@@ -670,8 +743,8 @@ stanza_create_step() {
     [ "$remaining" -le 0 ] && break
     out=$(timeout "$remaining" pgbackrest --stanza=main stanza-create 2>&1)
     rc=$?
-    # A live archive-push owns its lock. Leave ownership to pgBackRest and
-    # retry after a short jitter, within the original 60-second budget.
+    # Retry only transient archive-lock contention. Preserve the newer
+    # upstream scheduling gate and do not extend its 60-second run budget.
     if [ "$rc" -ne 50 ] || [ "$attempt" -ge 3 ]; then
       break
     fi
@@ -682,12 +755,7 @@ stanza_create_step() {
     attempt=$((attempt + 1))
   done
   if [ "$rc" -eq 0 ]; then
-    # A whole stanza ends any half-created sighting in progress: the earlier
-    # sighting was a stanza-create caught between its two writes.
-    if [ -n "$(read_state half_stanza_first_seen_at)" ]; then
-      write_state_field half_stanza_first_seen_at ""
-      log "half-created stanza: stanza-create now succeeds at ${PGBACKREST_REPO1_PATH:-unset}; the earlier sighting was transient"
-    fi
+    end_half_stanza_sighting "stanza-create now succeeds"
     return 0
   fi
   log "stanza-create: exited rc=${rc}; $(stanza_create_error_excerpt "$out")"
@@ -696,6 +764,31 @@ stanza_create_step() {
   if kind=$(half_created_stanza_kind "$out"); then
     half_created_stanza_step "$kind"
   fi
+}
+
+# Echoes repo1's status code for the stanza from `pgbackrest info`. Codes
+# (src/command/info/info.c): 0 "ok" and 2 "no valid backups" mean backup.info
+# and archive.info both loaded; 1 "missing stanza path", 3 "missing stanza
+# data" and 99 (an error reading the repo or an info file) mean they did not.
+# Returns 1 when info gave no answer: killed by the timeout, a non-zero exit,
+# or output with no status code for the stanza.
+probe_stanza_status() {
+  local info_out code
+  info_out=$(timeout --kill-after=5 30 pgbackrest --stanza=main --repo=1 info --output=json 2>/dev/null) || return 1
+  code=$(printf '%s' "$info_out" \
+    | jq -r '[.[]? | select(.name == "main")][0].status.code // empty' 2>/dev/null) || return 1
+  case "$code" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  echo "$code"
+}
+
+# A whole stanza ends any half-created sighting in progress: the earlier
+# sighting was a stanza-create caught between its two writes.
+end_half_stanza_sighting() {
+  [ -z "$(read_state half_stanza_first_seen_at)" ] && return 0
+  write_state_field half_stanza_first_seen_at ""
+  log "half-created stanza: $1 at ${PGBACKREST_REPO1_PATH:-unset}; the earlier sighting was transient"
 }
 
 # The part of a failed pgBackRest command's output worth logging. With
@@ -763,8 +856,8 @@ half_created_stanza_kind() {
 # few milliseconds apart, so one sighting can be a stanza caught mid-creation.
 # The first sighting only records its epoch in the state file; the migration
 # fires on a later iteration that still sees the half-created stanza at least
-# HALF_STANZA_CONFIRM_SECONDS (default: one normal poll) after it. A successful
-# stanza-create in between clears the sighting (stanza_create_step). The epoch
+# HALF_STANZA_CONFIRM_SECONDS (default: one normal poll) after it. A stanza
+# found whole in between clears the sighting (stanza_create_step). The epoch
 # is in the state file, so a watcher restart does not reset the clock.
 half_created_stanza_step() {
   local kind="$1" now first_seen
@@ -1515,47 +1608,47 @@ gap_recovery_step() {
     return 0
   fi
 
-  # Not in recovery. Two independent entry conditions, both meaning
-  # "WAL coverage is diverging from the catalog":
-  #   - LSN lag ≥ threshold (async wedge / queue-max-trip — postgres
-  #     keeps handing off, async doesn't drain to S3)
-  #   - failed_count grew since the last full's anchor (foreground hard
-  #     failure — archive_command returning non-zero so postgres never
-  #     hands off; lag stays at 0 but archiving is broken just the same)
+  # Not in recovery. Two signals, with different meanings:
+  #   - LSN lag ≥ threshold (async wedge / queue-max-trip — postgres keeps
+  #     handing off, async doesn't drain to S3): WAL may already be missing
+  #     from the repo, so enter recovery, which ends in a diff.
+  #   - failed_count grew since the anchor (archive_command returned non-zero):
+  #     Postgres still holds the segment and retries it, so nothing is missing.
+  #     archive_failure_step follows it without a backup.
   local last_full_failed; last_full_failed=$(read_state last_full_failed_count); : "${last_full_failed:=0}"
   local failed_grew=0
   [ "${FAILED_COUNT:-0}" -gt "$last_full_failed" ] && failed_grew=1
 
-  if [ "$lag" -ge "$WAL_LAG_GAP_THRESHOLD_SEGMENTS" ] || [ "$failed_grew" -eq 1 ]; then
-    # Before entering the pkill-cycle state machine, check whether this is a
-    # WAL_REGRESSION: pg_stat_archiver says the current failure is for a WAL at
-    # or before the catalog max on the same timeline AND the async status file
-    # for that WAL reports code 45 (ArchiveDuplicateError). pkill-async cannot
-    # fix a duplicate-segment conflict — it is structural, not a stuck process.
-    # Self-heal immediately by migrating to a new archive path suffix. `-le`
-    # (not `-lt`) covers the boundary case where rollback lands exactly at the
-    # last archived segment.
-    #
-    # Guard: LAST_FAILED_EPOCH > LAST_ARCHIVED_EPOCH confirms the failure is
-    # currently active, not a stale pg_stat_archiver.last_failed_wal from an
-    # old transient error (those fields are sticky until postgres restart).
-    if [ "$failed_grew" -eq 1 ] && [ -n "$LAST_FAILED_WAL" ] \
-       && [ "${LAST_FAILED_EPOCH:-0}" -gt "${LAST_ARCHIVED_EPOCH:-0}" ] \
-       && wal_has_async_archive_duplicate_error "$LAST_FAILED_WAL"; then
-      local wr_catalog_max
-      wr_catalog_max=$(catalog_max_for_wal "$LAST_FAILED_WAL" "$catalog_max") || wr_catalog_max=""
-      if [ -n "$wr_catalog_max" ]; then
-        local wr_f_n wr_c_n
-        wr_f_n=$(segment_to_number "$LAST_FAILED_WAL")
-        wr_c_n=$(segment_to_number "$wr_catalog_max")
-        if [ -n "$wr_f_n" ] && [ -n "$wr_c_n" ] && [ "$wr_f_n" -le "$wr_c_n" ]; then
-          log "wal-regression: detected (failed_wal=${LAST_FAILED_WAL}, catalog_max=${wr_catalog_max}, failed_count=${FAILED_COUNT:-0}) — self-healing immediately"
-          migrate_to_new_archive_path
-          return 0
-        fi
+  # Before either path, check whether this is a WAL_REGRESSION:
+  # pg_stat_archiver says the current failure is for a WAL at or before the
+  # catalog max on the same timeline AND the async status file for that WAL
+  # reports code 45 (ArchiveDuplicateError). pkill-async cannot fix a
+  # duplicate-segment conflict — it is structural, not a stuck process.
+  # Self-heal immediately by migrating to a new archive path suffix. `-le`
+  # (not `-lt`) covers the boundary case where rollback lands exactly at the
+  # last archived segment.
+  #
+  # Guard: LAST_FAILED_EPOCH > LAST_ARCHIVED_EPOCH confirms the failure is
+  # currently active, not a stale pg_stat_archiver.last_failed_wal from an
+  # old transient error (those fields are sticky until postgres restart).
+  if [ "$failed_grew" -eq 1 ] && [ -n "$LAST_FAILED_WAL" ] \
+     && [ "${LAST_FAILED_EPOCH:-0}" -gt "${LAST_ARCHIVED_EPOCH:-0}" ] \
+     && wal_has_async_archive_duplicate_error "$LAST_FAILED_WAL"; then
+    local wr_catalog_max
+    wr_catalog_max=$(catalog_max_for_wal "$LAST_FAILED_WAL" "$catalog_max") || wr_catalog_max=""
+    if [ -n "$wr_catalog_max" ]; then
+      local wr_f_n wr_c_n
+      wr_f_n=$(segment_to_number "$LAST_FAILED_WAL")
+      wr_c_n=$(segment_to_number "$wr_catalog_max")
+      if [ -n "$wr_f_n" ] && [ -n "$wr_c_n" ] && [ "$wr_f_n" -le "$wr_c_n" ]; then
+        log "wal-regression: detected (failed_wal=${LAST_FAILED_WAL}, catalog_max=${wr_catalog_max}, failed_count=${FAILED_COUNT:-0}) — self-healing immediately"
+        migrate_to_new_archive_path
+        return 0
       fi
     fi
+  fi
 
+  if [ "$lag" -ge "$WAL_LAG_GAP_THRESHOLD_SEGMENTS" ]; then
     touch "$GAP_MARKER"
     write_state_field last_lag_detected_at "$now"
     write_state_field catalog_max_at_detection "$catalog_max"
@@ -1563,8 +1656,92 @@ gap_recovery_step() {
     write_state_field force_attempts 0
     GAP_STATE_DIAG="detected"
     log "gap-recovery: entering recovery (lag=${lag}, failed_count=${FAILED_COUNT:-0} vs anchor ${last_full_failed}, handoff=${LAST_ARCHIVED_WAL}, catalog_max=${catalog_max}) — first pkill in ${GAP_RECOVERY_BACKOFF_SECONDS}s if catalog hasn't advanced"
+  elif [ "$failed_grew" -eq 1 ]; then
+    archive_failure_step "$now" "$catalog_max" "$last_full_failed"
   else
+    # A Postgres restart zeroes pg_stat_archiver, which ends a failure
+    # archive_failure_step was following without it ever reading as over.
+    # Reset its clock so the next failure starts a fresh backoff window.
+    local following_since; following_since=$(read_state last_lag_detected_at)
+    if [ -n "$following_since" ] && [ "$following_since" != "0" ]; then
+      write_state_field last_lag_detected_at 0
+      write_state_field last_force_recovery_at 0
+      write_state_field force_attempts 0
+    fi
     GAP_STATE_DIAG="clear"
+  fi
+}
+
+# Succeeds when the archive_command failure pg_stat_archiver last recorded is
+# over: Postgres has archived again since, and — for a WAL segment — the
+# catalog max on that segment's timeline has reached it. Postgres retries a
+# failed file until archive_command accepts it, so an archive after the last
+# failure means the failed file went through. Timeline history and
+# backup-label files have no place in the catalog's segment range; for those
+# Postgres's own order is the whole answer.
+archive_failure_resolved() {
+  local catalog_max="${1:-}"
+  [ "${LAST_ARCHIVED_EPOCH:-0}" -gt "${LAST_FAILED_EPOCH:-0}" ] || return 1
+  local f_n
+  f_n=$(segment_to_number "$LAST_FAILED_WAL")
+  [ -z "$f_n" ] && return 0
+  local failed_catalog_max c_n
+  failed_catalog_max=$(catalog_max_for_wal "$LAST_FAILED_WAL" "$catalog_max") || return 1
+  c_n=$(segment_to_number "$failed_catalog_max")
+  [ -n "$c_n" ] && [ "$c_n" -ge "$f_n" ]
+}
+
+# Follows an archive_command failure that has lost no WAL: failed_count is past
+# its anchor, the gap marker is absent and the catalog keeps up with the
+# handoff. Postgres holds the segment in pg_wal and retries it, so the WAL
+# chain in the repo stays whole and there is nothing for a backup to seal. A
+# single archive-push that outlives pgBackRest's archive-timeout and lands on
+# the retry is the common case; a diff for it reads everything changed since
+# the last full off the data volume for no gain in restorability.
+#
+# WAL goes missing only when a segment is dropped, and every drop goes through
+# the archive-push wrapper, which touches the gap marker for its own drops and
+# for pgBackRest's queue-max drop alike. The marker — or lag reaching the
+# threshold — moves this failure into gap recovery on the next iteration,
+# timers and kick count included.
+#
+# While the failure lasts, the async daemon gets the same kick every
+# GAP_RECOVERY_BACKOFF_SECONDS that gap recovery gives it. Once
+# archive_failure_resolved holds, the failures fold into the anchor.
+archive_failure_step() {
+  local now="$1" catalog_max="$2" anchor="$3"
+  local since last_force force_attempts
+  since=$(read_state last_lag_detected_at); : "${since:=0}"
+  last_force=$(read_state last_force_recovery_at); : "${last_force:=0}"
+  force_attempts=$(read_state force_attempts); : "${force_attempts:=0}"
+
+  if archive_failure_resolved "$catalog_max"; then
+    write_state_field last_full_failed_count "${FAILED_COUNT:-0}"
+    write_state_field last_lag_detected_at 0
+    write_state_field last_force_recovery_at 0
+    write_state_field force_attempts 0
+    GAP_STATE_DIAG="clear"
+    log "archive-failure: over — Postgres archived ${LAST_FAILED_WAL:-the failed file} on retry (failed_count=${FAILED_COUNT:-0} vs anchor ${anchor}, handoff=${LAST_ARCHIVED_WAL}, catalog_max=${catalog_max}, ${force_attempts} pkill cycles); no WAL was lost, no backup needed"
+    return 0
+  fi
+
+  GAP_STATE_DIAG="archive-failing"
+  if [ "$since" -eq 0 ]; then
+    write_state_field last_lag_detected_at "$now"
+    write_state_field last_force_recovery_at 0
+    write_state_field force_attempts 0
+    log "archive-failure: archive_command failed for ${LAST_FAILED_WAL:-a WAL file} (failed_count=${FAILED_COUNT:-0} vs anchor ${anchor}, handoff=${LAST_ARCHIVED_WAL}, catalog_max=${catalog_max}); Postgres keeps the file and retries — first pkill in ${GAP_RECOVERY_BACKOFF_SECONDS}s if it has not archived by then"
+    return 0
+  fi
+
+  local last_action_at="$since"
+  [ "$last_force" -gt "$last_action_at" ] && last_action_at="$last_force"
+  if [ $((now - last_action_at)) -ge "$GAP_RECOVERY_BACKOFF_SECONDS" ]; then
+    force_attempts=$((force_attempts + 1))
+    log "archive-failure: ${LAST_FAILED_WAL:-a WAL file} still failing after $(( (now - since) / 60 ))min (handoff=${LAST_ARCHIVED_WAL}, catalog_max=${catalog_max}) — pkill async (attempt #${force_attempts})"
+    kick_async_daemon
+    write_state_field last_force_recovery_at "$now"
+    write_state_field force_attempts "$force_attempts"
   fi
 }
 
@@ -1639,17 +1816,15 @@ decide_action() {
   #                            pgBackRest rejects). Don't clear last_full (that
   #                            would burn a full on every transient hiccup, and
   #                            transient info errors are common). Instead log
-  #                            the otherwise-swallowed stderr and run an
-  #                            idempotent stanza-create — cheap, and it repairs
-  #                            a missing/half-written backup.info so the *next*
-  #                            verify returns rc=1 and the clear path takes
-  #                            over. A truly-unreachable S3 makes stanza-create
-  #                            a no-op; nothing is burned.
+  #                            the otherwise-swallowed stderr. Repairing a
+  #                            missing/half-written backup.info is
+  #                            stanza_create_step's job, earlier in the same
+  #                            iteration; once it has, the *next* verify
+  #                            returns rc=1 and the clear path takes over.
   #
   # last_catalog_verify_at is stamped on ALL outcomes (including rc=2), so the
-  # probe — and the stanza-create — run at most once per interval rather than
-  # every poll. That bound is also what stops the rc=2 case from spewing a log
-  # line every 60s.
+  # probe runs at most once per interval rather than every poll. That bound is
+  # also what stops the rc=2 case from spewing a log line every 60s.
   local last_catalog_verify
   last_catalog_verify=$(read_state last_catalog_verify_at)
   if [ "$CATALOG_VERIFY_INTERVAL_SECONDS" -gt 0 ] \
@@ -1666,7 +1841,7 @@ decide_action() {
       if [ "$full_attempt_ok" -eq 1 ]; then DECIDED_ACTION="full"; return 0; fi
       DECIDED_ACTION=""; return 0
     else
-      log "catalog check inconclusive (pgbackrest info errored); logging probe error (stanza-create ran this iteration)"
+      log "catalog check inconclusive (pgbackrest info errored); logging probe error"
       log_catalog_probe_error
     fi
   fi
@@ -1769,10 +1944,11 @@ watcher_iteration() {
   # never sees an arithmetic crash from a missing global.
   refresh_wal_segment_size || true
 
-  # Idempotent stanza health — every iteration. A no-op (2 S3 reads) when the
-  # stanza is healthy; repairs a missing or corrupt backup.info on the spot.
-  # Running every iteration means a broken stanza is fixed on the next poll
-  # rather than waiting up to CATALOG_VERIFY_INTERVAL_SECONDS.
+  # Stanza health — every iteration. `pgbackrest info` (no lock) says whether
+  # the stanza is whole; stanza-create runs on the spot when it is not, so a
+  # broken stanza is fixed on the next poll rather than waiting up to
+  # CATALOG_VERIFY_INTERVAL_SECONDS, and once per
+  # STANZA_CREATE_INTERVAL_SECONDS otherwise.
   stanza_create_step
 
   # Gap-recovery state machine — detects WAL/catalog divergence and drives

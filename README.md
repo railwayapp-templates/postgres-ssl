@@ -330,12 +330,17 @@ conditions holds:
    full has been recorded on this volume. Triggers the first
    `--type=full`, anchoring the PITR window from the first archived LSN
    forward.
-2. **Gap recovery** — either the archive-push wrapper dropped a segment
-   (touches `$PGDATA/.pgbackrest_gap_pending`) or
-   `pg_stat_archiver.failed_count` grew since the last full. Once
-   archive failures have been quiescent for 5 minutes, runs a fresh full
-   so the PITR window resumes from the new base. The dropped segment
-   itself remains unrestorable; everything from the new base forward is.
+2. **Gap recovery** — WAL is missing from the bucket: either a segment
+   was dropped (by the archive-push wrapper or by pgBackRest's
+   `archive-push-queue-max`; both touch
+   `$PGDATA/.pgbackrest_gap_pending`) or the bucket has fallen
+   `WAL_LAG_GAP_THRESHOLD_SEGMENTS` behind what Postgres handed off. Once
+   the bucket receives WAL again, runs a differential so the PITR window
+   resumes from a new restore point. The dropped segment itself remains
+   unrestorable; everything from the new backup forward is. An
+   `archive_command` failure that Postgres retries successfully
+   (`pg_stat_archiver.failed_count` grows, nothing is dropped) loses no
+   WAL and triggers no backup.
 3. **Periodic** — `WAL_BACKUP_FULL_INTERVAL_HOURS` (default 168 h /
    weekly) for fulls, `WAL_BACKUP_DIFF_INTERVAL_HOURS` (default 24 h)
    for differentials. Set either to `0` to disable that schedule.
@@ -393,16 +398,17 @@ over; if its local state is stale, an extra full may run, which is
 harmless.
 
 **Queue-max-trip detection**: pgBackRest's `archive-push-queue-max` trip
-drops segments without going through the archive-push wrapper *and*
-without incrementing `failed_count`, so neither of those two gap signals
-fires on its own. The backup watcher closes this independently: every
+drops segments and reports them to Postgres as archived. The archive-push
+wrapper sees the drop in pgBackRest's output and touches the gap marker.
+The backup watcher also checks independently, which covers an async
+worker that is wedged without dropping anything: every
 poll (`WAL_BACKUP_POLL_INTERVAL_SECONDS`, default 60s) it compares
 `pg_stat_archiver.last_archived_wal` against the repo's archived
 high-water mark (`pgbackrest info --output=json`); once the lag reaches
 `WAL_LAG_GAP_THRESHOLD_SEGMENTS` (default 32 ≈ 512 MiB) it enters the
-gap-recovery state machine the same way the other two signals do, so a
-fresh full fires once grace elapses instead of waiting for the next
-periodic full (#85, hardened by #86).
+gap-recovery state machine the same way a wrapper drop does, so a
+differential fires once the bucket receives WAL again instead of waiting
+for the next periodic backup (#85, hardened by #86).
 
 `pgbackrest backup` is invoked with `--type=full` or `--type=diff`
 depending on the trigger; the `process-max=backup` setting (default
