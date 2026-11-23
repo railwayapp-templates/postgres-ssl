@@ -2524,19 +2524,17 @@ count_archived_wal_segments() {
     | tail -1 | tr -d ' '
 }
 
-# G1. Failure-driven gap recovery via pg_stat_archiver.failed_count growth.
-# Exercises the failed_count entry condition of the gap-recovery state
-# machine — drives the watcher purely off failed_count rather than touching
-# the marker by hand. The state machine itself touches
-# .pgbackrest_gap_pending as a consequence of detection (that's the
-# "marker" used to remember we're in recovery across iterations), so this
-# test asserts the resulting gap-recovery diff lands and clears state,
-# not that the marker stays absent.
-t_watcher_gap_recovery_failed_count_path() {
-  local name=t-gap-fc-${PG_VERSION}
+# G1. An archive_command failure that loses no WAL takes no backup.
+# archive-push fails for a while (pg_stat_archiver.failed_count grows) with the
+# wrapper's drop threshold out of reach, so Postgres keeps every segment and
+# archives them all once pushes work again. The WAL chain in the bucket stays
+# whole: the watcher follows the failure, takes no diff, never writes
+# .pgbackrest_gap_pending, and folds the failures into its anchor.
+t_watcher_archive_failure_without_wal_loss_takes_no_backup() {
+  local name=t-arch-fail-${PG_VERSION}
   local vol=${name}-vol
-  local user=t-gap-fc-user
-  local pass=t-gap-fc-pass-12345
+  local user=t-arch-fail-user
+  local pass=t-arch-fail-pass-12345
   reset_bucket
   new_volume "$vol"
   docker rm -f "$name" >/dev/null 2>&1 || true
@@ -2550,8 +2548,8 @@ t_watcher_gap_recovery_failed_count_path() {
     mc admin policy attach local readwrite --user ${user} 2>/dev/null || true
   " >/dev/null
 
-  # Threshold absurdly high so the wrapper NEVER drops on its own → no
-  # .pgbackrest_gap_pending marker ever written → the only signal the
+  # Threshold absurdly high so the wrapper NEVER drops on its own: Postgres
+  # keeps every segment it could not archive, and the only signal the
   # watcher has is failed_count growing past last_full_failed_count.
   # archive_timeout=5 so failed_count grows in seconds, not minutes.
   docker run -d --name "$name" --label postgres-ssl-e2e=1 --network "$NET" \
@@ -2569,17 +2567,17 @@ t_watcher_gap_recovery_failed_count_path() {
     -e WAL_BACKUP_GAP_RECOVERY_BACKOFF_SECONDS=10 \
     -v "$vol:/var/lib/postgresql/data" \
     "$IMAGE" >/dev/null
-  wait_for_pg "$name" || { ko t_watcher_gap_recovery_failed_count_path "no startup"; fail_dump t_watcher_gap_recovery_failed_count_path "$name"; return; }
+  wait_for_pg "$name" || { ko t_watcher_archive_failure_without_wal_loss_takes_no_backup "no startup"; fail_dump t_watcher_archive_failure_without_wal_loss_takes_no_backup "$name"; return; }
 
   for _ in $(seq 1 15); do
     docker logs "$name" 2>&1 | grep -q "stanza-create completed" && break
     sleep 1
   done
   docker exec "$name" psql -U postgres -c "CREATE TABLE t(id int); SELECT pg_switch_wal();" >/dev/null
-  wait_for_watcher_backup "$name" full 60 || { ko t_watcher_gap_recovery_failed_count_path "no initial full"; fail_dump t_watcher_gap_recovery_failed_count_path "$name"; return; }
+  wait_for_watcher_backup "$name" full 60 || { ko t_watcher_archive_failure_without_wal_loss_takes_no_backup "no initial full"; fail_dump t_watcher_archive_failure_without_wal_loss_takes_no_backup "$name"; return; }
 
   local before_diff_count
-  before_diff_count=$(docker logs "$name" 2>&1 | grep -c "backup --type=diff completed" || true)
+  before_diff_count=$(docker logs "$name" 2>&1 | grep -c "running pgbackrest backup --type=diff" || true)
 
   # Switch the user to read-only → PutObject fails with AccessDenied →
   # archive_command returns non-zero (wrapper threshold not met) → Postgres
@@ -2599,17 +2597,13 @@ t_watcher_gap_recovery_failed_count_path() {
   local failed_count
   failed_count=$(docker exec "$name" psql -U postgres -At -c "SELECT failed_count FROM pg_stat_archiver" 2>/dev/null || echo 0)
   if [ "${failed_count:-0}" -lt 1 ]; then
-    ko t_watcher_gap_recovery_failed_count_path "expected failed_count to grow under disabled user; got $failed_count"
-    fail_dump t_watcher_gap_recovery_failed_count_path "$name"
+    ko t_watcher_archive_failure_without_wal_loss_takes_no_backup "expected failed_count to grow under disabled user; got $failed_count"
+    fail_dump t_watcher_archive_failure_without_wal_loss_takes_no_backup "$name"
     return
   fi
 
-  # Restore write access → archive-push succeeds again → catalog advances
-  # past detection point → state machine takes a diff to re-anchor the
-  # PITR window. (Marker may have been written by the failed_count entry
-  # condition — that's fine; it's the wrapper-threshold marker we're
-  # exercising in the OTHER test, this one exercises the failed_count
-  # entry condition into the same state machine.)
+  # Restore write access → Postgres's retries go through and the catalog
+  # reaches the segment that failed.
   mc "
     mc admin policy detach local readonly --user ${user} 2>/dev/null || true
     mc admin policy attach local readwrite --user ${user} 2>/dev/null || true
@@ -2618,29 +2612,57 @@ t_watcher_gap_recovery_failed_count_path() {
   local deadline=$(($(date +%s) + 60)) hit=0
   while [ "$(date +%s)" -lt "$deadline" ]; do
     docker exec "$name" psql -U postgres -c "SELECT pg_switch_wal();" >/dev/null 2>&1
-    local now_count
-    now_count=$(docker logs "$name" 2>&1 | grep -c "backup --type=diff completed" || true)
-    if [ "$now_count" -gt "$before_diff_count" ]; then hit=1; break; fi
+    if docker logs "$name" 2>&1 | grep -q "archive-failure: over"; then hit=1; break; fi
     sleep 3
   done
   if [ "$hit" != "1" ]; then
-    ko t_watcher_gap_recovery_failed_count_path "watcher did not take gap-recovery diff via failed_count path"
-    fail_dump t_watcher_gap_recovery_failed_count_path "$name"
+    ko t_watcher_archive_failure_without_wal_loss_takes_no_backup "watcher never reported the archive failure as over"
+    fail_dump t_watcher_archive_failure_without_wal_loss_takes_no_backup "$name"
     return
   fi
 
-  # last_full_failed_count must have advanced past 0 — otherwise next
-  # iteration would re-trigger immediately. clear_gap_recovery_state
-  # writes this field as part of post-diff cleanup.
+  # Give the watcher two more polls: a backup would have started by now.
+  sleep 12
+  local after_diff_count
+  after_diff_count=$(docker logs "$name" 2>&1 | grep -c "running pgbackrest backup --type=diff" || true)
+  if [ "$after_diff_count" -ne "$before_diff_count" ]; then
+    ko t_watcher_archive_failure_without_wal_loss_takes_no_backup "watcher ran a diff for an archive failure that lost no WAL (diffs before=${before_diff_count}, after=${after_diff_count})"
+    fail_dump t_watcher_archive_failure_without_wal_loss_takes_no_backup "$name"
+    return
+  fi
+  if docker logs "$name" 2>&1 | grep -q "gap-recovery: entering recovery"; then
+    ko t_watcher_archive_failure_without_wal_loss_takes_no_backup "watcher entered gap recovery although no WAL was dropped"
+    fail_dump t_watcher_archive_failure_without_wal_loss_takes_no_backup "$name"
+    return
+  fi
+  if docker exec "$name" test -f /var/lib/postgresql/data/.pgbackrest_gap_pending; then
+    ko t_watcher_archive_failure_without_wal_loss_takes_no_backup ".pgbackrest_gap_pending written although no WAL was dropped"
+    fail_dump t_watcher_archive_failure_without_wal_loss_takes_no_backup "$name"
+    return
+  fi
+
+  # The failures are folded into the anchor — otherwise every later poll
+  # would follow the same, finished failure again.
   local last_failed_in_state
-  last_failed_in_state=$(docker exec "$name" grep -E "^last_full_failed_count=" /var/lib/postgresql/data/.pgbackrest_backup_state 2>/dev/null | cut -d= -f2)
-  if [ -z "$last_failed_in_state" ] || [ "$last_failed_in_state" = "0" ]; then
-    ko t_watcher_gap_recovery_failed_count_path "last_full_failed_count not advanced (got '$last_failed_in_state'); next poll would re-trigger"
+  last_failed_in_state=$(docker exec "$name" grep -E "^last_full_failed_count=" /var/lib/postgresql/data/.pgbackrest_backup_state 2>/dev/null | tail -1 | cut -d= -f2)
+  if [ -z "$last_failed_in_state" ] || [ "$last_failed_in_state" -lt "$failed_count" ]; then
+    ko t_watcher_archive_failure_without_wal_loss_takes_no_backup "last_full_failed_count not advanced to the failures seen (got '$last_failed_in_state', failed_count was $failed_count)"
+    fail_dump t_watcher_archive_failure_without_wal_loss_takes_no_backup "$name"
     return
   fi
 
-  ok t_watcher_gap_recovery_failed_count_path
-  note "failed_count=${failed_count} → catalog advanced → gap-recovery diff; last_full_failed_count=${last_failed_in_state}"
+  # Every segment Postgres handed off is in the bucket: the catalog max has
+  # reached the last archived WAL.
+  local handoff
+  handoff=$(docker exec "$name" psql -U postgres -At -c "SELECT last_archived_wal FROM pg_stat_archiver" 2>/dev/null)
+  if ! mc "mc find local/${BUCKET}/pgbackrest --name '${handoff}-*' 2>/dev/null" | grep -q "$handoff"; then
+    ko t_watcher_archive_failure_without_wal_loss_takes_no_backup "last archived WAL ${handoff} is not in the bucket"
+    fail_dump t_watcher_archive_failure_without_wal_loss_takes_no_backup "$name"
+    return
+  fi
+
+  ok t_watcher_archive_failure_without_wal_loss_takes_no_backup
+  note "failed_count=${failed_count} → Postgres archived on retry → no backup, no gap marker; last_full_failed_count=${last_failed_in_state}"
   mc "mc admin user remove local ${user}" >/dev/null 2>&1 || true
   docker rm -f "$name" >/dev/null
   docker volume rm "$vol" >/dev/null
@@ -5476,7 +5498,7 @@ ALL_TESTS=(
   t_dual_repo_archives_to_own_bucket
   t_empty_volume_restore_from_s3
   t_retention_expires_old_fulls
-  t_watcher_gap_recovery_failed_count_path
+  t_watcher_archive_failure_without_wal_loss_takes_no_backup
   t_watcher_gap_recovery_lsn_lag_path
   t_watcher_wal_regression_async_spool_probe
   t_pitr_target_before_retention_window_refuses
