@@ -330,8 +330,9 @@ conditions holds:
    full has been recorded on this volume. Triggers the first
    `--type=full`, anchoring the PITR window from the first archived LSN
    forward.
-2. **Gap recovery** — WAL is missing from the bucket: either the
-   archive-push wrapper dropped a segment (touches
+2. **Gap recovery** — WAL is missing from the bucket: either a segment
+   was dropped (by the archive-push wrapper or by pgBackRest's
+   `archive-push-queue-max`; both touch
    `$PGDATA/.pgbackrest_gap_pending`) or the bucket has fallen
    `WAL_LAG_GAP_THRESHOLD_SEGMENTS` behind what Postgres handed off. Once
    the bucket receives WAL again, runs a differential so the PITR window
@@ -397,8 +398,10 @@ over; if its local state is stale, an extra full may run, which is
 harmless.
 
 **Queue-max-trip detection**: pgBackRest's `archive-push-queue-max` trip
-drops segments without going through the archive-push wrapper, so the
-gap marker is never touched. The backup watcher closes this independently: every
+drops segments and reports them to Postgres as archived. The archive-push
+wrapper sees the drop in pgBackRest's output and touches the gap marker.
+The backup watcher also checks independently, which covers an async
+worker that is wedged without dropping anything: every
 poll (`WAL_BACKUP_POLL_INTERVAL_SECONDS`, default 60s) it compares
 `pg_stat_archiver.last_archived_wal` against the repo's archived
 high-water mark (`pgbackrest info --output=json`); once the lag reaches

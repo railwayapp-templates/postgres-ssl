@@ -13,7 +13,8 @@
 #      diverging from the S3 catalog, regardless of cause. Entry conditions
 #      (any of):
 #        - pgbackrest-archive-push-wrapper.sh dropped a segment and touched
-#          .pgbackrest_gap_pending (bucket gone, hard archive-push failure)
+#          .pgbackrest_gap_pending (bucket gone, hard archive-push failure),
+#          or saw pgBackRest drop its queue (archive-push-queue-max)
 #        - LSN-lag probe found pg_stat_archiver.last_archived_wal more than
 #          WAL_LAG_GAP_THRESHOLD_SEGMENTS ahead of the catalog max (async
 #          worker silently wedged — queue-max-trip or hung connection)
@@ -1601,10 +1602,11 @@ archive_failure_resolved() {
 # the retry is the common case; a diff for it reads everything changed since
 # the last full off the data volume for no gain in restorability.
 #
-# WAL goes missing only when a segment is dropped, and both drop paths have
-# their own signal: the archive-push wrapper touches the gap marker, and
-# pgBackRest's queue-max drop shows up as lag. Either one moves this failure
-# into gap recovery on the next iteration, timers and kick count included.
+# WAL goes missing only when a segment is dropped, and every drop goes through
+# the archive-push wrapper, which touches the gap marker for its own drops and
+# for pgBackRest's queue-max drop alike. The marker — or lag reaching the
+# threshold — moves this failure into gap recovery on the next iteration,
+# timers and kick count included.
 #
 # While the failure lasts, the async daemon gets the same kick every
 # GAP_RECOVERY_BACKOFF_SECONDS that gap recovery gives it. Once

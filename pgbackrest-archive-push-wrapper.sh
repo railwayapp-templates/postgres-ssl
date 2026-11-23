@@ -139,6 +139,16 @@ pgb_out=$(pgbackrest --stanza=main archive-push "$WAL_FILE" 2>&1)
 PGB_RC=$?
 [ -n "$pgb_out" ] && printf '%s\n' "$pgb_out" >&2
 if [ "$PGB_RC" -eq 0 ]; then
+  # pgBackRest's own archive-push-queue-max drop also returns 0: it discards
+  # the queued segments, reports each as archived, and says so only in a
+  # warning ("dropped WAL file '<segment>' because archive queue exceeded
+  # <size>"). The WAL is gone from the PITR chain exactly as in the drops
+  # below, so leave the same signal for pgbackrest-backup-watcher.sh.
+  case "$pgb_out" in
+    *"dropped WAL file"*"archive queue exceeded"*)
+      touch "$PGDATA/.pgbackrest_gap_pending" 2>/dev/null || true
+      ;;
+  esac
   exit 0
 fi
 

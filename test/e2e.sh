@@ -1296,6 +1296,7 @@ EOF
     -e PGBACKREST_REPO1_S3_URI_STYLE=path \
     -e PGBACKREST_ARCHIVE_PUSH_QUEUE_MAX=128MiB \
     -e WAL_DROP_THRESHOLD_MB=999999 \
+    -e WAL_LAG_GAP_THRESHOLD_SEGMENTS=1000000 \
     -v "$vol:/var/lib/postgresql/data" \
     "$IMAGE" >/dev/null
   wait_for_pg "$name" || { ko t_queue_max_5gib_trips "ro boot"; return; }
@@ -1327,6 +1328,15 @@ EOF
   local alive
   alive=$(docker exec "$name" psql -U postgres -At -c "SELECT 1" 2>/dev/null || echo DEAD)
   assert_eq "$alive" "1" "postgres alive after queue-max trip" || { ko t_queue_max_5gib_trips ""; return; }
+
+  # The drop returns success to Postgres, so the wrapper's own drop paths
+  # never run; with the lag threshold out of reach, the marker can only come
+  # from the wrapper reading pgBackRest's drop warning.
+  if ! docker exec "$name" test -f /var/lib/postgresql/data/.pgbackrest_gap_pending; then
+    ko t_queue_max_5gib_trips ".pgbackrest_gap_pending not written after pgBackRest dropped its queue"
+    fail_dump t_queue_max_5gib_trips "$name"
+    return
+  fi
 
   ok t_queue_max_5gib_trips
   note "$dropped 'archive queue exceeded' WAL drops logged at queue-max=128MiB"
