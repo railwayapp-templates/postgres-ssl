@@ -1185,13 +1185,30 @@ t_s3_unreachable_pg_stays_up() {
   reset_bucket
   new_volume "$vol"
   docker rm -f "$name" >/dev/null 2>&1 || true
-  run_archiving_pg "$name" "$vol" -e "WAL_DROP_THRESHOLD_MB=999999"
+  run_archiving_pg "$name" "$vol" -e "WAL_DROP_THRESHOLD_MB=999999" -e "PGBACKREST_WATCHER_DEBUG=1"
   wait_for_pg "$name" || { ko t_s3_unreachable_pg_stays_up "no startup"; return; }
   # wait for stanza-create
   sleep 4
 
   docker exec "$name" psql -U postgres -c "CREATE TABLE t(id int); INSERT INTO t SELECT g FROM generate_series(1,1000) g; SELECT pg_switch_wal();" >/dev/null
   sleep 3
+
+  # The watcher runs stanza-create on its first iteration on a fresh volume and
+  # records it; its next run regardless of the bucket's state is an hour away.
+  local stamp_deadline=$(($(date +%s) + 60)) stamped=0
+  while [ "$(date +%s)" -lt "$stamp_deadline" ]; do
+    if docker exec "$name" grep -q '^last_stanza_create_at=[1-9]' /var/lib/postgresql/data/.pgbackrest_backup_state 2>/dev/null; then
+      stamped=1; break
+    fi
+    sleep 1
+  done
+  if [ "$stamped" != 1 ]; then
+    ko t_s3_unreachable_pg_stays_up "watcher did not record its first stanza-create"
+    fail_dump t_s3_unreachable_pg_stays_up "$name"
+    return
+  fi
+  local stanza_create_failures_before
+  stanza_create_failures_before=$(docker logs "$name" 2>&1 | grep -c "pgbackrest-watcher: stanza-create: exited")
 
   log "stopping MinIO to simulate S3 outage"
   docker stop "$MINIO" >/dev/null
@@ -1224,6 +1241,27 @@ t_s3_unreachable_pg_stays_up() {
   done
   if [ "$failed_count" -lt 1 ]; then
     ko t_s3_unreachable_pg_stays_up "pg_stat_archiver.failed_count should grow under S3 outage; got $failed_count"
+    docker start "$MINIO" >/dev/null
+    return
+  fi
+
+  # stanza-create holds the archive lock archive-push needs, for as long as the
+  # bucket keeps it waiting. With the bucket down `pgbackrest info` gives the
+  # watcher no answer, and the watcher leaves stanza-create alone: an iteration
+  # reaches that decision during the outage, and none logs a stanza-create
+  # failure.
+  local waiting_deadline=$(($(date +%s) + 150)) waited=0
+  while [ "$(date +%s)" -lt "$waiting_deadline" ]; do
+    if docker logs "$name" 2>&1 | grep -q "pgbackrest-watcher: stanza-create: waiting — pgbackrest info gave no answer"; then
+      waited=1; break
+    fi
+    sleep 3
+  done
+  local stanza_create_failures
+  stanza_create_failures=$(docker logs "$name" 2>&1 | grep -c "pgbackrest-watcher: stanza-create: exited")
+  if [ "$waited" != 1 ] || [ "$stanza_create_failures" != "$stanza_create_failures_before" ]; then
+    ko t_s3_unreachable_pg_stays_up "watcher should hold stanza-create back while the bucket is unreachable; held back=${waited}, stanza-create failure lines ${stanza_create_failures_before} before the outage and ${stanza_create_failures} after"
+    fail_dump t_s3_unreachable_pg_stays_up "$name"
     docker start "$MINIO" >/dev/null
     return
   fi
@@ -5162,6 +5200,70 @@ t_watcher_heals_stanza_missing_archive_info() {
   run_half_created_stanza_case archive.info t_watcher_heals_stanza_missing_archive_info
 }
 
+# The watcher's periodic stanza-create. On a whole stanza the watcher runs
+# stanza-create once per WAL_BACKUP_STANZA_CREATE_INTERVAL_SECONDS, for the one
+# repair `pgbackrest info` cannot ask for: a missing .info/.info.copy twin.
+# info loads the surviving file and reports the stanza ok. This removes both
+# .info.copy files from a stanza with a full on it and asserts info still
+# reports ok and the watcher puts both files back.
+t_watcher_restores_missing_info_copy() {
+  local t=t_watcher_restores_missing_info_copy
+  local name=t-info-copy-${PG_VERSION}
+  local vol=${name}-vol
+  reset_bucket
+  new_volume "$vol"
+  docker rm -f "$name" >/dev/null 2>&1 || true
+
+  run_archiving_pg_fast_watcher "$name" "$vol" \
+    -e "WAL_BACKUP_STANZA_CREATE_INTERVAL_SECONDS=20"
+  wait_for_pg "$name" || { ko "$t" "no startup"; fail_dump "$t" "$name"; return; }
+  docker exec "$name" psql -U postgres -c "CREATE TABLE t(id int); SELECT pg_switch_wal();" >/dev/null
+  # A full on record means the stanza exists, whichever of the boot-time loop
+  # and the watcher created it. 150s covers a first full that fails once and
+  # is retried.
+  wait_for_watcher_backup "$name" full 150 \
+    || { ko "$t" "no initial full"; fail_dump "$t" "$name"; return; }
+
+  local repo_path
+  repo_path=$(docker exec "$name" cat /var/lib/postgresql/data/.pgbackrest_repo_path)
+  mc "mc rm --force local/${BUCKET}${repo_path}/archive/main/archive.info.copy local/${BUCKET}${repo_path}/backup/main/backup.info.copy" >/dev/null 2>&1
+  local copies
+  copies=$(mc "mc find local/${BUCKET}${repo_path} --name '*.info.copy' 2>/dev/null" | wc -l | tr -d ' ')
+
+  local status_code
+  status_code=$(docker exec -u postgres "$name" bash -c "
+    export PGBACKREST_REPO1_S3_BUCKET=\"\$WAL_ARCHIVE_BUCKET\"
+    export PGBACKREST_REPO1_S3_KEY=\"\$WAL_ARCHIVE_KEY\"
+    export PGBACKREST_REPO1_S3_KEY_SECRET=\"\$WAL_ARCHIVE_SECRET\"
+    export PGBACKREST_REPO1_S3_REGION=\"\$WAL_ARCHIVE_REGION\"
+    export PGBACKREST_REPO1_S3_ENDPOINT=\"\$WAL_ARCHIVE_ENDPOINT\"
+    export PGBACKREST_REPO1_PATH=\"$repo_path\"
+    pgbackrest --stanza=main --repo=1 info --output=json 2>/dev/null | jq -r '.[0].status.code'
+  " 2>/dev/null | tail -1)
+  if [ "$status_code" != "0" ]; then
+    ko "$t" "pgbackrest info should report the stanza ok with a surviving .info of each pair; got status code '${status_code}' (.info.copy objects right after the removal: ${copies})"
+    fail_dump "$t" "$name"
+    return
+  fi
+
+  local deadline=$(($(date +%s) + 90))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    copies=$(mc "mc find local/${BUCKET}${repo_path} --name '*.info.copy' 2>/dev/null" | wc -l | tr -d ' ')
+    [ "$copies" = "2" ] && break
+    sleep 3
+  done
+  if [ "$copies" != "2" ]; then
+    ko "$t" "watcher did not restore archive.info.copy and backup.info.copy (${copies} of 2 present)"
+    fail_dump "$t" "$name"
+    return
+  fi
+
+  ok "$t"
+  note "both .info.copy removed at ${repo_path}; info still reported ok; the periodic stanza-create restored them"
+  docker rm -f "$name" >/dev/null
+  docker volume rm "$vol" >/dev/null
+}
+
 # M2. Catalog-verify self-heal. local state can carry last_full_at while S3
 # has lost the full (catalog wiped, redeploy that dropped the bucket, restore
 # from before the full). NEEDS_INITIAL_BACKUP only fires on empty state, so
@@ -5503,6 +5605,7 @@ ALL_TESTS=(
   t_catalog_verify_deadlock_selfheals
   t_watcher_heals_half_created_stanza
   t_watcher_heals_stanza_missing_archive_info
+  t_watcher_restores_missing_info_copy
   t_gap_marker_suppresses_catalog_verify_full
   t_stanza_create_timeout_sentinel_absent_on_success
   t_invalid_bucket_sentinel_cleared_on_disable
