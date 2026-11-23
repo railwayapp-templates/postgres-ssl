@@ -13,10 +13,14 @@
 #      diverging from the S3 catalog, regardless of cause. Entry conditions
 #      (any of):
 #        - pgbackrest-archive-push-wrapper.sh dropped a segment and touched
-#          .pgbackrest_gap_pending (bucket gone, hard archive-push failure)
+#          .pgbackrest_gap_pending (bucket gone, hard archive-push failure),
+#          or saw pgBackRest drop its queue (archive-push-queue-max)
 #        - LSN-lag probe found pg_stat_archiver.last_archived_wal more than
 #          WAL_LAG_GAP_THRESHOLD_SEGMENTS ahead of the catalog max (async
 #          worker silently wedged — queue-max-trip or hung connection)
+#      A failing archive_command alone (pg_stat_archiver.failed_count
+#      growing) loses no WAL — Postgres keeps the segment and retries it —
+#      and is followed by archive_failure_step until Postgres archives again.
 #      Recovery flow once in the state:
 #        - Wait GAP_RECOVERY_BACKOFF_SECONDS (default 10 min) for natural
 #          async recovery. Most short Tigris/S3 hiccups self-heal here.
@@ -28,7 +32,10 @@
 #          successfully) → take a diff backup to re-anchor latestRestorableAt,
 #          then clear the gap marker.
 #      Diff (not full) is enough because the customer-visible state is
-#      "latestRestorableAt is fresh", which a diff produces in seconds.
+#      "latestRestorableAt is fresh". A diff reads everything changed since
+#      the last full, so on a large database it runs for minutes and competes
+#      with live queries for volume I/O — which is why it is kept for WAL
+#      that is actually missing.
 #      Historical missing segments stay missing in the old chain; retention
 #      eventually rolls them off.
 #   3. Periodic — full every WAL_BACKUP_FULL_INTERVAL_HOURS, diff every
@@ -240,11 +247,15 @@ debug() { [ "${PGBACKREST_WATCHER_DEBUG:-0}" = "1" ] && echo "pgbackrest-watcher
 #                                      FULL_RETRY_BACKOFF_SECONDS; a full after a
 #                                      deliberate last_full_at clear is never
 #                                      delayed (no fresh failure marker).
-#   last_lag_detected_at=<epoch>     — when current gap-recovery cycle started
+#   last_lag_detected_at=<epoch>     — when current gap-recovery cycle started,
+#                                       or when archive_failure_step first
+#                                       saw the archive_command failure it is
+#                                       following (0 = neither)
 #   catalog_max_at_detection=<wal>   — catalog max segment at detection (recovery
 #                                       proof is "current catalog_max > this")
 #   last_force_recovery_at=<epoch>   — last time we pkill'd the async daemon
-#   force_attempts=<int>             — pkill cycles this gap-recovery cycle
+#   force_attempts=<int>             — pkill cycles this gap-recovery cycle or
+#                                       this archive_command failure
 #   archive_migration_orig_path=<path> — pre-migration repo1-path, set on the
 #                                       first WAL_REGRESSION self-heal and
 #                                       never cleared. Successive migrations
@@ -1500,47 +1511,47 @@ gap_recovery_step() {
     return 0
   fi
 
-  # Not in recovery. Two independent entry conditions, both meaning
-  # "WAL coverage is diverging from the catalog":
-  #   - LSN lag ≥ threshold (async wedge / queue-max-trip — postgres
-  #     keeps handing off, async doesn't drain to S3)
-  #   - failed_count grew since the last full's anchor (foreground hard
-  #     failure — archive_command returning non-zero so postgres never
-  #     hands off; lag stays at 0 but archiving is broken just the same)
+  # Not in recovery. Two signals, with different meanings:
+  #   - LSN lag ≥ threshold (async wedge / queue-max-trip — postgres keeps
+  #     handing off, async doesn't drain to S3): WAL may already be missing
+  #     from the repo, so enter recovery, which ends in a diff.
+  #   - failed_count grew since the anchor (archive_command returned non-zero):
+  #     Postgres still holds the segment and retries it, so nothing is missing.
+  #     archive_failure_step follows it without a backup.
   local last_full_failed; last_full_failed=$(read_state last_full_failed_count); : "${last_full_failed:=0}"
   local failed_grew=0
   [ "${FAILED_COUNT:-0}" -gt "$last_full_failed" ] && failed_grew=1
 
-  if [ "$lag" -ge "$WAL_LAG_GAP_THRESHOLD_SEGMENTS" ] || [ "$failed_grew" -eq 1 ]; then
-    # Before entering the pkill-cycle state machine, check whether this is a
-    # WAL_REGRESSION: pg_stat_archiver says the current failure is for a WAL at
-    # or before the catalog max on the same timeline AND the async status file
-    # for that WAL reports code 45 (ArchiveDuplicateError). pkill-async cannot
-    # fix a duplicate-segment conflict — it is structural, not a stuck process.
-    # Self-heal immediately by migrating to a new archive path suffix. `-le`
-    # (not `-lt`) covers the boundary case where rollback lands exactly at the
-    # last archived segment.
-    #
-    # Guard: LAST_FAILED_EPOCH > LAST_ARCHIVED_EPOCH confirms the failure is
-    # currently active, not a stale pg_stat_archiver.last_failed_wal from an
-    # old transient error (those fields are sticky until postgres restart).
-    if [ "$failed_grew" -eq 1 ] && [ -n "$LAST_FAILED_WAL" ] \
-       && [ "${LAST_FAILED_EPOCH:-0}" -gt "${LAST_ARCHIVED_EPOCH:-0}" ] \
-       && wal_has_async_archive_duplicate_error "$LAST_FAILED_WAL"; then
-      local wr_catalog_max
-      wr_catalog_max=$(catalog_max_for_wal "$LAST_FAILED_WAL" "$catalog_max") || wr_catalog_max=""
-      if [ -n "$wr_catalog_max" ]; then
-        local wr_f_n wr_c_n
-        wr_f_n=$(segment_to_number "$LAST_FAILED_WAL")
-        wr_c_n=$(segment_to_number "$wr_catalog_max")
-        if [ -n "$wr_f_n" ] && [ -n "$wr_c_n" ] && [ "$wr_f_n" -le "$wr_c_n" ]; then
-          log "wal-regression: detected (failed_wal=${LAST_FAILED_WAL}, catalog_max=${wr_catalog_max}, failed_count=${FAILED_COUNT:-0}) — self-healing immediately"
-          migrate_to_new_archive_path
-          return 0
-        fi
+  # Before either path, check whether this is a WAL_REGRESSION:
+  # pg_stat_archiver says the current failure is for a WAL at or before the
+  # catalog max on the same timeline AND the async status file for that WAL
+  # reports code 45 (ArchiveDuplicateError). pkill-async cannot fix a
+  # duplicate-segment conflict — it is structural, not a stuck process.
+  # Self-heal immediately by migrating to a new archive path suffix. `-le`
+  # (not `-lt`) covers the boundary case where rollback lands exactly at the
+  # last archived segment.
+  #
+  # Guard: LAST_FAILED_EPOCH > LAST_ARCHIVED_EPOCH confirms the failure is
+  # currently active, not a stale pg_stat_archiver.last_failed_wal from an
+  # old transient error (those fields are sticky until postgres restart).
+  if [ "$failed_grew" -eq 1 ] && [ -n "$LAST_FAILED_WAL" ] \
+     && [ "${LAST_FAILED_EPOCH:-0}" -gt "${LAST_ARCHIVED_EPOCH:-0}" ] \
+     && wal_has_async_archive_duplicate_error "$LAST_FAILED_WAL"; then
+    local wr_catalog_max
+    wr_catalog_max=$(catalog_max_for_wal "$LAST_FAILED_WAL" "$catalog_max") || wr_catalog_max=""
+    if [ -n "$wr_catalog_max" ]; then
+      local wr_f_n wr_c_n
+      wr_f_n=$(segment_to_number "$LAST_FAILED_WAL")
+      wr_c_n=$(segment_to_number "$wr_catalog_max")
+      if [ -n "$wr_f_n" ] && [ -n "$wr_c_n" ] && [ "$wr_f_n" -le "$wr_c_n" ]; then
+        log "wal-regression: detected (failed_wal=${LAST_FAILED_WAL}, catalog_max=${wr_catalog_max}, failed_count=${FAILED_COUNT:-0}) — self-healing immediately"
+        migrate_to_new_archive_path
+        return 0
       fi
     fi
+  fi
 
+  if [ "$lag" -ge "$WAL_LAG_GAP_THRESHOLD_SEGMENTS" ]; then
     touch "$GAP_MARKER"
     write_state_field last_lag_detected_at "$now"
     write_state_field catalog_max_at_detection "$catalog_max"
@@ -1548,8 +1559,92 @@ gap_recovery_step() {
     write_state_field force_attempts 0
     GAP_STATE_DIAG="detected"
     log "gap-recovery: entering recovery (lag=${lag}, failed_count=${FAILED_COUNT:-0} vs anchor ${last_full_failed}, handoff=${LAST_ARCHIVED_WAL}, catalog_max=${catalog_max}) — first pkill in ${GAP_RECOVERY_BACKOFF_SECONDS}s if catalog hasn't advanced"
+  elif [ "$failed_grew" -eq 1 ]; then
+    archive_failure_step "$now" "$catalog_max" "$last_full_failed"
   else
+    # A Postgres restart zeroes pg_stat_archiver, which ends a failure
+    # archive_failure_step was following without it ever reading as over.
+    # Reset its clock so the next failure starts a fresh backoff window.
+    local following_since; following_since=$(read_state last_lag_detected_at)
+    if [ -n "$following_since" ] && [ "$following_since" != "0" ]; then
+      write_state_field last_lag_detected_at 0
+      write_state_field last_force_recovery_at 0
+      write_state_field force_attempts 0
+    fi
     GAP_STATE_DIAG="clear"
+  fi
+}
+
+# Succeeds when the archive_command failure pg_stat_archiver last recorded is
+# over: Postgres has archived again since, and — for a WAL segment — the
+# catalog max on that segment's timeline has reached it. Postgres retries a
+# failed file until archive_command accepts it, so an archive after the last
+# failure means the failed file went through. Timeline history and
+# backup-label files have no place in the catalog's segment range; for those
+# Postgres's own order is the whole answer.
+archive_failure_resolved() {
+  local catalog_max="${1:-}"
+  [ "${LAST_ARCHIVED_EPOCH:-0}" -gt "${LAST_FAILED_EPOCH:-0}" ] || return 1
+  local f_n
+  f_n=$(segment_to_number "$LAST_FAILED_WAL")
+  [ -z "$f_n" ] && return 0
+  local failed_catalog_max c_n
+  failed_catalog_max=$(catalog_max_for_wal "$LAST_FAILED_WAL" "$catalog_max") || return 1
+  c_n=$(segment_to_number "$failed_catalog_max")
+  [ -n "$c_n" ] && [ "$c_n" -ge "$f_n" ]
+}
+
+# Follows an archive_command failure that has lost no WAL: failed_count is past
+# its anchor, the gap marker is absent and the catalog keeps up with the
+# handoff. Postgres holds the segment in pg_wal and retries it, so the WAL
+# chain in the repo stays whole and there is nothing for a backup to seal. A
+# single archive-push that outlives pgBackRest's archive-timeout and lands on
+# the retry is the common case; a diff for it reads everything changed since
+# the last full off the data volume for no gain in restorability.
+#
+# WAL goes missing only when a segment is dropped, and every drop goes through
+# the archive-push wrapper, which touches the gap marker for its own drops and
+# for pgBackRest's queue-max drop alike. The marker — or lag reaching the
+# threshold — moves this failure into gap recovery on the next iteration,
+# timers and kick count included.
+#
+# While the failure lasts, the async daemon gets the same kick every
+# GAP_RECOVERY_BACKOFF_SECONDS that gap recovery gives it. Once
+# archive_failure_resolved holds, the failures fold into the anchor.
+archive_failure_step() {
+  local now="$1" catalog_max="$2" anchor="$3"
+  local since last_force force_attempts
+  since=$(read_state last_lag_detected_at); : "${since:=0}"
+  last_force=$(read_state last_force_recovery_at); : "${last_force:=0}"
+  force_attempts=$(read_state force_attempts); : "${force_attempts:=0}"
+
+  if archive_failure_resolved "$catalog_max"; then
+    write_state_field last_full_failed_count "${FAILED_COUNT:-0}"
+    write_state_field last_lag_detected_at 0
+    write_state_field last_force_recovery_at 0
+    write_state_field force_attempts 0
+    GAP_STATE_DIAG="clear"
+    log "archive-failure: over — Postgres archived ${LAST_FAILED_WAL:-the failed file} on retry (failed_count=${FAILED_COUNT:-0} vs anchor ${anchor}, handoff=${LAST_ARCHIVED_WAL}, catalog_max=${catalog_max}, ${force_attempts} pkill cycles); no WAL was lost, no backup needed"
+    return 0
+  fi
+
+  GAP_STATE_DIAG="archive-failing"
+  if [ "$since" -eq 0 ]; then
+    write_state_field last_lag_detected_at "$now"
+    write_state_field last_force_recovery_at 0
+    write_state_field force_attempts 0
+    log "archive-failure: archive_command failed for ${LAST_FAILED_WAL:-a WAL file} (failed_count=${FAILED_COUNT:-0} vs anchor ${anchor}, handoff=${LAST_ARCHIVED_WAL}, catalog_max=${catalog_max}); Postgres keeps the file and retries — first pkill in ${GAP_RECOVERY_BACKOFF_SECONDS}s if it has not archived by then"
+    return 0
+  fi
+
+  local last_action_at="$since"
+  [ "$last_force" -gt "$last_action_at" ] && last_action_at="$last_force"
+  if [ $((now - last_action_at)) -ge "$GAP_RECOVERY_BACKOFF_SECONDS" ]; then
+    force_attempts=$((force_attempts + 1))
+    log "archive-failure: ${LAST_FAILED_WAL:-a WAL file} still failing after $(( (now - since) / 60 ))min (handoff=${LAST_ARCHIVED_WAL}, catalog_max=${catalog_max}) — pkill async (attempt #${force_attempts})"
+    kick_async_daemon
+    write_state_field last_force_recovery_at "$now"
+    write_state_field force_attempts "$force_attempts"
   fi
 }
 
