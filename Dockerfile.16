@@ -60,10 +60,18 @@ ARG PKG_REFRESH=none
 # the bundled Postgres minor — PGDG always carries the major's newest minor,
 # so an unheld upgrade can make the image bundle a newer server than the
 # minor tag it publishes under. Everything else upgrades freely.
+# The extension packages are the newest ones the held server accepts: PGDG
+# ties an extension build to the minor it was compiled for when that minor
+# changes what extensions link against, so on an older minor tag the newest
+# package is not installable and the one before it is the right build.
+COPY --chmod=755 apt-newest-installable.sh /usr/local/bin/apt-newest-installable.sh
 RUN echo "refresh key: ${PKG_REFRESH}" \
     && apt-mark hold postgresql-16 postgresql-client-16 \
     && apt-get update && apt-get upgrade -y \
-    && apt-get install -y openssl sudo ca-certificates jq pgbackrest tini "postgresql-16-pgvector=${PGVECTOR_PKG_VERSION}" postgresql-16-pgaudit \
+    && PGVECTOR_PKG="postgresql-16-pgvector=$(apt-newest-installable.sh postgresql-16-pgvector "${PGVECTOR_PKG_VERSION}")" \
+    && PGAUDIT_PKG="postgresql-16-pgaudit=$(apt-newest-installable.sh postgresql-16-pgaudit)" \
+    && echo "extension packages: ${PGVECTOR_PKG} ${PGAUDIT_PKG}" \
+    && apt-get install -y openssl sudo ca-certificates jq pgbackrest tini "${PGVECTOR_PKG}" "${PGAUDIT_PKG}" \
     && apt-mark unhold postgresql-16 postgresql-client-16 \
     && rm -rf /var/lib/apt/lists/*
 
