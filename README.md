@@ -82,6 +82,13 @@ Besides Postgres's own contrib modules, the image ships
 `CREATE EXTENSION` away (`vector`, `pgaudit`), from psql or the dashboard's
 Extensions card.
 
+Each image carries the newest build of both packages that its Postgres minor
+accepts (`apt-newest-installable.sh`, run by the image build). PGDG makes an
+extension build depend on the server minor it was compiled for when that
+minor changes what extensions link against, so a minor tag that is no longer
+its major's newest keeps the last build made for it, while the major tag and
+its newest minor follow the newest one.
+
 pgaudit refuses to load any way but `shared_preload_libraries`, so the image
 preloads it next to `pg_stat_statements` on every volume: `init-ssl.sh`
 writes `shared_preload_libraries = 'pg_stat_statements,pgaudit'` at initdb
