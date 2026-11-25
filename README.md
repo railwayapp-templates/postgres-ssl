@@ -448,6 +448,28 @@ ages out. Tune via `WAL_BACKUP_RETENTION_FULL`,
 `WAL_BACKUP_RETENTION_DIFF`, `WAL_BACKUP_FULL_INTERVAL_HOURS`,
 `WAL_BACKUP_DIFF_INTERVAL_HOURS`.
 
+#### Replacing the watcher in a running container
+
+A running container keeps the watcher of the image it was deployed from.
+`hotswap/watcher-hotswap.sh <dir>` (not part of the image) replaces the
+watcher and the archive-push wrapper in a running container with the copies
+in `<dir>` and restarts only the watcher; Postgres keeps running. The platform
+uses it to bring a watcher fix to databases that have not been redeployed. A
+new deploy installs the image's own scripts.
+
+The swapped-in watcher runs next to the rest of the image as it was built, so
+the platform only swaps on image builds that `test/e2e-watcher-hotswap.sh`
+has passed on:
+
+```bash
+IMAGE=ghcr.io/railwayapp-templates/postgres-ssl@sha256:<digest> test/e2e-watcher-hotswap.sh
+```
+
+The test reproduces a diff for an archive failure that loses no WAL on the
+old watcher, swaps with an open client session, checks that Postgres did not
+restart, and repeats the failure on the swapped-in watcher: no backup, and a
+second swap is a no-op.
+
 ### Disabling PITR
 
 When `WAL_ARCHIVE_BUCKET` is removed (the gating env var), the
