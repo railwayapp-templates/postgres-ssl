@@ -455,11 +455,20 @@ A running container keeps the watcher of the image it was deployed from.
 watcher and the archive-push wrapper in a running container with the copies
 in `<dir>` and restarts only the watcher; Postgres keeps running. The platform
 uses it to bring a watcher fix to databases that have not been redeployed. A
-new deploy installs the image's own scripts.
+new deploy, or a restart that recreates the container, installs the image's
+own scripts again.
+
+The container is never left without a watcher. If the new watcher does not
+stay up, the previous scripts go back and the previous watcher is started
+again. If the run is cut short after the old watcher stopped, the next run
+starts the watcher from the environment the first run saved. The script
+refuses while a pgBackRest backup is running, and it only restarts a watcher
+that `wrapper.sh` started in its own session (images since 2026-09-04).
 
 The swapped-in watcher runs next to the rest of the image as it was built, so
-the platform only swaps on image builds that `test/e2e-watcher-hotswap.sh`
-has passed on:
+the platform decides by the watcher that is installed in the container: it
+swaps only a watcher + archive-push wrapper pair (by sha256) that
+`test/e2e-watcher-hotswap.sh` has passed on, on an image that ships that pair:
 
 ```bash
 IMAGE=ghcr.io/railwayapp-templates/postgres-ssl@sha256:<digest> test/e2e-watcher-hotswap.sh
@@ -468,7 +477,9 @@ IMAGE=ghcr.io/railwayapp-templates/postgres-ssl@sha256:<digest> test/e2e-watcher
 The test reproduces a diff for an archive failure that loses no WAL on the
 old watcher, swaps with an open client session, checks that Postgres did not
 restart, and repeats the failure on the swapped-in watcher: no backup, and a
-second swap is a no-op.
+second swap is a no-op. It then swaps in a watcher that exits at once and
+checks the previous one is back, and cuts a swap short and checks the next
+run finishes it.
 
 ### Disabling PITR
 
