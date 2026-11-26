@@ -422,6 +422,30 @@ add_preload_library() {
   local config_file="$1" lib="$2" current_libs
   current_libs=$(preload_value "$config_file")
   echo "shared_preload_libraries = '${current_libs:+${current_libs},}${lib}'" >> "$config_file"
+  # Flush it like the other config appends: a crash before writeback leaves
+  # the new length with zeroed data, and Postgres refuses the whole file.
+  sync "$config_file"
+}
+
+# Repairs a config file torn by a crash between an append and its writeback:
+# the length reached disk, the data did not, and the gap reads back as NUL
+# bytes. Postgres refuses such a file outright ("contains errors") on every
+# start, and greps for a setting miss it, so it never heals by itself. NULs
+# are never valid in a config file, so dropping them loses nothing. The
+# repaired copy is written next to the file, flushed, then moved over it.
+# Usage: heal_nul_bytes <config_file>
+heal_nul_bytes() {
+  local file="$1" tmp
+  [ -f "$file" ] || return 0
+  tr -d '\000' < "$file" | cmp -s - "$file" && return 0
+  echo "wrapper: $(basename "$file") holds NUL bytes from a torn write, removing them"
+  tmp="$file.heal.$$"
+  tr -d '\000' < "$file" > "$tmp"
+  chmod --reference="$file" "$tmp" 2>/dev/null || true
+  chown --reference="$file" "$tmp" 2>/dev/null || true
+  sync "$tmp"
+  mv -f "$tmp" "$file"
+  sync "$file"
 }
 
 # postgresql.conf always carries the image's list (init-ssl.sh wrote it;
@@ -452,9 +476,11 @@ AUTO_CONF_FILE="$PGDATA/postgresql.auto.conf"
 # backend connections) doesn't exhaust the PostgreSQL default of 100. Writing
 # to auto.conf overrides postgresql.conf without touching the file Postgres
 # manages itself. Skipped if already set (e.g. via ALTER SYSTEM by the user).
+heal_nul_bytes "$AUTO_CONF_FILE"
 if [ -f "$POSTGRES_CONF_FILE" ] && ! grep -q "^[[:space:]]*max_connections" "$AUTO_CONF_FILE" 2>/dev/null; then
   echo "wrapper: setting max_connections = 500 in postgresql.auto.conf"
   echo "max_connections = 500" >> "$AUTO_CONF_FILE"
+  sync "$AUTO_CONF_FILE"
 fi
 ensure_image_preload_libraries "$POSTGRES_CONF_FILE" "$AUTO_CONF_FILE"
 
