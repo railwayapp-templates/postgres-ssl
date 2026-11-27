@@ -736,9 +736,24 @@ stanza_create_step() {
   fi
 
   write_state_field last_stanza_create_at "$now"
-  local out rc
-  out=$(timeout 60 pgbackrest --stanza=main stanza-create 2>&1)
-  rc=$?
+  local out="" rc=124 attempt=1 remaining retry_delay
+  local deadline=$((SECONDS + 60))
+  while :; do
+    remaining=$((deadline - SECONDS))
+    [ "$remaining" -le 0 ] && break
+    out=$(timeout "$remaining" pgbackrest --stanza=main stanza-create 2>&1)
+    rc=$?
+    # Retry only transient archive-lock contention. Preserve the newer
+    # upstream scheduling gate and do not extend its 60-second run budget.
+    if [ "$rc" -ne 50 ] || [ "$attempt" -ge 3 ]; then
+      break
+    fi
+    retry_delay=$((1 + RANDOM % 3))
+    remaining=$((deadline - SECONDS))
+    [ "$remaining" -le "$retry_delay" ] && break
+    sleep "$retry_delay"
+    attempt=$((attempt + 1))
+  done
   if [ "$rc" -eq 0 ]; then
     end_half_stanza_sighting "stanza-create now succeeds"
     return 0
