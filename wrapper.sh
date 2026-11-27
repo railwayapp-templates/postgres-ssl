@@ -601,6 +601,13 @@ PITR_DONE_MARKER="$PGDATA/.pitr_configured"
 # our conf.d/pgbackrest-recovery.conf path would duplicate them.
 PGBACKREST_RESTORED_MARKER="$PGDATA/.pgbackrest_restored"
 
+# Present from the boot that replays toward a point-in-time target until the
+# promoted cluster's superuser password has been set from this service's own
+# POSTGRES_PASSWORD (see fork_restored_superuser_password). On the volume, so
+# a container that dies between the promote and the ALTER ROLE finishes the
+# job on its next boot.
+PITR_SUPERUSER_PASSWORD_PENDING="$PGDATA/.pitr_superuser_password_pending"
+
 # Restartpoint tuning applied ONLY to a replay boot, via `-c` flags on the
 # postgres invocation itself — never written to postgresql.conf/auto.conf.
 # Without this, pg_wal can accumulate WAL segments fetched by restore_command
@@ -1864,6 +1871,82 @@ ENDSQL
   ) &
 }
 
+# A point-in-time restore brings back pg_authid as of the recovery target, so
+# the superuser's password is whatever the source had at that moment. This
+# service only knows its own POSTGRES_PASSWORD: when the source's password
+# changed between the target and the restore, every client configured from
+# this service's variables is refused. Once the restored cluster promotes,
+# set the superuser's password from POSTGRES_PASSWORD, once per restore.
+#
+# The pending marker is written on the boot that carries recovery.signal with
+# a recover-from bucket configured (the same gate as the replay-boot
+# restartpoint tuning, covering both the empty-volume restore and the conf.d
+# staging path) and removed after the ALTER ROLE succeeds, so a password
+# changed in the database afterwards stays as the operator set it. A failed
+# attempt keeps the marker and the next boot retries.
+fork_restored_superuser_password() {
+  if [ -f "$PGDATA/recovery.signal" ] && [ -n "${WAL_RECOVER_FROM_BUCKET:-}" ]; then
+    touch "$PITR_SUPERUSER_PASSWORD_PENDING"
+    chown postgres:postgres "$PITR_SUPERUSER_PASSWORD_PENDING" 2>/dev/null || true
+  fi
+  [ -f "$PITR_SUPERUSER_PASSWORD_PENDING" ] || return 0
+
+  local restored_password="${POSTGRES_PASSWORD:-}"
+  if [ -z "$restored_password" ] && [ -r "${POSTGRES_PASSWORD_FILE:-}" ]; then
+    restored_password="$(cat "$POSTGRES_PASSWORD_FILE")"
+  fi
+  if [ -z "$restored_password" ]; then
+    echo "pitr-restore: POSTGRES_PASSWORD is empty; the restored superuser keeps the password it had at the recovery target"
+    rm -f "$PITR_SUPERUSER_PASSWORD_PENDING"
+    return 0
+  fi
+
+  (
+    trap '' INT TERM  # background helper — see "Process tree and the stop signal" before the foreground call
+    local deadline
+    # Same ceiling as fork_collation_refresh: a replay staged with
+    # hot_standby=off fails pg_isready until it promotes, which can take
+    # hours.
+    deadline=$(( $(date +%s) + ${PITR_SUPERUSER_PASSWORD_WAIT_SECONDS:-86400} ))
+    until pg_isready -q -h /var/run/postgresql -p 5432 2>/dev/null; do
+      [ "$(date +%s)" -ge "$deadline" ] && exit 0
+      sleep 1
+    done
+    until [ "$(_rx_psql -d postgres -Atc 'SELECT pg_is_in_recovery()' 2>/dev/null)" = "f" ]; do
+      [ "$(date +%s)" -ge "$deadline" ] && exit 0
+      sleep 1
+    done
+
+    # The role name and the password reach psql through its environment and
+    # are quoted by psql itself (:"role" / :'password'), so this shell never
+    # interpolates either into SQL. The session turns statement logging and
+    # pg_stat_statements' utility tracking off first: the ALTER ROLE carries
+    # the password in clear text.
+    local out=""
+    for _ in 1 2 3 4 5; do
+      if out=$(RESTORED_SUPERUSER="${POSTGRES_USER:-postgres}" RESTORED_SUPERUSER_PASSWORD="$restored_password" \
+           _rx_psql -d postgres -q 2>&1 <<'SQL'
+\set role `printf '%s' "$RESTORED_SUPERUSER"`
+\set password `printf '%s' "$RESTORED_SUPERUSER_PASSWORD"`
+SET log_statement = 'none';
+SET log_min_duration_statement = -1;
+SET log_min_error_statement = 'panic';
+SET pg_stat_statements.track_utility = off;
+ALTER ROLE :"role" WITH PASSWORD :'password';
+SQL
+      ); then
+        rm -f "$PITR_SUPERUSER_PASSWORD_PENDING"
+        echo "pitr-restore: superuser password set from this service's POSTGRES_PASSWORD (the restored data carried the source's password as of the recovery target)"
+        exit 0
+      fi
+      sleep 2
+    done
+    # Only the error's own first line: the lines after it can quote the
+    # statement.
+    echo "pitr-restore: could not set the superuser password from POSTGRES_PASSWORD ($(printf '%s\n' "$out" | grep -m1 -E '^(psql: error|ERROR|FATAL)' || echo 'no error reported')); clients using this service's variables may be refused until the next start retries it" >&2
+  ) &
+}
+
 compute_volume_thresholds
 # Inject the computed pg_wal drop threshold into the env that postgres (and
 # its archive_command wrapper) inherits, unless the operator pinned it. The
@@ -2677,6 +2760,7 @@ fork_pgbackrest_backup_watcher
 # the same PID.
 POST_UPGRADE_ANALYZE_DONE="/tmp/.post-upgrade-analyze-done.$$"
 rm -f "$POST_UPGRADE_ANALYZE_DONE" 2>/dev/null
+fork_restored_superuser_password
 fork_collation_refresh
 fork_extension_reconcile
 fork_post_upgrade_analyze

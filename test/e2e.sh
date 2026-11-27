@@ -2498,6 +2498,174 @@ t_empty_volume_restore_from_s3() {
   docker volume rm "$rest_vol" "$src_vol" >/dev/null
 }
 
+# Whether <container> authenticates <role> with <password>. Connects to the
+# container's own non-loopback address: pg_hba trusts the socket and
+# loopback, so this is the route that asks for the password.
+accepts_password() {
+  local container="$1" password="$2" role="${3:-postgres}"
+  local out
+  out=$(docker exec -e PGHOSTADDR= -e PGHOST= -e PGCONNECT_TIMEOUT=5 \
+    -e "PGPASSWORD=$password" -e "PGUSER=$role" "$container" \
+    sh -c 'psql -h "$(hostname -i | cut -d" " -f1)" -d postgres -Atc "SELECT 1"' 2>/dev/null) || return 1
+  [ "$out" = "1" ]
+}
+
+# Poll accepts_password: the password is set by a background helper a moment
+# after the promote.
+wait_for_accepted_password() {
+  local container="$1" password="$2" timeout="${3:-60}"
+  local deadline=$(($(date +%s) + timeout))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    accepts_password "$container" "$password" && return 0
+    sleep 1
+  done
+  return 1
+}
+
+t_restored_fork_superuser_password_is_its_own() {
+  # The source runs with one password and the fork is created with another:
+  # the shape of a source whose password changed between the recovery target
+  # and the restore. The restored pg_authid carries the source's password,
+  # and the only credential the fork's clients have is the fork's own
+  # POSTGRES_PASSWORD.
+  local t="${FUNCNAME[0]}"
+  if ! rebuild_image; then ko "$t" "could not rebuild $IMAGE"; return; fi
+  setup_pitr_source >&2 || { ko "$t" "setup_pitr_source failed"; return; }
+  read -r src_name src_vol < "/tmp/pitr-source-${PG_VERSION}"
+  local target; target=$(cat "/tmp/pitr-target-${PG_VERSION}")
+  local src_path; src_path=$(pitr_source_path)
+  local fork_name=t-fork-password-${PG_VERSION}
+  local fork_vol=${fork_name}-vol
+  # Quotes, a backslash and a dollar sign: the value must reach ALTER ROLE
+  # byte for byte.
+  local fork_password='fork'"'"'s "own" \secret $1'
+  new_volume "$fork_vol"
+
+  # Control: the probe measures password authentication.
+  if ! accepts_password "$src_name" test; then
+    ko "$t" "control: source should accept its own password over TCP"; fail_dump "$t" "$src_name"; return
+  fi
+  if accepts_password "$src_name" not-the-password; then
+    ko "$t" "control: source accepted a wrong password, so the probe proves nothing"; return
+  fi
+
+  docker rm -f "$fork_name" >/dev/null 2>&1 || true
+  docker run -d --name "$fork_name" --label postgres-ssl-e2e=1 --network "$NET" \
+    -e "POSTGRES_PASSWORD=$fork_password" \
+    -e "WAL_RECOVER_FROM_BUCKET=$BUCKET" \
+    -e "WAL_RECOVER_FROM_ENDPOINT=http://${MINIO}:9000" \
+    -e WAL_RECOVER_FROM_REGION=us-east-1 \
+    -e WAL_RECOVER_FROM_KEY=$MINIO_USER \
+    -e WAL_RECOVER_FROM_SECRET=$MINIO_PASS \
+    -e "WAL_RECOVER_FROM_PATH=$src_path" \
+    -e PGBACKREST_REPO1_S3_URI_STYLE=path \
+    -e "POSTGRES_RECOVERY_TARGET_TIME=$target" \
+    -v "$fork_vol:/var/lib/postgresql/data" \
+    "$IMAGE" >/dev/null
+  wait_for_pg "$fork_name" || { ko "$t" "fork did not start"; fail_dump "$t" "$fork_name"; return; }
+  wait_for_promoted "$fork_name" || { ko "$t" "fork did not promote"; fail_dump "$t" "$fork_name"; return; }
+  if ! wait_for_accepted_password "$fork_name" "$fork_password" 60; then
+    ko "$t" "fork refuses its own POSTGRES_PASSWORD after the restore"; fail_dump "$t" "$fork_name"; return
+  fi
+  if ! wait_for_log_line "$fork_name" "pitr-restore: superuser password set" 30; then
+    ko "$t" "fork did not report setting its superuser password"; fail_dump "$t" "$fork_name"; return
+  fi
+  if accepts_password "$fork_name" test; then
+    ko "$t" "fork still accepts the source's password"; return
+  fi
+  if docker exec "$fork_name" test -f /var/lib/postgresql/data/.pitr_superuser_password_pending; then
+    ko "$t" "pending marker survived a successful password set"; return
+  fi
+  local rows
+  rows=$(docker exec "$fork_name" psql -U postgres -At -c "SELECT count(*) FROM pitrtest WHERE id=1")
+  if [ "$rows" != "1" ]; then
+    ko "$t" "restored data should hold id=1; got $rows"; return
+  fi
+
+  # Once per restore: a password the operator sets afterwards survives a
+  # restart with POSTGRES_PASSWORD still holding the creation-time value.
+  docker exec "$fork_name" psql -U postgres -c "ALTER ROLE postgres PASSWORD 'operator-set'" >/dev/null
+  docker restart "$fork_name" >/dev/null
+  wait_for_pg "$fork_name" || { ko "$t" "fork did not come back after restart"; fail_dump "$t" "$fork_name"; return; }
+  sleep 8
+  if ! accepts_password "$fork_name" operator-set; then
+    ko "$t" "a restart reset the password the operator had set"; fail_dump "$t" "$fork_name"; return
+  fi
+  if accepts_password "$fork_name" "$fork_password"; then
+    ko "$t" "a restart reapplied POSTGRES_PASSWORD over the operator's password"; return
+  fi
+  local logs sets
+  logs=$(docker logs "$fork_name" 2>&1)
+  sets=$(grep -c "pitr-restore: superuser password set" <<<"$logs" || true)
+  if [ "$sets" != "1" ]; then
+    ko "$t" "password should be set exactly once per restore; log shows $sets"; return
+  fi
+
+  ok "$t"
+  docker rm -f "$fork_name" "$src_name" >/dev/null
+  docker volume rm "$fork_vol" "$src_vol" >/dev/null
+}
+
+t_staged_restore_superuser_password_is_its_own() {
+  # Same contract on the other restore path: a volume populated by an
+  # external `pgbackrest restore`, where the wrapper stages the replay
+  # through conf.d. Statement logging is forced on in the restored cluster
+  # so the test can also read what the password change left in the log.
+  local t="${FUNCNAME[0]}"
+  if ! rebuild_image; then ko "$t" "could not rebuild $IMAGE"; return; fi
+  setup_pitr_source >&2 || { ko "$t" "setup_pitr_source failed"; return; }
+  read -r src_name src_vol < "/tmp/pitr-source-${PG_VERSION}"
+  local target; target=$(cat "/tmp/pitr-target-${PG_VERSION}")
+  local src_path; src_path=$(pitr_source_path)
+  local rest_name=t-staged-password-${PG_VERSION}
+  local rest_vol=${rest_name}-vol
+  local fork_password=staged-fork-secret-7f3a
+  new_volume "$rest_vol"
+
+  if ! pgbackrest_restore_into "$rest_vol" "$src_path"; then
+    ko "$t" "pgbackrest restore failed"; return
+  fi
+  docker run --rm -v "$rest_vol:/var/lib/postgresql/data" --entrypoint /bin/bash "$IMAGE" \
+    -c "echo \"log_statement = 'all'\" >> /var/lib/postgresql/data/postgresql.auto.conf" >/dev/null
+
+  docker rm -f "$rest_name" >/dev/null 2>&1 || true
+  docker run -d --name "$rest_name" --label postgres-ssl-e2e=1 --network "$NET" \
+    -e "POSTGRES_PASSWORD=$fork_password" \
+    -e "WAL_RECOVER_FROM_BUCKET=$BUCKET" \
+    -e "WAL_RECOVER_FROM_ENDPOINT=http://${MINIO}:9000" \
+    -e WAL_RECOVER_FROM_REGION=us-east-1 \
+    -e WAL_RECOVER_FROM_KEY=$MINIO_USER \
+    -e WAL_RECOVER_FROM_SECRET=$MINIO_PASS \
+    -e "WAL_RECOVER_FROM_PATH=$src_path" \
+    -e PGBACKREST_REPO1_S3_URI_STYLE=path \
+    -e "POSTGRES_RECOVERY_TARGET_TIME=$target" \
+    -v "$rest_vol:/var/lib/postgresql/data" \
+    "$IMAGE" >/dev/null
+  wait_for_pg "$rest_name" || { ko "$t" "restored pg did not start"; fail_dump "$t" "$rest_name"; return; }
+  wait_for_promoted "$rest_name" || { ko "$t" "restored pg did not promote"; fail_dump "$t" "$rest_name"; return; }
+  if ! wait_for_accepted_password "$rest_name" "$fork_password" 60; then
+    ko "$t" "restored service refuses its own POSTGRES_PASSWORD"; fail_dump "$t" "$rest_name"; return
+  fi
+  if accepts_password "$rest_name" test; then
+    ko "$t" "restored service still accepts the source's password"; return
+  fi
+
+  local logs
+  logs=$(docker logs "$rest_name" 2>&1)
+  # Control: statement logging really is on, so an absent password means
+  # the session kept it out, not that nothing is logged.
+  if [[ "$logs" != *"statement: SELECT pg_is_in_recovery()"* ]]; then
+    ko "$t" "control: statement logging is not on, so the log check proves nothing"; fail_dump "$t" "$rest_name"; return
+  fi
+  if [[ "$logs" == *"$fork_password"* ]]; then
+    ko "$t" "the password appears in the container log"; return
+  fi
+
+  ok "$t"
+  docker rm -f "$rest_name" "$src_name" >/dev/null
+  docker volume rm "$rest_vol" "$src_vol" >/dev/null
+}
+
 t_retention_expires_old_fulls() {
   local name=t-retain-${PG_VERSION}
   local vol=${name}-vol
@@ -5621,6 +5789,8 @@ ALL_TESTS=(
   t_watcher_gap_recovery_full
   t_dual_repo_archives_to_own_bucket
   t_empty_volume_restore_from_s3
+  t_restored_fork_superuser_password_is_its_own
+  t_staged_restore_superuser_password_is_its_own
   t_retention_expires_old_fulls
   t_watcher_archive_failure_without_wal_loss_takes_no_backup
   t_watcher_gap_recovery_lsn_lag_path
