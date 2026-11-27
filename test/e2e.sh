@@ -313,11 +313,23 @@ wait_for_promoted() {
 # that's actually there — a moment later fail_dump's own `docker logs` call
 # on the same container sees it fine. Tests that assert on a log message
 # following an expected-exit should use this instead of a one-shot grep.
+# True when the container's combined log matches. Captures the log first and
+# greps the copy: `docker logs | grep -q` under `pipefail` reports 141 when
+# grep exits on an early match and SIGPIPEs docker, so a line near the top of
+# a long log reads as missing (see logs_on_stream). grep options pass through.
+# Usage: logs_have <container> [grep options] <pattern>
+logs_have() {
+  local logs
+  logs=$(docker logs "$1" 2>&1)
+  shift
+  grep -q "$@" <<<"$logs"
+}
+
 wait_for_log_line() {
   local container="$1" pattern="$2" timeout="${3:-10}"
   local deadline=$(($(date +%s) + timeout))
   while [ "$(date +%s)" -lt "$deadline" ]; do
-    docker logs "$container" 2>&1 | grep -q -- "$pattern" && return 0
+    logs_have "$container" -- "$pattern" && return 0
     sleep 0.5
   done
   return 1
@@ -449,7 +461,7 @@ t_runtime_lock_blocks_overlapping_boot() {
     "$IMAGE" >/dev/null
   wait_for_log_line "${name}-b" "another postgres container still holds this volume" 30 \
     || { ko t_runtime_lock_blocks_overlapping_boot "second container did not report waiting on the runtime lock"; fail_dump t_runtime_lock_blocks_overlapping_boot "${name}-b"; return; }
-  if docker logs "${name}-b" 2>&1 | grep -q "starting PostgreSQL"; then
+  if logs_have "${name}-b" "starting PostgreSQL"; then
     ko t_runtime_lock_blocks_overlapping_boot "second container started postgres while the first still held the volume"
     fail_dump t_runtime_lock_blocks_overlapping_boot "${name}-b"
     return
@@ -459,7 +471,7 @@ t_runtime_lock_blocks_overlapping_boot() {
   # first container dies means a broken wait that returned immediately —
   # which the "starting PostgreSQL" grep alone could miss (postgres takes
   # longer than the grep to log its first line).
-  if docker logs "${name}-b" 2>&1 | grep -q "previous container released the volume"; then
+  if logs_have "${name}-b" "previous container released the volume"; then
     ko t_runtime_lock_blocks_overlapping_boot "second container exited the lock wait while the first still held the volume"
     fail_dump t_runtime_lock_blocks_overlapping_boot "${name}-b"
     return
@@ -581,7 +593,7 @@ t_requested_stop_still_exits_zero() {
   exit_code=$(docker inspect -f '{{.State.ExitCode}}' "$name")
   assert_eq "$exit_code" "0" "container exit code after requested stop" \
     || { ko t_requested_stop_still_exits_zero ""; fail_dump t_requested_stop_still_exits_zero "$name"; return; }
-  if docker logs "$name" 2>&1 | grep -q "no stop was requested"; then
+  if logs_have "$name" "no stop was requested"; then
     ko t_requested_stop_still_exits_zero "requested stop was misclassified as unasked"
     fail_dump t_requested_stop_still_exits_zero "$name"
     return
@@ -992,7 +1004,7 @@ t_invalid_bucket_skips_archive() {
     # suite-load. Without this polling loop, the test is a flake.
     local log_deadline=$(($(date +%s) + 30)) log_hit=0
     while [ "$(date +%s)" -lt "$log_deadline" ]; do
-      if docker logs "$name" 2>&1 | grep -q "WAL_ARCHIVE_BUCKET.*doesn't resolve to a bucket name"; then
+      if logs_have "$name" "WAL_ARCHIVE_BUCKET.*doesn't resolve to a bucket name"; then
         log_hit=1; break
       fi
       sleep 1
@@ -1020,7 +1032,7 @@ t_archiving_boot() {
   # Wait up to 15s for stanza-create to complete (it runs in background).
   local deadline=$(($(date +%s) + 15)) found=0
   while [ "$(date +%s)" -lt "$deadline" ]; do
-    if docker logs "$name" 2>&1 | grep -q "stanza-create completed"; then found=1; break; fi
+    if logs_have "$name" "stanza-create completed"; then found=1; break; fi
     sleep 1
   done
   [ "$found" = "1" ] || { ko t_archiving_boot "stanza-create did not complete"; fail_dump t_archiving_boot "$name"; return; }
@@ -1081,7 +1093,7 @@ t_archiving_boot_survives_pghostaddr() {
   # succeeding.
   local sc_deadline=$(($(date +%s) + 60)) found=0
   while [ "$(date +%s)" -lt "$sc_deadline" ]; do
-    if docker logs "$name" 2>&1 | grep -q "stanza-create completed"; then found=1; break; fi
+    if logs_have "$name" "stanza-create completed"; then found=1; break; fi
     sleep 1
   done
   [ "$found" = "1" ] || { ko t_archiving_boot_survives_pghostaddr "stanza-create did not complete despite PGHOSTADDR"; fail_dump t_archiving_boot_survives_pghostaddr "$name"; return; }
@@ -1252,7 +1264,7 @@ t_s3_unreachable_pg_stays_up() {
   # failure.
   local waiting_deadline=$(($(date +%s) + 150)) waited=0
   while [ "$(date +%s)" -lt "$waiting_deadline" ]; do
-    if docker logs "$name" 2>&1 | grep -q "pgbackrest-watcher: stanza-create: waiting — pgbackrest info gave no answer"; then
+    if logs_have "$name" "pgbackrest-watcher: stanza-create: waiting — pgbackrest info gave no answer"; then
       waited=1; break
     fi
     sleep 3
@@ -1312,7 +1324,7 @@ EOF
   run_archiving_pg "$name" "$vol"
   wait_for_pg "$name" || { ko t_queue_max_5gib_trips "initial boot"; return; }
   for _ in $(seq 1 15); do
-    docker logs "$name" 2>&1 | grep -q "stanza-create completed" && break
+    logs_have "$name" "stanza-create completed" && break
     sleep 1
   done
   docker exec "$name" psql -U postgres -c "CREATE TABLE t(id int);" >/dev/null
@@ -1464,7 +1476,7 @@ setup_pitr_source() {
   wait_for_pg "$name" >&2 || return 1
   # wait for stanza-create
   for _ in $(seq 1 15); do
-    docker logs "$name" 2>&1 | grep -q "stanza-create completed" && break
+    logs_have "$name" "stanza-create completed" && break
     sleep 1
   done
   # Wait for the watcher's NEEDS_INITIAL_BACKUP to land BEFORE the manual
@@ -1867,7 +1879,7 @@ t_pitr_retry_after_failed_staging() {
   # 8+ seconds after `docker run` returns, past the old fixed sleep.
   local deadline=$(($(date +%s) + 30)) found=0
   while [ "$(date +%s)" -lt "$deadline" ]; do
-    if docker logs "$rest_name" 2>&1 | grep -q "PITR replay staged (target=$target)"; then
+    if logs_have "$rest_name" "PITR replay staged (target=$target)"; then
       found=1; break
     fi
     sleep 2
@@ -1984,7 +1996,7 @@ wait_for_watcher_backup() {
   local container="$1" want_type="$2" deadline_secs="${3:-60}"
   local deadline=$(($(date +%s) + deadline_secs))
   while [ "$(date +%s)" -lt "$deadline" ]; do
-    if docker logs "$container" 2>&1 | grep -q "pgbackrest-watcher: backup --type=${want_type} completed"; then
+    if logs_have "$container" "pgbackrest-watcher: backup --type=${want_type} completed"; then
       return 0
     fi
     sleep 2
@@ -2074,7 +2086,7 @@ t_watcher_initial_full() {
   # Force a WAL switch so the watcher sees ARCHIVED_COUNT > 0 and trips
   # NEEDS_INITIAL_BACKUP. Without traffic it could sit idle indefinitely.
   for _ in $(seq 1 15); do
-    docker logs "$name" 2>&1 | grep -q "stanza-create completed" && break
+    logs_have "$name" "stanza-create completed" && break
     sleep 1
   done
   docker exec "$name" psql -U postgres -c "SELECT pg_switch_wal();" >/dev/null
@@ -2126,7 +2138,7 @@ t_watcher_periodic_full() {
   wait_for_pg "$name" || { ko t_watcher_periodic_full "no startup"; return; }
 
   for _ in $(seq 1 15); do
-    docker logs "$name" 2>&1 | grep -q "stanza-create completed" && break
+    logs_have "$name" "stanza-create completed" && break
     sleep 1
   done
   docker exec "$name" psql -U postgres -c "SELECT pg_switch_wal();" >/dev/null
@@ -2184,7 +2196,7 @@ t_watcher_periodic_diff() {
   wait_for_pg "$name" || { ko t_watcher_periodic_diff "no startup"; return; }
 
   for _ in $(seq 1 15); do
-    docker logs "$name" 2>&1 | grep -q "stanza-create completed" && break
+    logs_have "$name" "stanza-create completed" && break
     sleep 1
   done
   docker exec "$name" psql -U postgres -c "SELECT pg_switch_wal();" >/dev/null
@@ -2241,7 +2253,7 @@ t_watcher_gap_recovery_full() {
   wait_for_pg "$name" || { ko t_watcher_gap_recovery_full "no startup"; return; }
 
   for _ in $(seq 1 15); do
-    docker logs "$name" 2>&1 | grep -q "stanza-create completed" && break
+    logs_have "$name" "stanza-create completed" && break
     sleep 1
   done
   docker exec "$name" psql -U postgres -c "SELECT pg_switch_wal();" >/dev/null
@@ -2500,7 +2512,7 @@ t_retention_expires_old_fulls() {
   wait_for_pg "$name" || { ko t_retention_expires_old_fulls "no startup"; return; }
 
   for _ in $(seq 1 15); do
-    docker logs "$name" 2>&1 | grep -q "stanza-create completed" && break
+    logs_have "$name" "stanza-create completed" && break
     sleep 1
   done
   docker exec "$name" psql -U postgres -c "SELECT pg_switch_wal();" >/dev/null
@@ -2618,7 +2630,7 @@ t_watcher_archive_failure_without_wal_loss_takes_no_backup() {
   wait_for_pg "$name" || { ko t_watcher_archive_failure_without_wal_loss_takes_no_backup "no startup"; fail_dump t_watcher_archive_failure_without_wal_loss_takes_no_backup "$name"; return; }
 
   for _ in $(seq 1 15); do
-    docker logs "$name" 2>&1 | grep -q "stanza-create completed" && break
+    logs_have "$name" "stanza-create completed" && break
     sleep 1
   done
   docker exec "$name" psql -U postgres -c "CREATE TABLE t(id int); SELECT pg_switch_wal();" >/dev/null
@@ -2660,7 +2672,7 @@ t_watcher_archive_failure_without_wal_loss_takes_no_backup() {
   local deadline=$(($(date +%s) + 60)) hit=0
   while [ "$(date +%s)" -lt "$deadline" ]; do
     docker exec "$name" psql -U postgres -c "SELECT pg_switch_wal();" >/dev/null 2>&1
-    if docker logs "$name" 2>&1 | grep -q "archive-failure: over"; then hit=1; break; fi
+    if logs_have "$name" "archive-failure: over"; then hit=1; break; fi
     sleep 3
   done
   if [ "$hit" != "1" ]; then
@@ -2678,7 +2690,7 @@ t_watcher_archive_failure_without_wal_loss_takes_no_backup() {
     fail_dump t_watcher_archive_failure_without_wal_loss_takes_no_backup "$name"
     return
   fi
-  if docker logs "$name" 2>&1 | grep -q "gap-recovery: entering recovery"; then
+  if logs_have "$name" "gap-recovery: entering recovery"; then
     ko t_watcher_archive_failure_without_wal_loss_takes_no_backup "watcher entered gap recovery although no WAL was dropped"
     fail_dump t_watcher_archive_failure_without_wal_loss_takes_no_backup "$name"
     return
@@ -2746,7 +2758,7 @@ t_watcher_gap_recovery_lsn_lag_path() {
   run_archiving_pg_fast_watcher "$name" "$vol"
   wait_for_pg "$name" || { ko t_watcher_gap_recovery_lsn_lag_path "init boot"; return; }
   for _ in $(seq 1 15); do
-    docker logs "$name" 2>&1 | grep -q "stanza-create completed" && break
+    logs_have "$name" "stanza-create completed" && break
     sleep 1
   done
   docker exec "$name" psql -U postgres -c "CREATE TABLE t(id int); SELECT pg_switch_wal();" >/dev/null
@@ -2852,7 +2864,7 @@ t_watcher_wal_regression_async_spool_probe() {
   run_archiving_pg_fast_watcher "$name" "$vol"
   wait_for_pg "$name" || { ko t_watcher_wal_regression_async_spool_probe "no startup"; fail_dump t_watcher_wal_regression_async_spool_probe "$name"; return; }
   for _ in $(seq 1 15); do
-    docker logs "$name" 2>&1 | grep -q "stanza-create completed" && break
+    logs_have "$name" "stanza-create completed" && break
     sleep 1
   done
   docker exec "$name" psql -U postgres -c "CREATE TABLE t(id int); SELECT pg_switch_wal();" >/dev/null
@@ -2933,7 +2945,7 @@ EOF
   # start landing in the log buffer.
   local deadline=$(($(date +%s) + 60)) hit_migrate=0
   while [ "$(date +%s)" -lt "$deadline" ]; do
-    if docker logs "$name" 2>&1 | grep -q "wal-regression: migrating archive path"; then
+    if logs_have "$name" "wal-regression: migrating archive path"; then
       hit_migrate=1; break
     fi
     sleep 2
@@ -2953,7 +2965,7 @@ EOF
   # migration log by a few seconds on a loaded CI runner.
   local kick_deadline=$(($(date +%s) + 15)) hit_kick=0
   while [ "$(date +%s)" -lt "$kick_deadline" ]; do
-    if docker logs "$name" 2>&1 | grep -q "archive-migration: kicking async daemon"; then
+    if logs_have "$name" "archive-migration: kicking async daemon"; then
       hit_kick=1; break
     fi
     sleep 1
@@ -3091,7 +3103,7 @@ t_pitr_target_before_retention_window_refuses() {
   wait_for_pg "$src_name" || { ko t_pitr_target_before_retention_window_refuses "src no startup"; return; }
 
   for _ in $(seq 1 15); do
-    docker logs "$src_name" 2>&1 | grep -q "stanza-create completed" && break
+    logs_have "$src_name" "stanza-create completed" && break
     sleep 1
   done
   docker exec "$src_name" psql -U postgres -c "CREATE TABLE t(id int); SELECT pg_switch_wal();" >/dev/null
@@ -3191,7 +3203,7 @@ t_retention_expire_cascades_to_wal() {
   wait_for_pg "$name" || { ko t_retention_expire_cascades_to_wal "no startup"; return; }
 
   for _ in $(seq 1 15); do
-    docker logs "$name" 2>&1 | grep -q "stanza-create completed" && break
+    logs_have "$name" "stanza-create completed" && break
     sleep 1
   done
   docker exec "$name" psql -U postgres -c "CREATE TABLE t(id int);" >/dev/null
@@ -3317,7 +3329,7 @@ t_volume_wipe_same_bucket_preserves_both() {
   run_archiving_pg_fast_watcher "$name" "$vol"
   wait_for_pg "$name" || { ko t_volume_wipe_same_bucket_preserves_both "A no startup"; return; }
   for _ in $(seq 1 15); do
-    docker logs "$name" 2>&1 | grep -q "stanza-create completed" && break
+    logs_have "$name" "stanza-create completed" && break
     sleep 1
   done
   docker exec "$name" psql -U postgres -c "CREATE TABLE t(id int); INSERT INTO t VALUES (1); SELECT pg_switch_wal();" >/dev/null
@@ -3340,7 +3352,7 @@ t_volume_wipe_same_bucket_preserves_both() {
   run_archiving_pg_fast_watcher "$name" "$vol"
   wait_for_pg "$name" || { ko t_volume_wipe_same_bucket_preserves_both "C no startup"; fail_dump t_volume_wipe_same_bucket_preserves_both "$name"; return; }
   for _ in $(seq 1 15); do
-    docker logs "$name" 2>&1 | grep -q "stanza-create completed" && break
+    logs_have "$name" "stanza-create completed" && break
     sleep 1
   done
   docker exec "$name" psql -U postgres -c "CREATE TABLE u(id int); INSERT INTO u VALUES (1); SELECT pg_switch_wal();" >/dev/null
@@ -3432,7 +3444,7 @@ seed_upgraded_volume() {
   # Wait for the stanza before generating WAL: archive-push against a repo with
   # no stanza fails, and this test has no business exercising that race.
   for _ in $(seq 1 20); do
-    docker logs "$name" 2>&1 | grep -q "stanza-create completed" && break
+    logs_have "$name" "stanza-create completed" && break
     sleep 1
   done
   docker exec "$name" psql -U postgres -c \
@@ -3505,7 +3517,7 @@ assert_reanchored_end_state() {
   # an idle cluster only produces a segment per archive_timeout.
   local deadline=$(($(date +%s) + 150)) got_full=0
   while [ "$(date +%s)" -lt "$deadline" ]; do
-    if docker logs "$name" 2>&1 | grep -q "pgbackrest-watcher: backup --type=full completed"; then
+    if logs_have "$name" "pgbackrest-watcher: backup --type=full completed"; then
       got_full=1; break
     fi
     docker exec "$name" psql -U postgres -c "SELECT pg_switch_wal();" >/dev/null 2>&1
@@ -3587,7 +3599,7 @@ t_upgrade_archive_reanchors_to_new_cluster_path() {
     return
   fi
   for _ in $(seq 1 20); do
-    docker logs "$name" 2>&1 | grep -q "stanza-create completed" && break
+    logs_have "$name" "stanza-create completed" && break
     sleep 1
   done
 
@@ -3794,7 +3806,7 @@ t_reanchor_backfills_missing_anchor() {
     fail_dump "${FUNCNAME[0]}" "$name"
     return
   fi
-  if docker logs "$name" 2>&1 | grep -q "cluster re-identified"; then
+  if logs_have "$name" "cluster re-identified"; then
     ko "${FUNCNAME[0]}" "a missing anchor was treated as a re-identified cluster"
     fail_dump "${FUNCNAME[0]}" "$name"
     return
@@ -3851,7 +3863,7 @@ t_legacy_wal_regression_state_fields_migrate() {
     return
   fi
   for _ in $(seq 1 20); do
-    docker logs "$name" 2>&1 | grep -q "stanza-create completed" && break
+    logs_have "$name" "stanza-create completed" && break
     sleep 1
   done
   docker exec "$name" psql -U postgres -c "CREATE TABLE t(id int); SELECT pg_switch_wal();" >/dev/null
@@ -3973,7 +3985,7 @@ t_restore_change_target_after_promote_noop() {
 
   # No new restore: PG_VERSION already exists, restore_from_pgbackrest_if_empty_volume
   # bails on the populated-volume check.
-  if docker logs "$rest_name" 2>&1 | grep -q "restoring from source bucket"; then
+  if logs_have "$rest_name" "restoring from source bucket"; then
     ko t_restore_change_target_after_promote_noop "wrapper attempted a second restore on populated volume"
     fail_dump t_restore_change_target_after_promote_noop "$rest_name"
     return
@@ -4055,7 +4067,7 @@ t_restore_then_wipe_volume_redoes_restore() {
   # seconds beyond wait_for_pg under suite-load on slow runners.
   local deadline=$(($(date +%s) + 30)) hit=0
   while [ "$(date +%s)" -lt "$deadline" ]; do
-    if docker logs "$rest_name" 2>&1 | grep -q "restoring from source bucket"; then
+    if logs_have "$rest_name" "restoring from source bucket"; then
       hit=1; break
     fi
     sleep 1
@@ -4312,7 +4324,7 @@ t_recovery_conf_persists_across_restart_mid_replay() {
   run_archiving_pg "$src_name" "$src_vol" -e "WAL_HEARTBEAT_DISABLED=1"
   wait_for_pg "$src_name" || { ko t_recovery_conf_persists_across_restart_mid_replay "source did not start"; return; }
   for _ in $(seq 1 15); do
-    docker logs "$src_name" 2>&1 | grep -q "stanza-create completed" && break
+    logs_have "$src_name" "stanza-create completed" && break
     sleep 1
   done
   wait_for_watcher_backup "$src_name" full 60 || {
@@ -4413,7 +4425,7 @@ t_recovery_conf_persists_across_restart_mid_replay() {
   # not at consistent-state.
   local caught=0 i
   for i in $(seq 1 600); do
-    if docker logs "$rest_name" 2>&1 | grep -q "archive-get command begin"; then
+    if logs_have "$rest_name" "archive-get command begin"; then
       caught=1
       break
     fi
@@ -4650,7 +4662,7 @@ t_pitr_missing_wal_segment_fatals() {
   run_archiving_pg "$src_name" "$src_vol"
   wait_for_pg "$src_name" || { ko t_pitr_missing_wal_segment_fatals "src no startup"; fail_dump t_pitr_missing_wal_segment_fatals "$src_name"; return; }
   for _ in $(seq 1 15); do
-    docker logs "$src_name" 2>&1 | grep -q "stanza-create completed" && break
+    logs_have "$src_name" "stanza-create completed" && break
     sleep 1
   done
 
@@ -4745,7 +4757,7 @@ t_pitr_missing_wal_segment_fatals() {
   # WAL. Wait up to 180s; archive-get retries a few times before giving up.
   local deadline=$(($(date +%s) + 180)) found=0
   while [ "$(date +%s)" -lt "$deadline" ]; do
-    if docker logs "$rest_name" 2>&1 | grep -qE "(WAL file .* missing|archive-get.*FATAL|recovery ended before configured recovery target was reached|requested WAL segment.*has already been removed)"; then
+    if logs_have "$rest_name" -E "(WAL file .* missing|archive-get.*FATAL|recovery ended before configured recovery target was reached|requested WAL segment.*has already been removed)"; then
       found=1; break
     fi
     sleep 5
@@ -4793,7 +4805,7 @@ t_lifecycle_enable_disable_reenable() {
   run_archiving_pg_fast_watcher "$name" "$vol"
   wait_for_pg "$name" || { ko t_lifecycle_enable_disable_reenable "phase1 startup"; return; }
   for _ in $(seq 1 15); do
-    docker logs "$name" 2>&1 | grep -q "stanza-create completed" && break
+    logs_have "$name" "stanza-create completed" && break
     sleep 1
   done
   docker exec "$name" psql -U postgres -c "CREATE TABLE t(id int); INSERT INTO t VALUES (1); SELECT pg_switch_wal();" >/dev/null
@@ -4833,7 +4845,7 @@ t_lifecycle_enable_disable_reenable() {
     || { ko t_lifecycle_enable_disable_reenable ""; return; }
 
   for _ in $(seq 1 15); do
-    docker logs "$name" 2>&1 | grep -q "stanza-create completed" && break
+    logs_have "$name" "stanza-create completed" && break
     sleep 1
   done
   docker exec "$name" psql -U postgres -c "INSERT INTO t VALUES (3); SELECT pg_switch_wal();" >/dev/null
@@ -5151,7 +5163,7 @@ run_half_created_stanza_case() {
 
   local deadline=$(($(date +%s) + 120)) migrated=0
   while [ "$(date +%s)" -lt "$deadline" ]; do
-    if docker logs "$name" 2>&1 | grep -q "half-created-stanza: migrating archive path"; then
+    if logs_have "$name" "half-created-stanza: migrating archive path"; then
       migrated=1; break
     fi
     docker exec "$name" psql -U postgres -c "SELECT pg_switch_wal();" >/dev/null 2>&1
@@ -5184,7 +5196,7 @@ run_half_created_stanza_case() {
 
   local full_deadline=$(($(date +%s) + 120)) full_hit=0
   while [ "$(date +%s)" -lt "$full_deadline" ]; do
-    if docker logs "$name" 2>&1 | grep -q "pgbackrest-watcher: backup --type=full completed"; then
+    if logs_have "$name" "pgbackrest-watcher: backup --type=full completed"; then
       full_hit=1; break
     fi
     docker exec "$name" psql -U postgres -c "SELECT pg_switch_wal();" >/dev/null 2>&1
@@ -5337,7 +5349,7 @@ t_catalog_verify_deadlock_selfheals() {
   # Wait for the rc=1 self-heal log line (proves the catalog-verify path fired).
   local deadline=$(($(date +%s) + 60)) got_clear=0
   while [ "$(date +%s)" -lt "$deadline" ]; do
-    docker logs "$name" 2>&1 | grep -q "clearing last_full_at to trigger new full" \
+    logs_have "$name" "clearing last_full_at to trigger new full" \
       && { got_clear=1; break; }
     sleep 2
   done
@@ -5375,7 +5387,7 @@ t_gap_marker_suppresses_catalog_verify_full() {
     -e WAL_BACKUP_CATALOG_VERIFY_INTERVAL_SECONDS=5
   wait_for_pg "$name" || { ko t_gap_marker_suppresses_catalog_verify_full "startup"; return; }
   for _ in $(seq 1 15); do
-    docker logs "$name" 2>&1 | grep -q "stanza-create completed" && break
+    logs_have "$name" "stanza-create completed" && break
     sleep 1
   done
   docker exec "$name" psql -U postgres -c "SELECT pg_switch_wal();" >/dev/null
@@ -5434,7 +5446,7 @@ t_stanza_create_timeout_sentinel_absent_on_success() {
   # initdb + first-boot SQL can stretch this on a busy host).
   local deadline=$(($(date +%s) + 60)) hit=0
   while [ "$(date +%s)" -lt "$deadline" ]; do
-    if docker logs "$name" 2>&1 | grep -q "stanza-create completed"; then hit=1; break; fi
+    if logs_have "$name" "stanza-create completed"; then hit=1; break; fi
     sleep 1
   done
   if [ "$hit" != "1" ]; then
