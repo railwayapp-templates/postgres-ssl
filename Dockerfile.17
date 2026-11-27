@@ -19,7 +19,19 @@ ARG POSTGRES_VERSION=17
 # The build workflow's content gate reads this ARG so it tracks the pinned
 # base, not the floating alias.
 ARG DEBIAN_RELEASE=trixie
+# Rebuild gosu from immutable upstream source with a patched Go toolchain.
+# The official Postgres image ships a prebuilt helper with an older Go stdlib.
+FROM golang:1.27.2-alpine3.24@sha256:f92b6ef800e499660581efdabdf25d9d817a9d124eaf900924f0504e7e27e12d AS gosu-build
+ADD --checksum=sha256:2b70da8a5480fafedc16bb1fc91b572f064d03df736cbd91a616af2f1b66ab51 https://codeload.github.com/tianon/gosu/tar.gz/29b939aa5bd4dc588af765b8248f6e39150d2565 /tmp/gosu.tar.gz
+RUN mkdir /src && tar -xzf /tmp/gosu.tar.gz -C /src --strip-components=1
+WORKDIR /src
+RUN CGO_ENABLED=0 GOTOOLCHAIN=local go build -mod=readonly -trimpath -buildvcs=false -ldflags='-d -w' -o /out/gosu . \
+    && go version -m /out/gosu \
+    && /out/gosu --version \
+    && /out/gosu nobody id
+
 FROM postgres:${POSTGRES_VERSION}-${DEBIAN_RELEASE}
+COPY --from=gosu-build /out/gosu /usr/local/bin/gosu
 # Extension packages are pinned AT THE MINOR: the volume keeps each
 # extension's SQL catalog at install-time version while the image carries
 # the .so, and this tag is rebuilt daily - an unpinned package would let
